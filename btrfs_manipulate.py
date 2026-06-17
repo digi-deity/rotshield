@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "crc32c>=2.2.post0",
+#   "btrfs-recon",  # local package at /root/btrfs-recon (resolved below)
+# ]
+#
+# [tool.uv.sources]
+# btrfs-recon = { path = "/root/btrfs-recon" }
+# ///
 """btrfs_manipulate.py — Python port of btrfs_manipulate.sh.
 
 Injects a "silent" corruption into a btrfs file to reproduce the exact failure
@@ -16,7 +26,7 @@ This version uses the stripped-down, inspection-only `btrfs_recon` package
 (no DB, no async, no btrfs-progs shelling out) to locate a file's data on
 disk by walking the btrfs on-disk structures directly.
 
-Run with:  uv run --project /root/btrfs-recon python /root/btrfs_manipulate.py
+Run with:  sudo uv run /root/btrfs_manipulate.py
 """
 from __future__ import annotations
 
@@ -197,14 +207,23 @@ def find_csum_root(superblock, tree, devid_fp_map) -> int:
     sys.exit('ERROR: CSUM_TREE ROOT_ITEM not found in root tree')
 
 
-def find_csum_covering(fp, tree, csum_root_logical, target_logical):
+def find_csum_covering(fp, tree, csum_root_logical, target_logical,
+                      csum_size: int = CSUM_SIZE_CRC32C):
     """Return (leaf_node, csum_leaf_item) for the first EXTENT_CSUM whose
-    logical range covers `target_logical`. Returns None if not found."""
+    logical range covers `target_logical`. Returns None if not found.
+
+    An EXTENT_CSUM item's key.offset is the logical byte address where its
+    covered data range begins, but its on-disk `size` is the length of the
+    *checksum array* (num_sectors * csum_size bytes) — NOT the length of the
+    data it covers. The covered data length is
+    `(size / csum_size) * CSUM_BLOCK_SIZE`.
+    """
     for leaf, _ in walk_leaves(fp, csum_root_logical, tree):
         for item in leaf.items:
-            if (item.key.ty == KeyType.ExtentCsum
-                    and item.key.offset <= target_logical
-                    < item.key.offset + item.size):
+            if item.key.ty != KeyType.ExtentCsum:
+                continue
+            covered_len = (item.size // csum_size) * CSUM_BLOCK_SIZE
+            if item.key.offset <= target_logical < item.key.offset + covered_len:
                 return leaf, item
     return None
 
@@ -436,18 +455,19 @@ def main() -> None:
         # parsing trees from; the *computed* checksum comes from the underlying
         # partition (we corrupt THAT device in Step 4, and the array device
         # would otherwise just hand back the cached, uncorrupted bytes).
-        csum_size = CSUM_SIZE_CRC32C if sb.csum_type == 0 else None
-        if sb.csum_type != 0:
+        csum_size = CSUM_SIZE_CRC32C if superblock.csum_type == 0 else None
+        if superblock.csum_type != 0:
             print()
             print(f'=== Step 2d: skipping checksum verification '
-                  f'(unsupported csum_type={sb.csum_type}; only CRC32C=0 supported) ===')
+                  f'(unsupported csum_type={superblock.csum_type}; only CRC32C=0 supported) ===')
             stored_csum_bytes = None
         else:
             print()
             print(f'=== Step 2d: Locating stored checksum (CSUM_TREE walk) ===')
             csum_root = find_csum_root(superblock, tree, devid_fp_map)
             print(f'CSUM_TREE root: 0x{csum_root:x}')
-            csum_match = find_csum_covering(fp, tree, csum_root, virt_addr)
+            csum_match = find_csum_covering(fp, tree, csum_root, virt_addr,
+                                            csum_size=csum_size)
             if csum_match is None:
                 sys.exit('ERROR: no EXTENT_CSUM item covers the file extent '
                          '(was a btrfs filesystem sync forced after creation?)')
@@ -534,6 +554,20 @@ def main() -> None:
             drop_caches()
             dump_window(mount_dev, 'Array device (post-corruption)', real_phys_offset)
             dump_window(underlying_dev, 'Underlying partition (post-corruption)', real_phys_offset)
+
+        # ───────────────────────────────────────────────────────────────────
+        # Step 5a — Post-corruption: confirm stored csum NO LONGER matches
+        # ───────────────────────────────────────────────────────────────────
+        if stored_csum_bytes is not None:
+            print()
+            print('=== Step 5a: Post-corruption checksum verification ===')
+            computed_post = compute_block_csum(underlying_dev, real_phys_offset)
+            print(f'  stored csum   : 0x{stored_csum_int:08x}')
+            print(f'  computed csum : 0x{computed_post:08x}')
+            if stored_csum_int != computed_post:
+                print('  ✓ MISMATCH — corruption successfully invalidated the on-disk checksum')
+            else:
+                sys.exit('  ✗ ERROR — checksum still matches! Corruption failed to change the data block.')
 
     print()
     print('=== Summary ===')
