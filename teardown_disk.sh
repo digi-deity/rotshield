@@ -1,6 +1,6 @@
 #!/bin/bash
 # Full teardown for the nonraid virtual disk test setup.
-# Leaves .img files in place. Never aborts on a missing/already-undone step.
+# Removes loop devices, symlinks, and disk image files.
 
 SUPERBLOCK_FILE="/nonraid.dat"   # change if you used -s with a custom path
 BYID_PREFIX="virtdisk-"
@@ -52,7 +52,16 @@ losetup -a 2>/dev/null | while IFS=: read -r dev _ backing; do
     esac
 done
 
-echo "=== 7. Removing empty nmdctl mountpoint directories ==="
+echo "=== 7. Removing disk image files ==="
+IMAGE_DIR="/root/nonraid-test"
+for img in "$IMAGE_DIR"/d[0-9]*; do
+    [ -e "$img" ] || continue
+    rm -f "$img" && echo "  Removed $img."
+done
+# Remove the directory if empty now
+rmdir "$IMAGE_DIR" 2>/dev/null && echo "  Removed empty $IMAGE_DIR." || echo "  $IMAGE_DIR not empty/removable, skipping."
+
+echo "=== 8. Removing empty nmdctl mountpoint directories ==="
 for d in ${MOUNT_PREFIX}*; do
     [ -d "$d" ] || continue
     rmdir "$d" 2>/dev/null && echo "  Removed empty $d." || echo "  $d not empty/removable, skipping."
@@ -60,7 +69,7 @@ done
 
 udevadm settle 2>/dev/null
 
-echo "=== Teardown complete. .img files were left in place. ==="
+echo "=== Teardown complete. Disk images removed. ==="
 echo "----"
 losetup -a
 ls -l /dev/disk/by-id/ 2>/dev/null | grep -i virtdisk || echo "No virtdisk by-id symlinks remain."
