@@ -10,6 +10,15 @@
 # btrfs-recon = { path = "/root/btrfs-recon" }
 # ///
 
+"""
+This script monitors the dmesg buffer for BTRFS checksum failures after a read I/O operation, extracts the relevant information,
+and attempts to recover the corrupted data using parity information.
+
+Works on this type of dmesg message:
+[218470.835135] BTRFS warning (device nmd1p1): csum failed root 5 ino 257 off 167936 csum 0x28f86fd2 expected csum 0xf8d99c3c mirror 1
+[218470.835140] BTRFS error (device nmd1p1): bdev /dev/nmd1p1 errs: wr 0, rd 0, flush 0, corrupt 7, gen 0
+"""
+
 from __future__ import annotations
 import os
 import re
