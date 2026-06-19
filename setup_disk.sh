@@ -1,7 +1,7 @@
 #!/bin/bash
 
 DISK_COUNT=4
-SIZE_MB=1024
+SIZE_MB=256
 WORKDIR="/root/nonraid-test"
 
 if [ "$EUID" -ne 0 ]; then
