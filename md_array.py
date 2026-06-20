@@ -160,21 +160,17 @@ def get_array_config() -> ArrayConfig:
     return config
 
 
-def resolve_devid_to_device(devid: int, fallback: str) -> str:
-    """Map a btrfs devid to an underlying block device path.
+def resolve_devid_to_device(devid: int) -> str:
+    """Map a btrfs devid to an underlying block device path via the array config.
 
-    Uses the array stat file when available.  Falls back to *fallback*
-    (typically the path of the mounted array device) when no stat file exists,
-    which is the correct behaviour for a plain (non-array) btrfs filesystem.
+    Exits with an error if no stat file is found or the devid is not listed —
+    writing to the wrong device could silently corrupt unrelated data.
     """
-    path = _stat_path()
-    if path is None:
-        return fallback
-
     config = get_array_config()
     dev = config.data_devs.get(devid)
-    if dev:
-        return dev
-
-    # devid not found as a data disk — fall back to the mounted device.
-    return fallback
+    if not dev:
+        sys.exit(
+            f'ERROR: btrfs devid {devid} not found in array config; '
+            f'refusing to proceed without a confirmed device mapping.'
+        )
+    return dev
