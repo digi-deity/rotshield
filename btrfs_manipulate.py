@@ -410,36 +410,7 @@ def main() -> None:
         # ───────────────────────────────────────────────────────────────────
         print()
         print(f'=== Step 2c: Resolving btrfs devid {devid} → block device path ===')
-        underlying_dev = resolve_devid_to_device(devid, mount_dev)
-        print(f'devid {devid} → {underlying_dev}')
-
-        print()
-        print("=== DEBUG: neighbouring sectors ===")
-        for i in range(-2, 3):
-            off = sector_phys_offset + i*4096
-            with open(underlying_dev, "rb") as dbg_fp:
-                dbg_fp.seek(off)
-                d = dbg_fp.read(8)
-
-            print(
-                f"{i:+d} sectors "
-                f"phys={off:#x} "
-                f"bytes={d.hex(' ')}"
-            )
-        print()
-        print(f'Chunk virtual start  : {chunk_virt_start}')
-        print(f'Chunk physical base  : {chunk_phys_base}')
-        print(f'Target physical byte : {real_phys_offset}')
-        print(f'Sector phys offset   : {sector_phys_offset}')
-        print(f'Logical→physical delta = {real_phys_offset - target_logical}')
-        print(f'btrfs devid          : {devid}')
-
-        # ───────────────────────────────────────────────────────────────────
-        # Step 2c — Translate btrfs devid → actual block device path
-        # ───────────────────────────────────────────────────────────────────
-        print()
-        print(f'=== Step 2c: Resolving btrfs devid {devid} → block device path ===')
-        underlying_dev = resolve_devid_to_device(devid, mount_dev)
+        underlying_dev = resolve_devid_to_device(devid)
         print(f'devid {devid} → {underlying_dev}')
 
         # ───────────────────────────────────────────────────────────────────
