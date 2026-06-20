@@ -61,16 +61,19 @@ import os
 import re
 import sys
 import random
-import struct
 import argparse
 import subprocess
-from collections import deque
-from pathlib import Path
-
 from crc32c import crc32c
 
-from btrfs_recon.parsing import parse_superblock, build_chunk_tree, walk_btree, parse_at
-from btrfs_recon.structure import KeyType, ObjectId, TreeNode, Header
+from btrfs_recon.constants import BTRFS_SECTOR_SIZE
+from btrfs_recon.parsing import (
+    parse_superblock,
+    build_chunk_tree,
+    find_tree_root,
+    find_extent_data,
+    lookup_csum,
+)
+from btrfs_recon.structure import ObjectId
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,92 +116,16 @@ def dump_window(dev: str, label: str, phys_offset: int, count: int = 3) -> None:
     print(hexdump(data, base=start_offset))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# btrfs structure inspection (replaces `btrfs inspect-internal dump-tree`)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def find_file_extent(
-    fp,
-    superblock,
-    tree,
-    devid_fp_map: dict,
-    mount_point: str,
-    target_file: str,
-    file_offset: int,
-):
-    """Walk root tree → FS_TREE → find the EXTENT_DATA item covering file_offset.
-
-    Returns (inode, file_extent_item). Raises if not found.
-
-    This replaces Step 2a of the shell script:
-        VIRT_ADDR=$(btrfs inspect-internal dump-tree -t FS_TREE "$REAL_DEV" | awk ...)
-    """
-    inode = os.stat(target_file).st_ino
-    print(f'target: {target_file}  inode={inode}')
-
-    # Real device btrfs is mounted on (e.g. /dev/nmd1p1 for the array).
-    real_dev = findmnt_source(mount_point)
-    print(f'btrfs device: {real_dev}')
-
-    # 1. Find FS_TREE root (objectid 5, ROOT_ITEM) in the root tree.
-    fs_root_bytenr = None
-    for item in walk_btree(superblock.root, tree, devid_fp_map):
-        if (item.key.objectid == ObjectId.FsTree
-                and item.key.ty == KeyType.RootItem):
-            fs_root_bytenr = item.data.bytenr
-            break
-    if fs_root_bytenr is None:
-        sys.exit('ERROR: FS_TREE ROOT_ITEM not found in root tree')
-
-    # 2. Walk the FS_TREE, find the REGULAR EXTENT_DATA covering file_offset.
-    #    Each item's key.offset is the file byte where that extent begins;
-    #    disk_num_bytes is the length of its on-disk (and file) data.
-    for item in walk_btree(fs_root_bytenr, tree, devid_fp_map):
-        if item.key.objectid != inode or item.key.ty != KeyType.ExtentData:
-            continue
-        if item.data.type != item.data.type.REGULAR:
-            continue  # skip INLINE / PREALLOC extents
-        ext_start = item.key.offset
-        ext_len = item.data.ref.num_bytes
-        if ext_start <= file_offset < ext_start + ext_len:
-            return inode, item
-    sys.exit(
-        f'ERROR: No REGULAR EXTENT_DATA found for inode {inode} '
-        f'covering file offset {file_offset}'
-    )
-
-
 def resolve_logical_to_physical(tree, logical: int):
-    """Map a btrfs logical (virtual) address to a physical byte offset.
-
-    Replaces Step 2b of the shell script:
-        btrfs inspect-internal dump-tree -t CHUNK "$REAL_DEV" | awk ...
-
-    Returns (devid, physical_offset, chunk_virtual_start, chunk_physical_base).
-    Yields the first mapping (callers can pick a copy for mirrored chunks).
-    """
+    """Map a btrfs logical address to (devid, phys, chunk_virt_start, chunk_phys_base)."""
     matches = list(tree.offsets(logical))
     if not matches:
         sys.exit(f'ERROR: No chunk found that contains virtual address {logical}')
-
     devid, phys, _n = matches[0]
-    # Find the containing interval so we can report the chunk boundaries too.
     block = next(iter(tree.at(logical)))
     chunk_virt_start = block.begin
     chunk_phys_base = block.data['stripes'][0][1]
     return devid, phys, chunk_virt_start, chunk_phys_base
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Checksum tree inspection (extends beyond the bash script — the original
-# btrfs_manipulate.sh does NOT compute or verify checksums; this is a new
-# feature that proves the silent corruption actually invalidates the on-disk
-# btrfs checksum, not just the file's visible data).
-# ─────────────────────────────────────────────────────────────────────────────
-
-# btrfs stores one CRC32C per 4096-byte data sector as a little-endian uint32.
-CSUM_BLOCK_SIZE = 4096
-CSUM_SIZE_CRC32C = 4  # bytes per checksum
 
 
 def btrfs_sync(mount_point: str) -> None:
@@ -215,78 +142,8 @@ def btrfs_sync(mount_point: str) -> None:
     )
 
 
-def walk_leaves(fp, root_logical, tree):
-    """BFS-walk a btrfs B-tree; yield (leaf_node, leaf_phys) for each leaf.
-
-    Identical to `walk_btree` but keeps the parent leaf node around so we
-    can locate item data relative to the leaf's on-disk position.
-    """
-    queue: deque = deque((d, p) for d, p, _ in tree.offsets(root_logical))
-    while queue:
-        devid, phys = queue.popleft()
-        node = parse_at(fp, phys, TreeNode)
-        if node.header.level == 0:
-            yield node, phys
-        else:
-            for ptr in node.items:
-                for d, p, _ in tree.offsets(ptr.blockptr):
-                    queue.append((d, p))
-
-
-def find_csum_root(superblock, tree, devid_fp_map) -> int:
-    """Locate the root of the dedicated CRC32C checksum tree (objectid 7).
-
-    The CSUM_TREE (a.k.a. CSUM_TREE_ROOT) is registered as a ROOT_ITEM in the
-    root tree, keyed by ObjectId.CsumTree (7).
-    """
-    for item in walk_btree(superblock.root, tree, devid_fp_map):
-        if (item.key.objectid == ObjectId.CsumTree
-                and item.key.ty == KeyType.RootItem):
-            return item.data.bytenr
-    sys.exit('ERROR: CSUM_TREE ROOT_ITEM not found in root tree')
-
-
-def find_csum_covering(fp, tree, csum_root_logical, target_logical,
-                      csum_size: int = CSUM_SIZE_CRC32C):
-    """Return (leaf_node, csum_leaf_item) for the first EXTENT_CSUM whose
-    logical range covers `target_logical`. Returns None if not found.
-
-    An EXTENT_CSUM item's key.offset is the logical byte address where its
-    covered data range begins, but its on-disk `size` is the length of the
-    *checksum array* (num_sectors * csum_size bytes) — NOT the length of the
-    data it covers. The covered data length is
-    `(size / csum_size) * CSUM_BLOCK_SIZE`.
-    """
-    for leaf, _ in walk_leaves(fp, csum_root_logical, tree):
-        for item in leaf.items:
-            if item.key.ty != KeyType.ExtentCsum:
-                continue
-            covered_len = (item.size // csum_size) * CSUM_BLOCK_SIZE
-            if item.key.offset <= target_logical < item.key.offset + covered_len:
-                return leaf, item
-    return None
-
-
-def read_stored_csum(fp, leaf, item, target_logical,
-                     csum_size: int = CSUM_SIZE_CRC32C) -> bytes:
-    """Read the raw csum bytes for the data sector containing `target_logical`.
-
-    btrfs layout: an EXTENT_CSUM leaf item holds a contiguous array of
-    checksums (one per sector). The array begins on disk at byte offset
-    `leaf_phys + header_size + item.offset`. For a given logical address:
-        block_index = (target_logical - item.key.offset) / sector_size
-        csum_byte   = array_start + block_index * csum_size
-    """
-    csum_byte = (leaf.phys_start
-                 + Header.sizeof()
-                 + item.offset
-                 + ((target_logical - item.key.offset) // CSUM_BLOCK_SIZE) * csum_size)
-    fp.seek(csum_byte)
-    return fp.read(csum_size)
-
-
 def compute_block_csum(dev: str, phys_offset: int,
-                       block_size: int = CSUM_BLOCK_SIZE) -> int:
+                       block_size: int = BTRFS_SECTOR_SIZE) -> int:
     """Read `block_size` bytes from `dev` at `phys_offset` and return crc32c."""
     with open(dev, 'rb') as fp:
         fp.seek(phys_offset)
@@ -478,10 +335,14 @@ def main() -> None:
         devid_fp_map = {superblock.dev_item.devid: fp}
         tree = build_chunk_tree(superblock, devid_fp_map)
 
-        inode, extent_item = find_file_extent(
-            fp, superblock, tree, devid_fp_map, args.mount_point, target,
-            file_offset,
-        )
+        inode = os.stat(target).st_ino
+        print(f'target: {target}  inode={inode}')
+        print(f'btrfs device: {mount_dev}')
+        try:
+            fs_root = find_tree_root(superblock, tree, devid_fp_map, ObjectId.FsTree)
+            extent_item = find_extent_data(tree, devid_fp_map, fs_root, inode, file_offset)
+        except KeyError as e:
+            sys.exit(f'ERROR: {e}')
 
         print()
         print('=== DEBUG: raw extent fields ===')
@@ -522,7 +383,7 @@ def main() -> None:
             offset_in_extent = random.randrange(extent_item.data.ref.disk_num_bytes)
 
         target_logical = virt_addr + data_ref_offset + offset_in_extent
-        sector_logical = (target_logical // CSUM_BLOCK_SIZE) * CSUM_BLOCK_SIZE
+        sector_logical = (target_logical // BTRFS_SECTOR_SIZE) * BTRFS_SECTOR_SIZE
 
         print()
         print('=== DEBUG ===')
@@ -649,34 +510,21 @@ def main() -> None:
         # parsing trees from; the *computed* checksum comes from the underlying
         # partition (we corrupt THAT device in Step 4, and the array device
         # would otherwise just hand back the cached, uncorrupted bytes).
-        csum_size = CSUM_SIZE_CRC32C if superblock.csum_type == 0 else None
         if superblock.csum_type != 0:
             print()
             print(f'=== Step 2d: skipping checksum verification '
                   f'(unsupported csum_type={superblock.csum_type}; only CRC32C=0 supported) ===')
-            stored_csum_bytes = None
+            stored_csum_int = None
         else:
             print()
             print(f'=== Step 2d: Locating stored checksum (CSUM_TREE walk) ===')
-            csum_root = find_csum_root(superblock, tree, devid_fp_map)
-            print(f'CSUM_TREE root: 0x{csum_root:x}')
-            csum_match = find_csum_covering(fp, tree, csum_root, sector_logical,
-                                            csum_size=csum_size)
-            if csum_match is None:
-                sys.exit('ERROR: no EXTENT_CSUM item covers the file extent '
-                         '(was a btrfs filesystem sync forced after creation?)')
-            csum_leaf, csum_item = csum_match
-            stored_csum_bytes = read_stored_csum(
-                fp, csum_leaf, csum_item, sector_logical, csum_size=csum_size,
-            )
-            block_index = (sector_logical - csum_item.key.offset) // CSUM_BLOCK_SIZE
-            print(f'Block index inside EXTENT_CSUM item: {block_index}')
-            stored_csum_int = struct.unpack('<I', stored_csum_bytes)[0]
-            print(f'CSUM leaf logical  : 0x{csum_leaf.header.bytenr:x}')
-            print(f'CSUM item key      : offset=0x{csum_item.key.offset:x} '
-                  f'size={csum_item.size}')
-            print(f'Stored csum bytes  : {stored_csum_bytes.hex()} '
-                  f'(uint32 LE = 0x{stored_csum_int:08x})')
+            try:
+                csum_root = find_tree_root(superblock, tree, devid_fp_map, ObjectId.CsumTree)
+                print(f'CSUM_TREE root: 0x{csum_root:x}')
+                stored_csum_int = lookup_csum(fp, tree, csum_root, sector_logical)
+            except KeyError as e:
+                sys.exit(f'ERROR: {e} (was a btrfs filesystem sync forced after creation?)')
+            print(f'Stored csum (uint32 LE) : 0x{stored_csum_int:08x}')
 
         # ───────────────────────────────────────────────────────────────────
         # Step 3 — Sanity check: confirm both devices show 0xFF at the target
@@ -691,7 +539,7 @@ def main() -> None:
         # Independently compute the CRC32C of the target 4K data sector,
         # reading from the UNDERLYING partition (the device we will corrupt).
         # For healthy data, this MUST equal the value stored in the CSUM_TREE.
-        if stored_csum_bytes is not None:
+        if stored_csum_int is not None:
             print()
             print('=== Step 3a: Pre-corruption checksum verification ===')
             computed_pre = compute_block_csum(underlying_dev, sector_phys_offset)
@@ -750,7 +598,7 @@ def main() -> None:
         # ───────────────────────────────────────────────────────────────────
         # Step 5a — Post-corruption: confirm stored csum NO LONGER matches
         # ───────────────────────────────────────────────────────────────────
-        if stored_csum_bytes is not None:
+        if stored_csum_int is not None and not args.dry_run:
             print()
             print('=== Step 5a: Post-corruption checksum verification ===')
             computed_post = compute_block_csum(underlying_dev, sector_phys_offset)
