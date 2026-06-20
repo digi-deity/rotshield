@@ -36,58 +36,9 @@ from btrfs_recon.parsing import (
     lookup_csum,
 )
 from btrfs_recon.structure import ObjectId
+from md_array import get_array_config, must_be_root
 
 DEDUP_WINDOW_SECONDS = 5
-
-def must_be_root() -> None:
-    if os.geteuid() != 0:
-        sys.exit("Please run as root (sudo).")
-
-def get_array_config() -> dict:
-    """Parses /proc/nmdstat and strictly validates device paths."""
-    if not os.path.exists('/proc/nmdstat'):
-        sys.exit("ERROR: /proc/nmdstat not found.")
-    
-    values = {}
-    with open('/proc/nmdstat', 'r') as f:
-        for line in f:
-            line = line.strip()
-            if "=" in line:
-                key, _, value = line.partition("=")
-                values[key] = value
-
-    config = {'data_devs': {}, 'parity_p': None, 'parity_q': None}
-    
-    for key, value in values.items():
-        # Only process keys that are exactly 'rdevName.<number>'
-        if key.startswith('rdevName.'):
-            try:
-                slot_str = key.split('.')[1]
-                slot = int(slot_str)
-            except (ValueError, IndexError):
-                continue
-            
-            if not value or value.strip() == "":
-                continue
-
-            # Normalize path
-            full_path = value if value.startswith('/') else f'/dev/{value}'
-            
-            # CRITICAL FIX: Ensure the path is actually a block device and not a directory
-            if not os.path.exists(full_path) or os.path.isdir(full_path):
-                continue
-
-            if slot == 0:
-                config['parity_p'] = full_path
-            elif slot == 29:
-                config['parity_q'] = full_path
-            else:
-                config['data_devs'][slot] = full_path
-
-    if not config['parity_p']:
-        sys.exit("ERROR: Primary parity disk (Slot 0) not found or invalid in /proc/nmdstat")
-        
-    return config
 
 def find_physical_offset(mount_dev: str, target_ino: int, target_off: int):
     with open(mount_dev, 'rb') as fp:
