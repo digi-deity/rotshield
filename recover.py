@@ -24,15 +24,20 @@ import argparse
 import os
 import re
 import sys
-import struct
 import subprocess
 import time
 from crc32c import crc32c
-from btrfs_recon.parsing import parse_superblock, build_chunk_tree, walk_btree, parse_at
-from btrfs_recon.structure import KeyType, ObjectId, TreeNode, Header
+from btrfs_recon.constants import BTRFS_SECTOR_SIZE
+from btrfs_recon.parsing import (
+    parse_superblock,
+    build_chunk_tree,
+    find_tree_root,
+    find_extent_data,
+    lookup_csum,
+)
+from btrfs_recon.structure import ObjectId
 
-CSUM_BLOCK_SIZE = 4096
-DEDUP_WINDOW_SECONDS = 5 
+DEDUP_WINDOW_SECONDS = 5
 
 def must_be_root() -> None:
     if os.geteuid() != 0:
@@ -90,31 +95,22 @@ def find_physical_offset(mount_dev: str, target_ino: int, target_off: int):
         devid_fp_map = {superblock.dev_item.devid: fp}
         tree = build_chunk_tree(superblock, devid_fp_map)
 
-        fs_root_bytenr = None
-        for item in walk_btree(superblock.root, tree, devid_fp_map):
-            if item.key.objectid == ObjectId.FsTree and item.key.ty == KeyType.RootItem:
-                fs_root_bytenr = item.data.bytenr
-                break
-        if fs_root_bytenr is None: raise RuntimeError("FS_TREE ROOT_ITEM not found")
-        
-        found_item = None
-        for item in walk_btree(fs_root_bytenr, tree, devid_fp_map):
-            if item.key.objectid == target_ino and item.key.ty == KeyType.ExtentData:
-                if item.key.offset <= target_off < item.key.offset + item.data.ref.disk_num_bytes:
-                    found_item = item
-                    break
-        if not found_item: raise RuntimeError(f"Could not find extent for ino {target_ino}")
+        try:
+            fs_root = find_tree_root(superblock, tree, devid_fp_map, ObjectId.FsTree)
+            found_item = find_extent_data(tree, devid_fp_map, fs_root, target_ino, target_off)
+        except KeyError as e:
+            raise RuntimeError(str(e))
 
         logical_addr = found_item.data.ref.disk_bytenr + (target_off - found_item.key.offset)
         chunks = list(tree.at(logical_addr))
         if not chunks:
             raise RuntimeError(f"No chunk mapping for logical address {logical_addr}")
-        
+
         chunk = chunks[0]
         phys_base = chunk.data['stripes'][0][1]
         abs_phys_offset = phys_base + (logical_addr - chunk.begin)
         devid = chunk.data['stripes'][0][0]
-        
+
         return devid, abs_phys_offset, logical_addr
 
 def xor_bytes(data_list: list[bytes]) -> bytes:
@@ -124,72 +120,18 @@ def xor_bytes(data_list: list[bytes]) -> bytes:
             result[i] ^= next_block[i]
     return bytes(result)
 
-BTRFS_HEADER_SIZE = 101  # fixed size of a btrfs tree node header on disk
-
 def lookup_extent_csum(mount_dev: str, logical_addr: int) -> int:
-    """
-    Look up the expected CRC32C from the BTRFS checksum tree.
-
-    Returns the checksum for the 4 KiB sector containing logical_addr.
-    Checksums are stored big-endian on disk; we return the value byte-swapped
-    to little-endian so it matches crc32c() output and dmesg reports.
-    """
-    from collections import deque
-
-    with open(mount_dev, "rb") as fp:
+    """Look up the stored CRC32C for the 4 KiB sector containing logical_addr."""
+    sector_logical = (logical_addr // BTRFS_SECTOR_SIZE) * BTRFS_SECTOR_SIZE
+    with open(mount_dev, 'rb') as fp:
         superblock = parse_superblock(fp)
         devid_fp_map = {superblock.dev_item.devid: fp}
         tree = build_chunk_tree(superblock, devid_fp_map)
-
-        csum_root = None
-        for item in walk_btree(superblock.root, tree, devid_fp_map):
-            if (
-                item.key.objectid == ObjectId.CsumTree
-                and item.key.ty == KeyType.RootItem
-            ):
-                csum_root = item.data.bytenr
-                break
-
-        if csum_root is None:
-            raise RuntimeError("Could not locate checksum tree root")
-
-        # Walk the csum tree manually so we have the node's physical address.
-        # item.offset in a leaf item is the offset of its data from the start
-        # of the node body (i.e. right after the fixed-size header), so:
-        #   data_pos = node_phys + BTRFS_HEADER_SIZE + item.offset
-        queue = deque(
-            (devid, phys) for devid, phys, _ in tree.offsets(csum_root)
-        )
-        while queue:
-            devid, node_phys = queue.popleft()
-            node = parse_at(fp, node_phys, TreeNode)
-            if node.header.level > 0:
-                for ptr in node.items:
-                    for d, p, _ in tree.offsets(ptr.blockptr):
-                        queue.append((d, p))
-                continue
-
-            for item in node.items:
-                if item.key.ty != KeyType.ExtentCsum:
-                    continue
-
-                # key.offset holds the logical start address of this csum run.
-                start = item.key.offset
-                num_csums = item.size // 4
-                end = start + num_csums * CSUM_BLOCK_SIZE
-
-                if start <= logical_addr < end:
-                    sector_index = (logical_addr - start) // CSUM_BLOCK_SIZE
-                    data_pos = node_phys + BTRFS_HEADER_SIZE + item.offset
-                    fp.seek(data_pos + sector_index * 4)
-                    # Csums are stored big-endian on disk; convert to LE to
-                    # match crc32c() output and what the kernel reports.
-                    raw = fp.read(4)
-                    return struct.unpack(">I", raw)[0]
-
-        raise RuntimeError(
-            f"No checksum found for logical address 0x{logical_addr:x}"
-        )
+        try:
+            csum_root = find_tree_root(superblock, tree, devid_fp_map, ObjectId.CsumTree)
+            return lookup_csum(fp, tree, csum_root, sector_logical)
+        except KeyError as e:
+            raise RuntimeError(str(e))
 
 def monitor_dmesg(log_file: str | None = None):
     """
@@ -258,19 +200,17 @@ def handle_failure(match):
 
     with open(failing_path, 'rb') as f:
         f.seek(phys_offset)
-        corrupted_block = f.read(CSUM_BLOCK_SIZE)
-    
+        corrupted_block = f.read(BTRFS_SECTOR_SIZE)
+
     current_block_csum = crc32c(corrupted_block)
 
     if actual_csum_reported is not None:
-        adjusted = current_block_csum
-        if adjusted != actual_csum_reported:
-            swapped = struct.unpack('<I', struct.pack('>I', adjusted))[0]
-            if swapped == actual_csum_reported:
-                adjusted = swapped
+        # The kernel reports the actual checksum in dmesg as big-endian bytes
+        # while crc32c() returns little-endian, so byte-swap before comparing.
+        current_be = int.from_bytes(current_block_csum.to_bytes(4, 'little'), 'big')
         print(f"Reported Actual Csum: 0x{actual_csum_reported:08x}")
-        print(f"Read Block Csum:      0x{adjusted:08x}")
-        if adjusted != actual_csum_reported:
+        print(f"Read Block Csum:      0x{current_be:08x}")
+        if current_be != actual_csum_reported:
             raise RuntimeError(f"Verification failed! Block at 0x{phys_offset:x} does not match dmesg.")
         print("✓ Verification successful.")
     else:
@@ -278,21 +218,17 @@ def handle_failure(match):
 
     blocks_to_xor = []
     for slot, path in config['data_devs'].items():
-        if path == failing_path: continue 
+        if path == failing_path: continue
         with open(path, 'rb') as f:
             f.seek(phys_offset)
-            blocks_to_xor.append(f.read(CSUM_BLOCK_SIZE))
-            
+            blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
+
     with open(config['parity_p'], 'rb') as f:
         f.seek(phys_offset)
-        blocks_to_xor.append(f.read(CSUM_BLOCK_SIZE))
+        blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
 
     recovered_data = xor_bytes(blocks_to_xor)
     computed_csum = crc32c(recovered_data)
-    
-    if computed_csum != expected_csum:
-        swapped = struct.unpack('<I', struct.pack('>I', computed_csum))[0]
-        if swapped == expected_csum: computed_csum = swapped
 
     print(f"Expected Csum: 0x{expected_csum:08x} | Recovered: 0x{computed_csum:08x}")
     if computed_csum == expected_csum:
