@@ -11,12 +11,19 @@
 # ///
 
 """
-This script monitors the dmesg buffer for BTRFS checksum failures after a read I/O operation, extracts the relevant information,
-and attempts to recover the corrupted data using parity information.
+Scans the dmesg buffer (or a kernel log file) for BTRFS checksum failures,
+extracts the relevant inode and offset information, and attempts to recover
+the corrupted data using parity information from the array.
 
-Works on this type of dmesg message:
-[218470.835135] BTRFS warning (device nmd1p1): csum failed root 5 ino 257 off 167936 csum 0x28f86fd2 expected csum 0xf8d99c3c mirror 1
-[218470.835140] BTRFS error (device nmd1p1): bdev /dev/nmd1p1 errs: wr 0, rd 0, flush 0, corrupt 7, gen 0
+Handles two kernel message formats:
+
+  Read-I/O failure (btrfs detects corruption during a normal file read):
+    BTRFS warning (device nmd1p1): csum failed root 5 ino 257 off 167936 \
+      csum 0x28f86fd2 expected csum 0xf8d99c3c mirror 1
+
+  Scrub failure (btrfs detects corruption during a background scrub):
+    BTRFS warning (device nmd1p1): checksum error at logical ... \
+      root 5, inode 257, offset 167936, length 4096
 """
 
 from __future__ import annotations
@@ -25,7 +32,6 @@ import os
 import re
 import sys
 import subprocess
-import time
 from crc32c import crc32c
 from btrfs_recon.constants import BTRFS_SECTOR_SIZE
 from btrfs_recon.parsing import (
@@ -38,7 +44,7 @@ from btrfs_recon.parsing import (
 from btrfs_recon.structure import ObjectId
 from md_array import get_array_config, must_be_root
 
-DEDUP_WINDOW_SECONDS = 5
+DEDUP_WINDOW_SECONDS = 5  # minimum seconds between processing the same (dev, ino, off) triplet
 
 def find_physical_offset(mount_dev: str, target_ino: int, target_off: int):
     with open(mount_dev, 'rb') as fp:
@@ -144,7 +150,7 @@ def handle_failure(match):
     expected_csum = lookup_extent_csum(mount_dev, logical_addr)
     
     config = get_array_config()
-    failing_path = config['data_devs'].get(devid)
+    failing_path = config.data_devs.get(devid)
     if not failing_path: raise RuntimeError(f"Could not map DevID {devid} to path")
 
     print(f"Failing Device: {failing_path} (DevID: {devid}) | Offset: 0x{phys_offset:x}")
@@ -168,13 +174,13 @@ def handle_failure(match):
         print(f"Read Block Csum: 0x{current_block_csum:08x} (no reported csum to verify against)")
 
     blocks_to_xor = []
-    for slot, path in config['data_devs'].items():
+    for slot, path in config.data_devs.items():
         if path == failing_path: continue
         with open(path, 'rb') as f:
             f.seek(phys_offset)
             blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
 
-    with open(config['parity_p'], 'rb') as f:
+    with open(config.parity_p, 'rb') as f:
         f.seek(phys_offset)
         blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
 
