@@ -53,7 +53,7 @@ It does not attempt to repair corruption, update checksums, or simulate disk
 failures. Its sole purpose is to create controlled, reproducible data
 corruption scenarios.
 
-Run with:  uv run /root/btrfs_manipulate.py
+Run with:  uv run /root/btrfs_manipulate.py <target-file>
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ from btrfs_recon.parsing import (
     lookup_csum,
 )
 from btrfs_recon.structure import ObjectId
-from md_array import findmnt_source, must_be_root, resolve_devid_to_device
+from md_array import find_mount_for_path, must_be_root, resolve_devid_to_device
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,14 +94,9 @@ def hexdump(data: bytes, base: int = 0, width: int = 16) -> str:
 
 
 def dump_window(dev: str, label: str, phys_offset: int, count: int = 3) -> None:
-    """Hex-dump a window centred just before `phys_offset` on `dev`.
-
-    Mirrors the shell `dump_window` helper: read `count` blocks of 2048 bytes
-    starting one block before the file's physical start, so it is obvious where
-    the file data begins.
-    """
-    # Modified to focus on a small window around the target offset instead of full blocks
-    window_size = 64 
+    """Hex-dump a 64-byte window centred on `phys_offset` on `dev`."""
+    # 64-byte window: 32 bytes before the target through 32 bytes after.
+    window_size = 64
     start_offset = max(phys_offset - 32, 0)
     
     with open(dev, 'rb') as fp:
@@ -186,17 +181,17 @@ def create_test_file(path: str, size_mb: int = 50) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--target', default='/mnt/disk1/bigfile2.bin',
-                        help='path to the test file to corrupt (default: %(default)s)')
-    parser.add_argument('--mount-point', default='/mnt/disk1',
-                        help='mount point of the btrfs filesystem (default: %(default)s)')
-    parser.add_argument('--device', default=None,
-                        help='block device the btrfs filesystem lives on '
-                             '(default: auto-detect from mount point)')
+    parser.add_argument('target',
+                        help='path to the file to corrupt (must be on a mounted btrfs filesystem)')
     parser.add_argument('--size-mb', type=int, default=50,
-                        help='size of the test file to create in MB (default: %(default)s)')
-    parser.add_argument('--byte-value', default='0x00',
-                        help='byte to write at the corruption point (default: %(default)s)')
+                        help='size of the test file to create in MB, if it does not already '
+                             'exist (default: %(default)s)')
+    parser.add_argument('--byte-value', default=None,
+                        help='hex byte value to write at the corruption point '
+                             '(e.g. 0x00); if the on-disk byte already equals this value, '
+                             'its bitwise complement (XOR 0xFF) is written instead to '
+                             'guarantee a real change. '
+                             'Default: XOR the existing byte with 0xFF (always a guaranteed flip)')
     parser.add_argument('--overwrite', action='store_true',
                         help='recreate the test file even if it already exists; '
                              'by default an existing file is reused as-is')
@@ -205,25 +200,23 @@ def main() -> None:
                              '(default: pick a random location across all extents); '
                              'must be in [0, file_size)')
     parser.add_argument('--dry-run', action='store_true',
-                        help='resolve and print the file offset, but do NOT corrupt it')
+                        help='resolve and print the target physical offset, but do NOT write '
+                             'anything to disk')
     args = parser.parse_args()
 
     must_be_root()
 
-    mount_dev = args.device or findmnt_source(args.mount_point)
     target = args.target
+    mount_point, mount_dev = find_mount_for_path(target)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Step 1 — Create a recognisable test file (all 0xFF)
+    # Step 1 — Create the test file if it does not already exist
     # ─────────────────────────────────────────────────────────────────────────
-    # 0xFF is chosen so any corruption is trivially visible in a hex dump:
-    # a single 0x00 byte stands out immediately against a wall of FFs.
-    #
-    # 300 MB forces btrfs to allocate a dedicated data chunk, giving us a
-    # single clean extent to resolve (small files get packed inline or mixed
-    # into metadata nodes, making the offset math messy).
+    # Each 4 KiB sector is filled with its sector index repeated as a 4-byte
+    # little-endian integer, making any corruption trivially visible in a hex
+    # dump and allowing the sector to be identified by its content alone.
     print()
-    print('=== Step 1: Creating test file (all 0xFF) ===')
+    print('=== Step 1: Creating test file ===')
     if args.overwrite or not os.path.exists(target):
         if args.overwrite:
             # Also clear any older bigfile* test siblings for cleanliness.
@@ -242,7 +235,7 @@ def main() -> None:
     # filesystem sync — without this, the CSUM_TREE walk below would find no
     # EXTENT_CSUM item covering the freshly-written extent.
     if not args.dry_run:
-        btrfs_sync(args.mount_point)
+        btrfs_sync(mount_point)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Step 1b — Determine the target byte offset within the file
@@ -250,7 +243,7 @@ def main() -> None:
     # If the caller supplied --file-offset we use it verbatim (after a bounds
     # check). Otherwise we pick a random byte across the entire file — note
     # that for large files btrfs may have allocated multiple extents, so the
-    # random offset might land anywhere across them; find_file_extent handles
+    # random offset might land anywhere across them; find_extent_data handles
     # this by walking all EXTENT_DATA items for the inode.
     file_size = os.path.getsize(target)
     if args.file_offset is not None:
@@ -406,7 +399,6 @@ def main() -> None:
 
         # ───────────────────────────────────────────────────────────────────
         # Step 2c — Translate btrfs devid → actual block device path
-        # (moved up: needed by the neighbouring-sectors debug dump below)
         # ───────────────────────────────────────────────────────────────────
         print()
         print(f'=== Step 2c: Resolving btrfs devid {devid} → block device path ===')
@@ -416,18 +408,15 @@ def main() -> None:
         # ───────────────────────────────────────────────────────────────────
         # Step 2d — Locate the stored checksum for the file's target data block
         # ───────────────────────────────────────────────────────────────────
-        # This goes beyond the original shell script — btrfs_manipulate.sh does
-        # NOT compute or read checksums. We walk the dedicated CSUM_TREE
-        # (objectid 7) and find the EXTENT_CSUM leaf item whose logical range
-        # covers the target byte's sector, then read its raw CRC32C bytes
-        # so we can prove (in Steps 3a and 5a) that the silent corruption
-        # actually invalidates the on-disk btrfs checksum, not just the file's
-        # visible data.
+        # Walk the CSUM_TREE (objectid 7) to find the EXTENT_CSUM leaf item
+        # whose logical range covers the target byte's sector. The stored
+        # CRC32C is used in Steps 3a and 5a to prove that the silent corruption
+        # actually invalidates the btrfs checksum.
         #
-        # The stored checksum is read from the same array device we're already
-        # parsing trees from; the *computed* checksum comes from the underlying
-        # partition (we corrupt THAT device in Step 4, and the array device
-        # would otherwise just hand back the cached, uncorrupted bytes).
+        # The stored checksum is read from the array device (the superblock
+        # source); the *computed* checksum is read from the underlying data
+        # disk partition — the device we write to in Step 4, which is never
+        # seen by the array layer so parity remains stale.
         if superblock.csum_type != 0:
             print()
             print(f'=== Step 2d: skipping checksum verification '
@@ -448,7 +437,7 @@ def main() -> None:
         # Step 3 — Sanity check: confirm both devices show 0xFF at the target
         # ───────────────────────────────────────────────────────────────────
         print()
-        print(f'=== Step 3: Sanity check — both devices should show 0xFF at offset {real_phys_offset} ===')
+        print(f'=== Step 3: Sanity check — hex dump at target offset {real_phys_offset} ===')
         dump_window(underlying_dev, 'Underlying partition', real_phys_offset)
 
         # ───────────────────────────────────────────────────────────────────
@@ -477,20 +466,23 @@ def main() -> None:
         # the exact physical offset of the target file byte, bypassing btrfs
         # (so checksums go stale) and the NonRAID array (so parity disks are
         # NOT updated and cannot heal it).
-        byte_value = int(args.byte_value, 0)
+        byte_value = args.byte_value and int(args.byte_value, 0)
         byte_offset = real_phys_offset
         print()
-        print(f'=== Step 4: Writing 0x{byte_value:02x} to {underlying_dev} at byte offset {byte_offset} ===')
         if args.dry_run:
+            print(f'=== Step 4: (dry-run) Would corrupt {underlying_dev} at byte offset {byte_offset} ===')
             print('(dry-run: not actually writing)')
         else:
             with open(underlying_dev, 'r+b') as raw_fp:
                 raw_fp.seek(byte_offset)
                 current = raw_fp.read(1)[0]
-                if current == byte_value:
-                    byte_value = byte_value ^ 0xFF  # guarantee a real change
+                if byte_value is None:
+                    byte_value = current ^ 0xFF
+                elif current == byte_value:
+                    byte_value = byte_value ^ 0xFF
                     print(f'  NOTE: on-disk byte is already 0x{current:02x}; '
-                        f'writing 0x{byte_value:02x} instead so corruption actually takes effect')
+                          f'writing 0x{byte_value:02x} instead so corruption actually takes effect')
+                print(f'=== Step 4: Writing 0x{byte_value:02x} to {underlying_dev} at byte offset {byte_offset} ===')
                 raw_fp.seek(byte_offset)
                 raw_fp.write(bytes([byte_value]))
                 raw_fp.flush()

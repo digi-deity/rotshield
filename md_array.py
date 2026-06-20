@@ -67,6 +67,29 @@ def findmnt_source(mount_point: str) -> str:
     sys.exit(f'ERROR: could not find device for mount point {mount_point}')
 
 
+def find_mount_for_path(path: str) -> tuple[str, str]:
+    """Return ``(mount_point, device)`` for the filesystem containing *path*.
+
+    Selects the longest matching mount point from /proc/mounts so that nested
+    mounts are handled correctly (e.g. /mnt/disk1 wins over /mnt).
+    """
+    real = os.path.realpath(path)
+    best_mp = best_dev = None
+    with open('/proc/mounts') as f:
+        for line in f:
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            dev, mp = fields[0], fields[1]
+            # A mount point matches if it is a prefix of the resolved path.
+            if real == mp or real.startswith(mp.rstrip('/') + '/'):
+                if best_mp is None or len(mp) > len(best_mp):
+                    best_mp, best_dev = mp, dev
+    if best_mp is None:
+        sys.exit(f'ERROR: could not determine mount point for {path}')
+    return best_mp, best_dev
+
+
 def _is_block_device(path: str) -> bool:
     try:
         st = os.stat(path)
