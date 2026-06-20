@@ -58,7 +58,6 @@ Run with:  uv run /root/btrfs_manipulate.py
 from __future__ import annotations
 
 import os
-import re
 import sys
 import random
 import argparse
@@ -74,16 +73,12 @@ from btrfs_recon.parsing import (
     lookup_csum,
 )
 from btrfs_recon.structure import ObjectId
+from md_array import findmnt_source, must_be_root, resolve_devid_to_device
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Setup
 # ─────────────────────────────────────────────────────────────────────────────
-
-def must_be_root() -> None:
-    if os.geteuid() != 0:
-        sys.exit("Please run as root (sudo).")
-
 
 def hexdump(data: bytes, base: int = 0, width: int = 16) -> str:
     """Mimic `hexdump -C` for a bytes window starting at `base`."""
@@ -153,54 +148,6 @@ def compute_block_csum(dev: str, phys_offset: int,
                  f'(wanted {block_size}, got {len(block)})')
     return crc32c(block)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Device resolution (replaces /proc/nmdstat awk parsing)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def findmnt_source(mount_point: str) -> str:
-    """Return the block device path a mount point is mounted from (like `findmnt -n -o SOURCE`)."""
-    with open('/proc/mounts') as f:
-        for line in f:
-            fields = line.split()
-            if len(fields) >= 2 and fields[1] == mount_point:
-                return fields[0]
-    sys.exit(f'ERROR: could not find device for mount point {mount_point}')
-
-
-def resolve_devid_to_device(devid: int, mount_dev: str) -> str:
-    """Translate btrfs devid → underlying block device path via /proc/nmdstat.
-
-    The NonRAID kernel module exposes /proc/nmdstat with lines:
-        rdevName.<slot>=<name>
-    where <slot> corresponds to the btrfs devid for data disks, and <name> is
-    a bare device name (e.g. "loop2p1"). Normalize it to a full /dev/ path.
-
-    If /proc/nmdstat is not present (plain btrfs, not a NonRAID array), we
-    fall back to using the mounted device directly.
-    """
-    if os.path.exists('/proc/nmdstat'):
-        pat = re.compile(rf'^rdevName\.{devid}=(.+)$')
-        with open('/proc/nmdstat') as f:
-            for line in f:
-                m = pat.match(line.strip())
-                if m:
-                    name = m.group(1)
-                    if not name.startswith('/'):
-                        name = f'/dev/{name}'
-                    if not os.path.exists(name) or not _is_block_device(name):
-                        sys.exit(f'ERROR: {name} is not a block device')
-                    return name
-        sys.exit(f'ERROR: rdevName.{devid} not found in /proc/nmdstat')
-    return mount_dev
-
-
-def _is_block_device(path: str) -> bool:
-    try:
-        st = os.stat(path)
-        return (st.st_mode & 0o170000) == 0o060000  # S_ISBLK
-    except OSError:
-        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
