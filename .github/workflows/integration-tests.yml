@@ -118,7 +118,13 @@ jobs:
 
           sudo dmesg | tail -n 20
 
-          sudo python3 recover.py
+          output=$(sudo python3 recover.py)
+          echo "$output"
+
+          echo "$output" | grep -q "✓ Corruption confirmed" \
+            || { echo "ERROR: recovery script did not confirm corruption"; exit 1; }
+          echo "$output" | grep -q "✓ SUCCESS: Data recovered" \
+            || { echo "ERROR: recovery script did not recover data"; exit 1; }
 
       - name: Cleanup
         if: always()

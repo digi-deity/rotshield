@@ -46,6 +46,12 @@ from md_array import get_array_config, must_be_root
 
 DEDUP_WINDOW_SECONDS = 5  # minimum seconds between processing the same (dev, ino, off) triplet
 
+# The btrfs scrub (via the NonRAID driver) reports the start of the 32 KB-aligned
+# window that contains the corrupt sector, not the exact 4 KB sector address.
+# Scan this many sectors (8 × 4 KiB = 32 KiB) forward from the reported offset
+# to locate the actually-corrupt sector.
+SCAN_WINDOW_SECTORS = 8
+
 def find_physical_offset(mount_dev: str, target_ino: int, target_off: int):
     with open(mount_dev, 'rb') as fp:
         superblock = parse_superblock(fp)
@@ -192,48 +198,73 @@ def monitor_dmesg(log_file: str | None = None):
 def handle_failure(fields: dict):
     must_be_root()
     failing_dev_name = fields['dev']
-    ino, off = int(fields['ino']), int(fields['off'])
+    ino, reported_off = int(fields['ino']), int(fields['off'])
     actual_csum_str = fields.get('actual')
     actual_csum_reported = int(actual_csum_str, 16) if actual_csum_str else None
 
     mount_dev = f"/dev/{failing_dev_name}" if not failing_dev_name.startswith('/') else failing_dev_name
-    devid, phys_offset, logical_addr = find_physical_offset(mount_dev, ino, off)
-    expected_csum = lookup_extent_csum(mount_dev, logical_addr)
-
     config = get_array_config()
-    failing_path = config.data_devs.get(devid)
-    if not failing_path:
-        raise RuntimeError(f"Could not map DevID {devid} to path")
 
-    print(f"Failing Device: {failing_path} (DevID: {devid}) | Offset: 0x{phys_offset:x}")
+    # --- Locate the corrupt sector -------------------------------------------
+    # The btrfs scrub (via the NonRAID driver) reports the start of a 32 KB-
+    # aligned window as the inode offset rather than the exact 4 KB sector.
+    # Scan forward up to SCAN_WINDOW_SECTORS to find the sector whose on-disk
+    # CRC32C no longer matches the value stored in the CSUM_TREE.
+    devid = phys_offset = logical_addr = expected_csum = None
+    corrupted_block = failing_path = None
 
-    with open(failing_path, 'rb') as f:
-        f.seek(phys_offset)
-        corrupted_block = f.read(BTRFS_SECTOR_SIZE)
+    print(f"Scanning {SCAN_WINDOW_SECTORS} sectors from reported offset {reported_off}...")
+    for i in range(SCAN_WINDOW_SECTORS):
+        candidate_off = reported_off + i * BTRFS_SECTOR_SIZE
+        try:
+            d, p, la = find_physical_offset(mount_dev, ino, candidate_off)
+        except RuntimeError as e:
+            print(f"  [{i}] offset {candidate_off}: no extent — {e}")
+            continue
 
-    current_block_csum = crc32c(corrupted_block)
+        try:
+            ec = lookup_extent_csum(mount_dev, la)
+        except RuntimeError as e:
+            print(f"  [{i}] offset {candidate_off} → logical 0x{la:x}: no stored csum — {e}")
+            continue
 
-    # --- Pre-recovery check: confirm that the block is actually corrupt ------
-    # Compare the on-disk csum against what btrfs metadata expects.
-    # If they already agree, either the data is fine (no recovery needed) or
-    # we are reading from the wrong physical location — either way, do not
-    # attempt recovery.
-    print(f"  On-disk csum:   0x{current_block_csum:08x}")
-    print(f"  Metadata csum:  0x{expected_csum:08x}")
-    if current_block_csum == expected_csum:
-        print("✓ Block matches metadata checksum — no corruption at this location. Skipping recovery.")
+        fp_path = config.data_devs.get(d)
+        if not fp_path:
+            print(f"  [{i}] offset {candidate_off}: DevID {d} not in array config")
+            continue
+
+        with open(fp_path, 'rb') as f:
+            f.seek(p)
+            block = f.read(BTRFS_SECTOR_SIZE)
+
+        disk_csum = crc32c(block)
+        if disk_csum != ec:
+            print(f"  [{i}] offset {candidate_off} → phys 0x{p:x}: CORRUPT "
+                  f"(disk=0x{disk_csum:08x}, stored=0x{ec:08x})")
+            devid, phys_offset, logical_addr, expected_csum = d, p, la, ec
+            corrupted_block, failing_path = block, fp_path
+            break
+
+        print(f"  [{i}] offset {candidate_off} → phys 0x{p:x}: OK (csum=0x{disk_csum:08x})")
+
+    if devid is None:
+        print(f"✓ No corruption found in {SCAN_WINDOW_SECTORS}-sector window — skipping recovery.")
         return
+
+    print(f"\nFailing Device: {failing_path} (DevID: {devid}) | Offset: 0x{phys_offset:x}")
+    print(f"  On-disk csum:   0x{crc32c(corrupted_block):08x}")
+    print(f"  Metadata csum:  0x{expected_csum:08x}")
     print("✓ Corruption confirmed: on-disk data does not match metadata checksum.")
 
     # For read-I/O failures the log also carries the csum btrfs actually read.
-    # Cross-check it against our own read to be sure we reached the right block.
+    # Cross-check it against our own read to confirm we found the right block.
     if actual_csum_reported is not None:
-        current_be = int.from_bytes(current_block_csum.to_bytes(4, 'little'), 'big')
+        disk_csum = crc32c(corrupted_block)
         print(f"  Reported actual csum: 0x{actual_csum_reported:08x}")
-        print(f"  Our read csum:        0x{current_be:08x}")
-        if current_be != actual_csum_reported:
+        print(f"  Our read csum:        0x{disk_csum:08x}")
+        if disk_csum != actual_csum_reported:
             raise RuntimeError(
-                f"Block at 0x{phys_offset:x}: our read csum 0x{current_be:08x} "
+                f"Block at 0x{phys_offset:x}: our read csum 0x{disk_csum:08x} "
                 f"differs from the csum btrfs reported (0x{actual_csum_reported:08x}). "
                 "Aborting — we may be looking at the wrong location."
             )
