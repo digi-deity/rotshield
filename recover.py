@@ -10,7 +10,7 @@
 # ]
 #
 # [tool.uv.sources]
-# btrfs-recon = { path = "/root/btrfs-recon" }
+# btrfs-recon = { path = "/root/project/unraid-btrfs-integrity-recovery" }
 # ///
 
 """
@@ -74,17 +74,18 @@ def find_physical_offset(mount_dev: str, target_ino: int, target_off: int):
         return devid, abs_phys_offset, logical_addr
 
 
-def find_corrupt_sector(
+def find_all_corrupt_sectors(
     mount_dev: str,
     data_dev_path: str,
     base_logical: int,
     base_phys: int,
     window: int = 64,
-) -> tuple[int, int] | None:
-    """Scan ±window sectors around base_logical/base_phys for an actual CRC32C mismatch.
+) -> list[tuple[int, int]]:
+    """Scan ±window sectors around base_logical/base_phys for CRC32C mismatches.
 
-    The scrub reports the start of the chunk window, not the exact sector.
-    Returns (logical, phys) of the first mismatching sector, or None if not found.
+    Returns a list of (logical, phys) for every mismatching sector in the window.
+    The scrub reports the start of a chunk window, not the exact sector, so there
+    may be more than one corrupt sector within this range.
     """
     with open(mount_dev, 'rb') as fp:
         superblock = parse_superblock(fp)
@@ -95,6 +96,7 @@ def find_corrupt_sector(
         except KeyError as e:
             raise RuntimeError(str(e))
 
+        mismatches = []
         for delta in range(-window, window + 1):
             logical = base_logical + delta * BTRFS_SECTOR_SIZE
             phys    = base_phys    + delta * BTRFS_SECTOR_SIZE
@@ -109,8 +111,8 @@ def find_corrupt_sector(
             except Exception:
                 continue
             if actual != stored:
-                return logical, phys
-    return None
+                mismatches.append((logical, phys))
+        return mismatches
 
 def xor_bytes(data_list: list[bytes]) -> bytes:
     result = bytearray(data_list[0])
@@ -136,20 +138,99 @@ def write_recovered_data(
     recovered_data: bytes,
     phys_offset: int,
     failing_path: str,
-) -> bool:
-    """Write recovered data to disk and verify the write.
-
-    Returns True if write and verification succeeded, False otherwise.
-    """
+) -> None:
+    """Write recovered data to disk, bypassing the array layer so parity is not updated."""
     print("✓ Checksum verified! Writing recovered data to disk...")
-    # Write the recovered data back to the failing device, bypassing the array layer.
-    # This ensures parity is not updated (we're manually recovering from it).
     with open(failing_path, 'r+b') as f:
         f.seek(phys_offset)
         f.write(recovered_data)
         f.flush()
         os.fsync(f.fileno())
     print(f"✓ SUCCESS: Data written to {failing_path} at offset 0x{phys_offset:x}")
+
+
+def recover_sector(
+    mount_dev: str,
+    config,
+    failing_path: str,
+    logical_addr: int,
+    phys_offset: int,
+    actual_csum_reported: int | None = None,
+) -> dict:
+    """Attempt parity recovery for a single confirmed-corrupt sector.
+
+    actual_csum_reported: the CRC32C btrfs logged (read-IO failures only), used
+    to cross-check that we are reading the exact sector btrfs complained about.
+    Only meaningful when logical_addr matches the originally reported offset.
+
+    Returns a dict with:
+      'success'        — bool
+      'error'          — str describing why it failed/was skipped (when not successful)
+      'phys_offset'    — int physical offset (always present)
+      'logical_addr'   — int logical address (always present)
+      'failing_path'   — str device path (always present)
+      'recovered_data' — bytes (only when successful)
+    """
+    base = {'phys_offset': phys_offset, 'logical_addr': logical_addr, 'failing_path': failing_path}
+
+    expected_csum = lookup_extent_csum(mount_dev, logical_addr)
+
+    with open(failing_path, 'rb') as f:
+        f.seek(phys_offset)
+        corrupted_block = f.read(BTRFS_SECTOR_SIZE)
+
+    current_block_csum = crc32c(corrupted_block)
+    print(f"  [0x{phys_offset:x}] on-disk csum: 0x{current_block_csum:08x}  metadata csum: 0x{expected_csum:08x}")
+
+    if current_block_csum == expected_csum:
+        return {**base, 'success': False, 'error': "Block matches metadata checksum — no corruption at this location"}
+    print(f"  [0x{phys_offset:x}] ✓ Corruption confirmed.")
+
+    # For read-IO failures the kernel also logs the csum it observed. Cross-check
+    # that our read matches, to ensure we are looking at the right block.
+    if actual_csum_reported is not None:
+        current_be = int.from_bytes(current_block_csum.to_bytes(4, 'little'), 'big')
+        if current_be != actual_csum_reported:
+            return {
+                **base,
+                'success': False,
+                'error': (
+                    f"our read csum 0x{current_be:08x} differs from "
+                    f"kernel-reported 0x{actual_csum_reported:08x} — wrong location"
+                ),
+            }
+        print(f"  [0x{phys_offset:x}] ✓ Matches kernel-reported csum.")
+
+    blocks_to_xor = []
+    for path in config.data_devs.values():
+        if path == failing_path:
+            continue
+        with open(path, 'rb') as f:
+            f.seek(phys_offset)
+            blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
+    with open(config.parity_p, 'rb') as f:
+        f.seek(phys_offset)
+        blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
+
+    # Parity must be inconsistent with the corrupted data for XOR recovery to work.
+    # XOR(all data blocks, parity) == 0 means parity was computed from the corrupted
+    # byte, so it cannot reconstruct the original.
+    parity_check = xor_bytes([corrupted_block] + blocks_to_xor)
+    if all(b == 0 for b in parity_check):
+        return {
+            **base,
+            'success': False,
+            'error': "Parity is consistent with corrupted data — baked into parity; XOR recovery impossible",
+        }
+
+    recovered_data = xor_bytes(blocks_to_xor)
+    computed_csum = crc32c(recovered_data)
+    print(f"  [0x{phys_offset:x}] expected csum: 0x{expected_csum:08x}  recovered csum: 0x{computed_csum:08x}")
+
+    if computed_csum != expected_csum:
+        return {**base, 'success': False, 'error': "Checksum mismatch after XOR recovery"}
+
+    return {**base, 'success': True, 'recovered_data': recovered_data}
 
 # --- Field detection -----------------------------------------------------
 # Different btrfs/kernel versions reorder fields, rename them (ino vs inode,
@@ -205,10 +286,83 @@ def _extract_fields(line: str) -> dict | None:
     return fields
 
 
+def handle_failure(
+    fields: dict,
+    already_recovered: set[int],
+) -> list[dict]:
+    """Locate and recover all corrupt sectors within the scan window for one log line.
+
+    Each log line provides a single (ino, off) hint that maps to a logical address.
+    The ±64-sector scan around that address may reveal multiple corrupt sectors —
+    one per distinct physical offset with a CRC32C mismatch.
+
+    already_recovered is a set of physical offsets that have already been written
+    back (shared across all log lines to avoid double-recovery when two log lines
+    have overlapping scan windows). It is mutated in place.
+
+    Returns a list of result dicts, one per sector attempted.
+    """
+    try:
+        must_be_root()
+        failing_dev_name = fields['dev']
+        ino, off = int(fields['ino']), int(fields['off'])
+        actual_csum_str = fields.get('actual')
+        # actual_csum_reported is the checksum btrfs observed for the specific sector
+        # named in the log line. It is only valid for the sector at `off`; sectors
+        # discovered by scanning nearby are not cross-checked against it.
+        actual_csum_reported = int(actual_csum_str, 16) if actual_csum_str else None
+
+        mount_dev = f"/dev/{failing_dev_name}" if not failing_dev_name.startswith('/') else failing_dev_name
+        devid, base_phys, base_logical = find_physical_offset(mount_dev, ino, off)
+
+        config = get_array_config()
+        failing_path = config.data_devs.get(devid)
+        if not failing_path:
+            return [{'success': False, 'error': f"Could not map DevID {devid} to path",
+                     'phys_offset': base_phys, 'logical_addr': base_logical,
+                     'failing_path': None}]
+
+        print(f"Failing Device: {failing_path} (DevID: {devid}) | Hint offset: 0x{base_phys:x}")
+
+        corrupt_sectors = find_all_corrupt_sectors(mount_dev, failing_path, base_logical, base_phys)
+        if not corrupt_sectors:
+            return [{'success': False,
+                     'error': "No mismatching sectors found in ±64-sector window",
+                     'phys_offset': base_phys, 'logical_addr': base_logical,
+                     'failing_path': failing_path}]
+
+        print(f"  Found {len(corrupt_sectors)} corrupt sector(s) in window.")
+
+        results = []
+        for logical, phys in corrupt_sectors:
+            if phys in already_recovered:
+                print(f"  [0x{phys:x}] Already recovered by a previous log line — skipping.")
+                continue
+
+            # Only pass actual_csum_reported for the sector the log line named.
+            reported_csum = actual_csum_reported if logical == base_logical else None
+
+            result = recover_sector(mount_dev, config, failing_path, logical, phys, reported_csum)
+            results.append(result)
+
+            if result['success']:
+                write_recovered_data(result['recovered_data'], phys, failing_path)
+                already_recovered.add(phys)
+            else:
+                print(f"  [0x{phys:x}] ✗ {result['error']}")
+
+        return results
+
+    except Exception as e:
+        return [{'success': False, 'error': f"Exception: {e}",
+                 'phys_offset': 0, 'logical_addr': 0, 'failing_path': None}]
+
+
 def monitor_dmesg(log_file: str | None = None):
     """
     Reads the current dmesg buffer (or a log file), processes all BTRFS csum
-    failures, and then exits.
+    failures, and attempts to recover each corrupt sector. Sectors already
+    recovered from a prior log line's window are skipped.
     """
     if log_file:
         print(f"Scanning log file '{log_file}' for BTRFS csum failures...")
@@ -218,124 +372,57 @@ def monitor_dmesg(log_file: str | None = None):
         except OSError as e:
             sys.exit(f"ERROR: Failed to read log file: {e}")
     else:
-        print(f"Scanning dmesg for BTRFS csum failures...")
+        print("Scanning dmesg for BTRFS csum failures...")
         try:
             log_data = subprocess.check_output(['dmesg'], text=True)
         except subprocess.CalledProcessError as e:
             sys.exit(f"ERROR: Failed to read dmesg: {e}")
 
-    found_any = False
-    seen_errors = set()
-
+    seen_hints: set[tuple] = set()
+    hints: list[dict] = []
     for line in log_data.splitlines():
         if 'BTRFS warning' not in line:
             continue
-
         fields = _extract_fields(line)
         if fields is None:
             continue
-
-        error_key = (fields['dev'], fields['ino'], fields['off'])
-        if error_key in seen_errors:
+        key = (fields['dev'], fields['ino'], fields['off'])
+        if key in seen_hints:
             continue
-        seen_errors.add(error_key)
-        found_any = True
+        seen_hints.add(key)
+        hints.append(fields)
 
-        print(f"\n[!] Detected {fields['type']} corruption: {fields['raw']}")
-        handle_failure(fields)
-
-    if not found_any:
+    if not hints:
         print("No BTRFS checksum failures found in dmesg.")
-    else:
-        print(f"\nFinished processing {len(seen_errors)} unique errors.")
-
-
-def handle_failure(fields: dict):
-    must_be_root()
-    failing_dev_name = fields['dev']
-    ino, off = int(fields['ino']), int(fields['off'])
-    actual_csum_str = fields.get('actual')
-    actual_csum_reported = int(actual_csum_str, 16) if actual_csum_str else None
-
-    mount_dev = f"/dev/{failing_dev_name}" if not failing_dev_name.startswith('/') else failing_dev_name
-    devid, phys_offset, logical_addr = find_physical_offset(mount_dev, ino, off)
-
-    config = get_array_config()
-    failing_path = config.data_devs.get(devid)
-    if not failing_path:
-        raise RuntimeError(f"Could not map DevID {devid} to path")
-
-    print(f"Failing Device: {failing_path} (DevID: {devid}) | Initial offset: 0x{phys_offset:x}")
-
-    # The scrub reports the start of a chunk window, not the exact corrupted
-    # sector. Scan ±64 sectors to find the one that actually mismatches.
-    result = find_corrupt_sector(mount_dev, failing_path, logical_addr, phys_offset)
-    if result is None:
-        print("✗ Could not find any mismatching sector in ±64-sector window. Skipping.")
-        return
-    logical_addr, phys_offset = result
-    print(f"  Found corrupt sector: logical=0x{logical_addr:x}  phys=0x{phys_offset:x}")
-
-    expected_csum = lookup_extent_csum(mount_dev, logical_addr)
-
-    with open(failing_path, 'rb') as f:
-        f.seek(phys_offset)
-        corrupted_block = f.read(BTRFS_SECTOR_SIZE)
-
-    current_block_csum = crc32c(corrupted_block)
-
-    print(f"  On-disk csum:   0x{current_block_csum:08x}")
-    print(f"  Metadata csum:  0x{expected_csum:08x}")
-    if current_block_csum == expected_csum:
-        print("✓ Block matches metadata checksum — no corruption at this location. Skipping recovery.")
-        return
-    print("✓ Corruption confirmed: on-disk data does not match metadata checksum.")
-
-    # For read-I/O failures the log also carries the csum btrfs actually read.
-    # Cross-check it against our own read to be sure we reached the right block.
-    if actual_csum_reported is not None:
-        current_be = int.from_bytes(current_block_csum.to_bytes(4, 'little'), 'big')
-        print(f"  Reported actual csum: 0x{actual_csum_reported:08x}")
-        print(f"  Our read csum:        0x{current_be:08x}")
-        if current_be != actual_csum_reported:
-            raise RuntimeError(
-                f"Block at 0x{phys_offset:x}: our read csum 0x{current_be:08x} "
-                f"differs from the csum btrfs reported (0x{actual_csum_reported:08x}). "
-                "Aborting — we may be looking at the wrong location."
-            )
-        print("  ✓ Matches dmesg-reported csum.")
-
-    blocks_to_xor = []
-    for slot, path in config.data_devs.items():
-        if path == failing_path:
-            continue
-        with open(path, 'rb') as f:
-            f.seek(phys_offset)
-            blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
-
-    with open(config.parity_p, 'rb') as f:
-        f.seek(phys_offset)
-        blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
-
-    # Check parity consistency before attempting recovery.
-    # XOR of all data blocks + parity must be zero for parity to be usable.
-    all_blocks = [corrupted_block] + blocks_to_xor
-    parity_check = xor_bytes(all_blocks)
-    parity_consistent = all(b == 0 for b in parity_check)
-    if parity_consistent:
-        print("✗ Parity is consistent with the corrupted data — corruption was already "
-              "baked into parity (pre-existing or introduced through the array layer). "
-              "XOR recovery cannot reconstruct the original data.")
         return
 
-    recovered_data = xor_bytes(blocks_to_xor)
-    computed_csum = crc32c(recovered_data)
+    print(f"\n[*] Found {len(hints)} unique log hints. Scanning recovery windows...\n")
 
-    print(f"Expected Csum: 0x{expected_csum:08x} | Recovered: 0x{computed_csum:08x}")
-    if computed_csum == expected_csum:
-        write_recovered_data(recovered_data, phys_offset, failing_path)
-    else:
-        print("✗ FAILURE: Checksum still mismatch.")
+    already_recovered: set[int] = set()
+    all_results: list[dict] = []
+
+    for fields in hints:
+        print(f"\n{'='*70}")
+        print(f"[!] {fields['type']} — ino={fields['ino']} off={fields['off']} dev={fields['dev']}")
+        print(f"{'='*70}")
+        results = handle_failure(fields, already_recovered)
+        all_results.extend(results)
+
+    # Summary
+    successful = [r for r in all_results if r['success']]
+    failed     = [r for r in all_results if not r['success']]
+    print(f"\n{'='*70}")
+    print(f"[*] RECOVERY SUMMARY")
+    print(f"{'='*70}")
+    print(f"Log line hints processed : {len(hints)}")
+    print(f"Sectors attempted        : {len(all_results)}")
+    print(f"  ✓ Recovered            : {len(successful)}")
+    print(f"  ✗ Failed/skipped       : {len(failed)}")
+    if failed:
+        print("\nFailed sectors:")
+        for r in failed:
+            print(f"  phys=0x{r['phys_offset']:x} — {r['error']}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Recover BTRFS corrupted blocks using parity.')

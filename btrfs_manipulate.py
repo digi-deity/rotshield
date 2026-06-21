@@ -2,16 +2,13 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "crc32c>=2.2.post0",
-#   "btrfs-recon",
+#   "crc32c",
 #   "construct",
 #   "construct-typing",
 #   "intervaltree"
 # ]
-#
-# [tool.uv.sources]
-# btrfs-recon = { path = "/root/btrfs-recon" }
 # ///
+
 """
 btrfs_manipulate.py
 
@@ -301,12 +298,6 @@ def main() -> None:
             sys.exit(f'ERROR: first extent is not REGULAR (type={extent_item.data.type})')
         virt_addr = extent_item.data.ref.disk_bytenr
         extent_size = extent_item.data.ref.disk_num_bytes
-        print(f'Found EXTENT_DATA for inode {inode}')
-        print(f'  extent key offset (file)   = {extent_item.key.offset}')
-        print(f'  disk_bytenr (virtual addr) = {virt_addr} (0x{virt_addr:x})')
-        print(f'  disk_num_bytes             = {extent_size}')
-        print(f'  num_bytes                  = {extent_item.data.ref.num_bytes}')
-        print(f'  disk_num_bytes             = {extent_size}')
 
         # Translate the file-level byte offset into the logical (virtual) disk
         # address of that exact byte, then find the sector boundary that btrfs
@@ -328,85 +319,22 @@ def main() -> None:
         target_logical = virt_addr + data_ref_offset + offset_in_extent
         sector_logical = (target_logical // BTRFS_SECTOR_SIZE) * BTRFS_SECTOR_SIZE
 
-        print()
-        print('=== DEBUG ===')
-        print(f'extent key.offset      = {extent_item.key.offset}')
-        print(f'ref.offset             = {data_ref_offset}')
-        print(f'disk_bytenr            = {virt_addr}')
-        print(f'num_bytes              = {extent_item.data.ref.num_bytes}')
-        print(f'disk_num_bytes         = {extent_item.data.ref.disk_num_bytes}')
-        print(f'file_offset            = {file_offset}')
-        print(f'offset_in_extent       = {offset_in_extent}')
-        print(f'target_logical         = {target_logical}')
-        print(f'sector_logical         = {sector_logical}')
-
-        print(f'  offset in extent           = {offset_in_extent}')
-        print(f'  target logical address     = {target_logical} (0x{target_logical:x})')
-        print(f'  sector logical address     = {sector_logical} (0x{sector_logical:x})')
-
-        print()
-        print('=== DEBUG: possible scrub windows ===')
-
-        for size_kb in (4, 8, 16, 32, 64, 128, 256):
-            size = size_kb * 1024
-            start = target_logical & ~(size - 1)
-
-            print(
-                f'{size_kb:3d} KiB window: '
-                f'start={start:#x}, '
-                f'offset={target_logical - start}'
-            )
-
-        print()
-
-        print()
-        print('=== DEBUG: btrfs logical-resolve ===')
-
-        for logical in (
-            target_logical,
-            sector_logical,
-            sector_logical - 4096,
-            sector_logical - 2 * 4096,
-            sector_logical - 7 * 4096,
-        ):
-            print(f'\nlogical = {logical:#x}')
-
-            try:
-                out = subprocess.check_output(
-                    [
-                        'btrfs',
-                        'inspect-internal',
-                        'logical-resolve',
-                        str(logical),
-                        os.path.dirname(target),
-                    ],
-                    text=True,
-                )
-
-                print(out.rstrip())
-
-            except subprocess.CalledProcessError as e:
-                print('logical-resolve failed')
-                print(e.output)
-
         # ───────────────────────────────────────────────────────────────────
         # Step 2b — Map target logical address → physical offset on device
         # ───────────────────────────────────────────────────────────────────
         print()
-        print('=== Step 2b: Mapping logical address to physical offset (CHUNK_TREE) ===')
+        print('=== Step 2b: Mapping logical → physical offset ===',)
         devid, real_phys_offset, chunk_virt_start, chunk_phys_base = \
             resolve_logical_to_physical(tree, target_logical)
-        # The chunk mapping is linear, so the sector-aligned physical offset is
-        # simply real_phys_offset minus the byte's position within its sector.
         sector_phys_offset = real_phys_offset - (target_logical - sector_logical)
+        print(f'Physical offset: {real_phys_offset} (0x{real_phys_offset:x})')
 
         # ───────────────────────────────────────────────────────────────────
         # Step 2c — Translate btrfs devid → actual block device path
         # ───────────────────────────────────────────────────────────────────
         print()
-        print(f'=== Step 2c: Resolving btrfs devid {devid} → block device path ===')
         underlying_dev = resolve_devid_to_device(devid)
-        print(f'devid {devid} → {underlying_dev}')
+        print(f'Block device: {underlying_dev}')
 
         # ───────────────────────────────────────────────────────────────────
         # Step 2d — Locate the stored checksum for the file's target data block
