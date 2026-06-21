@@ -28,7 +28,7 @@ jobs:
           sudo dkms status
 
           # Install crc32c for checksum verification
-          pip install crc32c                                                                                                                    
+          sudo -H pip3 install crc32c construct construct-typing intervaltree
 
       - name: Create test environment
         run: |
@@ -69,6 +69,10 @@ jobs:
           sudo mkfs.btrfs -f -L disk3 ${disk3}p1
           sudo mkfs.btrfs -f -L disk4 ${disk4}p1
 
+          # Enable compression on the 4th disk (maps to 2nd disk in NonRAID array due to parity disks)
+          sudo mkdir -p /etc/nonraid
+          echo "/dev/nmd4p1 /mnt/disk2 btrfs defaults,compress=zstd 0 2" | sudo tee -a /etc/nonraid/fstab
+
           echo "Test environment ready"
 
       - name: Test NonRAID array operations
@@ -97,11 +101,24 @@ jobs:
 
       - name: Test NonRAID array operations
         run: |
-          python btrfs_manipulate.py /mnt/disk1/file1 --size-mb 50
+          sudo python3 btrfs_manipulate.py /mnt/disk1/file1 --size-mb 50
 
           sudo btrfs scrub start /mnt/disk1
 
-          python recover.py
+          echo ">>> [scrub] Scrub started, waiting for completion..."
+          while true; do
+            status=$(sudo btrfs scrub status /mnt/disk1)
+            echo "$status"
+            if echo "$status" | grep -q "finished"; then
+              echo "Scrub completed successfully"
+              break
+            fi
+            sleep 1
+          done
+
+          sudo dmesg | tail -n 20
+
+          sudo python3 recover.py
 
       - name: Cleanup
         if: always()
@@ -118,8 +135,9 @@ jobs:
           sudo losetup -d $DISK1 || true
           sudo losetup -d $DISK2 || true
           sudo losetup -d $DISK3 || true
+          sudo losetup -d $DISK4 || true
 
           # Remove test files
-          sudo rm -f d1 d2 d3
+          sudo rm -f file1 || true
 
           echo "Cleanup completed"

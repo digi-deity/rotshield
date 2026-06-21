@@ -90,6 +90,60 @@ def lookup_extent_csum(mount_dev: str, logical_addr: int) -> int:
         except KeyError as e:
             raise RuntimeError(str(e))
 
+# --- Field detection -----------------------------------------------------
+# Different btrfs/kernel versions reorder fields, rename them (ino vs inode,
+# off vs offset), and even insert extra tokens between the device tag and
+# the marker phrase (e.g. "scrub: " in newer scrub messages). So instead of
+# one anchored sequential pattern, we treat every piece of information as
+# an independent search over the line:
+#   1. pull the device out of the "(device X):" prefix
+#   2. classify the line type by searching for a marker phrase anywhere in it
+#   3. pull each field out by searching for it anywhere in it
+# Nothing assumes adjacency or ordering between these.
+
+WARNING_PREFIX = re.compile(r'BTRFS warning \(device (?P<dev>\S+)\):')
+
+LINE_TYPE_MARKERS = [
+    ('read-io', re.compile(r'\bcsum failed\b')),
+    ('scrub',   re.compile(r'\bchecksum error at\b')),
+]
+
+FIELD_PATTERNS = {
+    'root':   re.compile(r'\broot[\s=]+(\d+)'),
+    'ino':    re.compile(r'\b(?:ino|inode)[\s=]+(\d+)'),
+    'off':    re.compile(r'\b(?:off|offset)[\s=]+(\d+)'),
+    # Reported checksum only appears on read-io failures, as "csum 0x<hex>".
+    'actual': re.compile(r'\bcsum\s+0x([0-9a-f]+)'),
+}
+
+REQUIRED_FIELDS = {'ino', 'off'}  # everything else is optional / informational
+
+
+def _extract_fields(line: str) -> dict | None:
+    """Parse a single log line into a field dict, independent of field
+    order, field naming, and extra tokens inserted between known parts."""
+    prefix_m = WARNING_PREFIX.search(line)
+    if not prefix_m:
+        return None
+
+    label = next((name for name, marker in LINE_TYPE_MARKERS if marker.search(line)), None)
+    if label is None:
+        return None  # a BTRFS warning, but not one we care about
+
+    fields = {'type': label, 'dev': prefix_m.group('dev'), 'raw': line.strip()}
+    for name, pattern in FIELD_PATTERNS.items():
+        fm = pattern.search(line)
+        if fm:
+            fields[name] = fm.group(1)
+
+    missing = REQUIRED_FIELDS - fields.keys()
+    if missing:
+        print(f"[!] Skipping unparsable {label} line (missing {', '.join(sorted(missing))}): {line.strip()}")
+        return None
+
+    return fields
+
+
 def monitor_dmesg(log_file: str | None = None):
     """
     Reads the current dmesg buffer (or a log file), processes all BTRFS csum
@@ -104,54 +158,52 @@ def monitor_dmesg(log_file: str | None = None):
             sys.exit(f"ERROR: Failed to read log file: {e}")
     else:
         print(f"Scanning dmesg for BTRFS csum failures...")
-        # Use check_output to get the current buffer as a string and return immediately
         try:
             log_data = subprocess.check_output(['dmesg'], text=True)
         except subprocess.CalledProcessError as e:
             sys.exit(f"ERROR: Failed to read dmesg: {e}")
 
-    readio_pattern = re.compile(
-        r'BTRFS warning \(device (?P<dev>\S+)\): csum failed root (?P<root>\d+) '
-        r'ino (?P<ino>\d+) off (?P<off>\d+) csum 0x(?P<actual>[0-9a-f]+)'
-    )
-    scrub_pattern = re.compile(
-        r'BTRFS warning \(device (?P<dev>\S+)\): checksum error at logical \d+ '
-        r'on dev \S+, physical \d+, root (?P<root>\d+), inode (?P<ino>\d+), '
-        r'offset (?P<off>\d+), length \d+'
-    )
-
     found_any = False
     seen_errors = set()
 
-    for pattern, label in [(readio_pattern, 'read-io'), (scrub_pattern, 'scrub')]:
-        for match in pattern.finditer(log_data):
-            error_key = (match.group('dev'), match.group('ino'), match.group('off'))
-            if error_key in seen_errors:
-                continue
-            seen_errors.add(error_key)
-            found_any = True
-            print(f"\n[!] Detected {label} corruption: {match.group(0)}")
-            handle_failure(match)
+    for line in log_data.splitlines():
+        if 'BTRFS warning' not in line:
+            continue
+
+        fields = _extract_fields(line)
+        if fields is None:
+            continue
+
+        error_key = (fields['dev'], fields['ino'], fields['off'])
+        if error_key in seen_errors:
+            continue
+        seen_errors.add(error_key)
+        found_any = True
+
+        print(f"\n[!] Detected {fields['type']} corruption: {fields['raw']}")
+        handle_failure(fields)
 
     if not found_any:
         print("No BTRFS checksum failures found in dmesg.")
     else:
         print(f"\nFinished processing {len(seen_errors)} unique errors.")
 
-def handle_failure(match):
+
+def handle_failure(fields: dict):
     must_be_root()
-    failing_dev_name = match.group('dev')
-    ino, off = int(match.group('ino')), int(match.group('off'))
-    actual_csum_str = match.groupdict().get('actual')
+    failing_dev_name = fields['dev']
+    ino, off = int(fields['ino']), int(fields['off'])
+    actual_csum_str = fields.get('actual')
     actual_csum_reported = int(actual_csum_str, 16) if actual_csum_str else None
-    
+
     mount_dev = f"/dev/{failing_dev_name}" if not failing_dev_name.startswith('/') else failing_dev_name
     devid, phys_offset, logical_addr = find_physical_offset(mount_dev, ino, off)
     expected_csum = lookup_extent_csum(mount_dev, logical_addr)
-    
+
     config = get_array_config()
     failing_path = config.data_devs.get(devid)
-    if not failing_path: raise RuntimeError(f"Could not map DevID {devid} to path")
+    if not failing_path:
+        raise RuntimeError(f"Could not map DevID {devid} to path")
 
     print(f"Failing Device: {failing_path} (DevID: {devid}) | Offset: 0x{phys_offset:x}")
 
@@ -162,8 +214,6 @@ def handle_failure(match):
     current_block_csum = crc32c(corrupted_block)
 
     if actual_csum_reported is not None:
-        # The kernel reports the actual checksum in dmesg as big-endian bytes
-        # while crc32c() returns little-endian, so byte-swap before comparing.
         current_be = int.from_bytes(current_block_csum.to_bytes(4, 'little'), 'big')
         print(f"Reported Actual Csum: 0x{actual_csum_reported:08x}")
         print(f"Read Block Csum:      0x{current_be:08x}")
@@ -175,7 +225,8 @@ def handle_failure(match):
 
     blocks_to_xor = []
     for slot, path in config.data_devs.items():
-        if path == failing_path: continue
+        if path == failing_path:
+            continue
         with open(path, 'rb') as f:
             f.seek(phys_offset)
             blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
