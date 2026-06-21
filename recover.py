@@ -326,7 +326,19 @@ def handle_failure(
 
         corrupt_sectors = find_all_corrupt_sectors(mount_dev, failing_path, base_logical, base_phys)
         if not corrupt_sectors:
-            return [{'success': False,
+            # Check whether the scan window overlaps with sectors we already fixed.
+            # If so this is a benign duplicate hint, not a genuine failure.
+            SCAN_WINDOW = 64
+            window_min = base_phys - SCAN_WINDOW * BTRFS_SECTOR_SIZE
+            window_max = base_phys + SCAN_WINDOW * BTRFS_SECTOR_SIZE
+            already_covered = any(window_min <= p <= window_max for p in already_recovered)
+            if already_covered:
+                print(f"  [0x{base_phys:x}] Window already covered by a previous log line — skipping.")
+                return [{'success': False, 'skipped': True,
+                         'error': "Window already covered by a previous log line",
+                         'phys_offset': base_phys, 'logical_addr': base_logical,
+                         'failing_path': failing_path}]
+            return [{'success': False, 'skipped': False,
                      'error': "No mismatching sectors found in ±64-sector window",
                      'phys_offset': base_phys, 'logical_addr': base_logical,
                      'failing_path': failing_path}]
@@ -337,12 +349,17 @@ def handle_failure(
         for logical, phys in corrupt_sectors:
             if phys in already_recovered:
                 print(f"  [0x{phys:x}] Already recovered by a previous log line — skipping.")
+                results.append({'success': False, 'skipped': True,
+                                'error': 'Already recovered by a previous log line',
+                                'phys_offset': phys, 'logical_addr': logical,
+                                'failing_path': failing_path})
                 continue
 
             # Only pass actual_csum_reported for the sector the log line named.
             reported_csum = actual_csum_reported if logical == base_logical else None
 
             result = recover_sector(mount_dev, config, failing_path, logical, phys, reported_csum)
+            result.setdefault('skipped', False)
             results.append(result)
 
             if result['success']:
@@ -354,7 +371,7 @@ def handle_failure(
         return results
 
     except Exception as e:
-        return [{'success': False, 'error': f"Exception: {e}",
+        return [{'success': False, 'skipped': False, 'error': f"Exception: {e}",
                  'phys_offset': 0, 'logical_addr': 0, 'failing_path': None}]
 
 
@@ -410,14 +427,16 @@ def monitor_dmesg(log_file: str | None = None):
 
     # Summary
     successful = [r for r in all_results if r['success']]
-    failed     = [r for r in all_results if not r['success']]
+    skipped    = [r for r in all_results if not r['success'] and r.get('skipped')]
+    failed     = [r for r in all_results if not r['success'] and not r.get('skipped')]
     print(f"\n{'='*70}")
     print(f"[*] RECOVERY SUMMARY")
     print(f"{'='*70}")
     print(f"Log line hints processed : {len(hints)}")
     print(f"Sectors attempted        : {len(all_results)}")
     print(f"  ✓ Recovered            : {len(successful)}")
-    print(f"  ✗ Failed/skipped       : {len(failed)}")
+    print(f"  ↷ Skipped (dup window) : {len(skipped)}")
+    print(f"  ✗ Failed               : {len(failed)}")
     if failed:
         print("\nFailed sectors:")
         for r in failed:
