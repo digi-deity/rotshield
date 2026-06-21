@@ -1,0 +1,125 @@
+name: NonRAID Integration Tests
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    name: NonRAID Integration Tests
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # Add the NonRAID PPA
+          sudo add-apt-repository ppa:qvr/nonraid
+          sudo apt update
+
+          # Install prerequisites and NonRAID packages
+          sudo apt install linux-headers-$(uname -r) nonraid-dkms nonraid-tools python3-pip
+
+          # Verify the DKMS module installation
+          sudo dkms status
+
+          # Install crc32c for checksum verification
+          pip install crc32c                                                                                                                    
+
+      - name: Create test environment
+        run: |
+          echo "Creating test disk images..."
+
+          # Create test disk images
+          sudo dd if=/dev/zero of=d1 bs=1M count=256 status=progress
+          sudo dd if=/dev/zero of=d2 bs=1M count=256 status=progress
+          sudo dd if=/dev/zero of=d3 bs=1M count=256 status=progress
+          sudo dd if=/dev/zero of=d4 bs=1M count=256 status=progress
+
+          # Set up loop devices
+          disk1=$(sudo losetup -fP --show d1)
+          disk2=$(sudo losetup -fP --show d2)
+          disk3=$(sudo losetup -fP --show d3)
+          disk4=$(sudo losetup -fP --show d4)
+
+          echo "DISK1=$disk1" >> $GITHUB_ENV
+          echo "DISK2=$disk2" >> $GITHUB_ENV
+          echo "DISK3=$disk3" >> $GITHUB_ENV
+          echo "DISK4=$disk4" >> $GITHUB_ENV
+
+          echo "Created loop devices: $disk1, $disk2, $disk3, $disk4"
+
+          # Create partitions
+          sudo sgdisk -o -a 8 -n 1:32K:0 $disk1
+          sudo sgdisk -o -a 8 -n 1:32K:0 $disk2
+          sudo sgdisk -o -a 8 -n 1:32K:0 $disk3
+          sudo sgdisk -o -a 8 -n 1:32K:0 $disk4
+
+          # Create symlinks for device discovery
+          sudo ln -s $disk1 -t /dev/disk/by-id/
+          sudo ln -s $disk2 -t /dev/disk/by-id/
+          sudo ln -s $disk3 -t /dev/disk/by-id/
+          sudo ln -s $disk4 -t /dev/disk/by-id/
+
+          # Make btrfs filesystems
+          sudo mkfs.btrfs -f -L disk3 ${disk3}p1
+          sudo mkfs.btrfs -f -L disk4 ${disk4}p1
+
+          echo "Test environment ready"
+
+      - name: Test NonRAID array operations
+        run: |
+          echo ">>> [mk_array] Creating NonRAID array with disk assignments"
+          sudo nmdctl create --force P:${DISK1}p1:$(basename $DISK1) Q:${DISK2}p1:$(basename $DISK2) 1:${DISK3}p1:$(basename $DISK3) 2:${DISK4}p1:$(basename $DISK4)
+
+          echo ">>> [mk_array] Starting the NonRAID array"
+          echo 'y' | sudo nmdctl start
+          sleep 1
+
+          echo ">>> [mk_array] Running array check"
+          echo 'y' | sudo nmdctl check
+          sleep 1
+
+          echo ">>> [mk_array] Mounting array disks"
+          sudo nmdctl mount
+          sleep 1
+
+          echo ">>> [mk_array] Checking array status"
+          sudo nmdctl status
+
+          echo ">>> [mk_array] Array setup complete"
+
+          echo "Array operations completed successfully"
+
+      - name: Test NonRAID array operations
+        run: |
+          python btrfs_manipulate.py /mnt/disk1/file1 --size-mb 50
+
+          sudo btrfs scrub start /mnt/disk1
+
+          python recover.py
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Stop NonRAID array
+          sudo bash tools/nmdctl -u umount || true
+          sudo bash tools/nmdctl -u stop || true
+
+          # Unload modules
+          sudo modprobe -r md_nonraid || true
+          sudo modprobe -r nonraid6_pq || true
+
+          # Clean up loop devices
+          sudo losetup -d $DISK1 || true
+          sudo losetup -d $DISK2 || true
+          sudo losetup -d $DISK3 || true
+
+          # Remove test files
+          sudo rm -f d1 d2 d3
+
+          echo "Cleanup completed"
