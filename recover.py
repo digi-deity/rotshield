@@ -213,15 +213,31 @@ def handle_failure(fields: dict):
 
     current_block_csum = crc32c(corrupted_block)
 
+    # --- Pre-recovery check: confirm that the block is actually corrupt ------
+    # Compare the on-disk csum against what btrfs metadata expects.
+    # If they already agree, either the data is fine (no recovery needed) or
+    # we are reading from the wrong physical location — either way, do not
+    # attempt recovery.
+    print(f"  On-disk csum:   0x{current_block_csum:08x}")
+    print(f"  Metadata csum:  0x{expected_csum:08x}")
+    if current_block_csum == expected_csum:
+        print("✓ Block matches metadata checksum — no corruption at this location. Skipping recovery.")
+        return
+    print("✓ Corruption confirmed: on-disk data does not match metadata checksum.")
+
+    # For read-I/O failures the log also carries the csum btrfs actually read.
+    # Cross-check it against our own read to be sure we reached the right block.
     if actual_csum_reported is not None:
         current_be = int.from_bytes(current_block_csum.to_bytes(4, 'little'), 'big')
-        print(f"Reported Actual Csum: 0x{actual_csum_reported:08x}")
-        print(f"Read Block Csum:      0x{current_be:08x}")
+        print(f"  Reported actual csum: 0x{actual_csum_reported:08x}")
+        print(f"  Our read csum:        0x{current_be:08x}")
         if current_be != actual_csum_reported:
-            raise RuntimeError(f"Verification failed! Block at 0x{phys_offset:x} does not match dmesg.")
-        print("✓ Verification successful.")
-    else:
-        print(f"Read Block Csum: 0x{current_block_csum:08x} (no reported csum to verify against)")
+            raise RuntimeError(
+                f"Block at 0x{phys_offset:x}: our read csum 0x{current_be:08x} "
+                f"differs from the csum btrfs reported (0x{actual_csum_reported:08x}). "
+                "Aborting — we may be looking at the wrong location."
+            )
+        print("  ✓ Matches dmesg-reported csum.")
 
     blocks_to_xor = []
     for slot, path in config.data_devs.items():
