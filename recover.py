@@ -321,7 +321,17 @@ def handle_failure(
         actual_csum_reported = int(actual_csum_str, 16) if actual_csum_str else None
 
         mount_dev = f"/dev/{failing_dev_name}" if not failing_dev_name.startswith('/') else failing_dev_name
-        devid, base_phys, base_logical = find_physical_offset(mount_dev, ino, off)
+        try:
+            devid, base_phys, base_logical = find_physical_offset(mount_dev, ino, off)
+        except RuntimeError as e:
+            # File was deleted (inode no longer has EXTENT_DATA entries) — skip this hint
+            if 'No REGULAR EXTENT_DATA found' in str(e):
+                print(f"  Inode {ino} no longer found — skipping.")
+                return [{'success': False, 'skipped': True,
+                         'error': "File was deleted (inode has no EXTENT_DATA entries)",
+                         'phys_offset': 0, 'logical_addr': 0,
+                         'failing_path': f"/dev/{failing_dev_name}"}]
+            raise
 
         config = get_array_config()
         failing_path = config.data_devs.get(devid)
@@ -341,9 +351,8 @@ def handle_failure(
             window_max = base_phys + SCAN_WINDOW * BTRFS_SECTOR_SIZE
             already_covered = any(window_min <= p <= window_max for p in already_recovered)
             if already_covered:
-                print(f"  [0x{base_phys:x}] Window already covered by a previous log line — skipping.")
-                return [{'success': False, 'skipped': True,
-                         'error': "Window already covered by a previous log line",
+                print(f"  [0x{base_phys:x}] Window already covered by a previous log line — recovered by proxy.")
+                return [{'success': True, 'skipped': False,
                          'phys_offset': base_phys, 'logical_addr': base_logical,
                          'failing_path': failing_path}]
             return [{'success': False, 'skipped': False,
@@ -356,9 +365,8 @@ def handle_failure(
         results = []
         for logical, phys in corrupt_sectors:
             if phys in already_recovered:
-                print(f"  [0x{phys:x}] Already recovered by a previous log line — skipping.")
-                results.append({'success': False, 'skipped': True,
-                                'error': 'Already recovered by a previous log line',
+                print(f"  [0x{phys:x}] Already recovered by a previous log line — recovered by proxy.")
+                results.append({'success': True, 'skipped': False,
                                 'phys_offset': phys, 'logical_addr': logical,
                                 'failing_path': failing_path})
                 continue
@@ -443,7 +451,7 @@ def monitor_dmesg(log_file: str | None = None):
     print(f"Log line hints processed : {len(hints)}")
     print(f"Sectors attempted        : {len(all_results)}")
     print(f"  ✓ Recovered            : {len(successful)}")
-    print(f"  ↷ Skipped (dup window) : {len(skipped)}")
+    print(f"  ↷ Skipped              : {len(skipped)}")
     print(f"  ✗ Failed               : {len(failed)}")
     if failed:
         print("\nFailed sectors:")
