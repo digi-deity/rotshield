@@ -79,7 +79,7 @@ class Superblock(Struct):
     metadata_uuid: UUID = field(fields.UUID)
     #: Future expansion
     _reserved: int = field(cs.Int64ul[28])
-    sys_chunks: list = field(SysChunk[1])
+    sys_chunks: list = field(cs.FixedSized(cs.this.sys_chunk_array_size, cs.GreedyRange(SysChunk.as_struct())))
     _parsed_end: int = field(cs.Tell)
     _unparsed_data: bytes = field(cs.Bytes(cs.this._csum_offset + 0x1000 - cs.this._parsed_end))
     csum_data: bytes = field(cs.Pointer(
