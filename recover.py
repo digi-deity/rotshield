@@ -132,6 +132,25 @@ def lookup_extent_csum(mount_dev: str, logical_addr: int) -> int:
         except KeyError as e:
             raise RuntimeError(str(e))
 
+def write_recovered_data(
+    recovered_data: bytes,
+    phys_offset: int,
+    failing_path: str,
+) -> bool:
+    """Write recovered data to disk and verify the write.
+
+    Returns True if write and verification succeeded, False otherwise.
+    """
+    print("✓ Checksum verified! Writing recovered data to disk...")
+    # Write the recovered data back to the failing device, bypassing the array layer.
+    # This ensures parity is not updated (we're manually recovering from it).
+    with open(failing_path, 'r+b') as f:
+        f.seek(phys_offset)
+        f.write(recovered_data)
+        f.flush()
+        os.fsync(f.fileno())
+    print(f"✓ SUCCESS: Data written to {failing_path} at offset 0x{phys_offset:x}")
+
 # --- Field detection -----------------------------------------------------
 # Different btrfs/kernel versions reorder fields, rename them (ino vs inode,
 # off vs offset), and even insert extra tokens between the device tag and
@@ -314,7 +333,7 @@ def handle_failure(fields: dict):
 
     print(f"Expected Csum: 0x{expected_csum:08x} | Recovered: 0x{computed_csum:08x}")
     if computed_csum == expected_csum:
-        print("✓ SUCCESS: Data recovered!")
+        write_recovered_data(recovered_data, phys_offset, failing_path)
     else:
         print("✗ FAILURE: Checksum still mismatch.")
 

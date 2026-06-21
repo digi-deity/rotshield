@@ -99,26 +99,37 @@ jobs:
 
           echo "Array operations completed successfully"
 
-      - name: Test NonRAID array operations
+      - name: Recovery test
         run: |
+          # 1. Induce error
           sudo python3 btrfs_manipulate.py /mnt/disk1/file1 --size-mb 50
 
+          # 2. Initial scrub to detect error
           sudo btrfs scrub start /mnt/disk1
-
-          echo ">>> [scrub] Scrub started, waiting for completion..."
+          echo ">>> [scrub] Initial scrub started, waiting for completion..."
           while true; do
             status=$(sudo btrfs scrub status /mnt/disk1)
-            echo "$status"
             if echo "$status" | grep -q "finished"; then
-              echo "Scrub completed successfully"
+              echo "$status"
               break
             fi
             sleep 1
           done
 
-          sudo dmesg | tail -n 20
-
+          # 3. Run recovery
           sudo python3 recover.py
+
+          # 4. Final scrub to confirm recovery
+          echo ">>> [scrub] Final verification scrub started..."
+          sudo btrfs scrub start /mnt/disk1
+          while true; do
+            status=$(sudo btrfs scrub status /mnt/disk1)
+            if echo "$status" | grep -q "finished"; then
+              echo "$status"
+              break
+            fi
+            sleep 1
+          done
 
       - name: Cleanup
         if: always()
