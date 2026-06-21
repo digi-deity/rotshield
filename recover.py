@@ -6,7 +6,8 @@
 #   "btrfs-recon",
 #   "construct",
 #   "construct-typing",
-#   "intervaltree"
+#   "intervaltree",
+#   "loguru"
 # ]
 #
 # [tool.uv.sources]
@@ -36,6 +37,8 @@ import re
 import sys
 import subprocess
 from crc32c import crc32c
+from loguru import logger
+
 from btrfs_recon.constants import BTRFS_SECTOR_SIZE
 from btrfs_recon.parsing import (
     parse_superblock,
@@ -46,6 +49,10 @@ from btrfs_recon.parsing import (
 )
 from btrfs_recon.structure import ObjectId
 from md_array import get_array_config, must_be_root
+
+# 1. Remove the default logger configuration
+logger.remove()
+logger.add(sys.stdout, format="{time:HH:mm:ss} - {level: <8} - {message}")
 
 DEDUP_WINDOW_SECONDS = 5  # minimum seconds between processing the same (dev, ino, off) triplet
 
@@ -140,13 +147,13 @@ def write_recovered_data(
     failing_path: str,
 ) -> None:
     """Write recovered data to disk, bypassing the array layer so parity is not updated."""
-    print("✓ Checksum verified! Writing recovered data to disk...")
+    logger.info("✓ Checksum verified! Writing recovered data to disk...")
     with open(failing_path, 'r+b') as f:
         f.seek(phys_offset)
         f.write(recovered_data)
         f.flush()
         os.fsync(f.fileno())
-    print(f"✓ SUCCESS: Data written to {failing_path} at offset 0x{phys_offset:x}")
+    logger.info(f"✓ SUCCESS: Data written to {failing_path} at offset 0x{phys_offset:x}")
 
 
 def recover_sector(
@@ -180,11 +187,11 @@ def recover_sector(
         corrupted_block = f.read(BTRFS_SECTOR_SIZE)
 
     current_block_csum = crc32c(corrupted_block)
-    print(f"  [0x{phys_offset:x}] on-disk csum: 0x{current_block_csum:08x}  metadata csum: 0x{expected_csum:08x}")
+    logger.debug(f"  [0x{phys_offset:x}] on-disk csum: 0x{current_block_csum:08x}  metadata csum: 0x{expected_csum:08x}")
 
     if current_block_csum == expected_csum:
         return {**base, 'success': False, 'error': "Block matches metadata checksum — no corruption at this location"}
-    print(f"  [0x{phys_offset:x}] ✓ Corruption confirmed.")
+    logger.info(f"  [0x{phys_offset:x}] ✓ Corruption confirmed.")
 
     # For read-IO failures the kernel also logs the csum it observed. Cross-check
     # that our read matches, to ensure we are looking at the right block.
@@ -200,6 +207,7 @@ def recover_sector(
                 ),
             }
         print(f"  [0x{phys_offset:x}] ✓ Matches kernel-reported csum.")
+        logger.debug(f"  [0x{phys_offset:x}] ✓ Matches kernel-reported csum.")
 
     blocks_to_xor = []
     for path in config.data_devs.values():

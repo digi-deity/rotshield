@@ -28,7 +28,7 @@ jobs:
           sudo dkms status
 
           # Install crc32c for checksum verification
-          sudo -H pip3 install crc32c construct construct-typing intervaltree
+          sudo -H pip3 install crc32c construct construct-typing intervaltree loguru
 
       - name: Create test environment
         run: |
@@ -101,6 +101,8 @@ jobs:
 
       - name: Recovery test - single corruption detailed flow
         run: |
+          export LOGURU_LEVEL=INFO
+
           # 1. Induce error
           sudo python3 btrfs_manipulate.py /mnt/disk1/file1 --size-mb 50
 

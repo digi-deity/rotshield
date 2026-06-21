@@ -5,7 +5,8 @@
 #   "crc32c",
 #   "construct",
 #   "construct-typing",
-#   "intervaltree"
+#   "intervaltree",
+#   "loguru"
 # ]
 # ///
 
@@ -63,6 +64,7 @@ import random
 import argparse
 import subprocess
 from crc32c import crc32c
+from loguru import logger
 
 from btrfs_recon.constants import BTRFS_SECTOR_SIZE
 from btrfs_recon.parsing import (
@@ -75,6 +77,9 @@ from btrfs_recon.parsing import (
 from btrfs_recon.structure import ObjectId
 from md_array import find_mount_for_path, must_be_root, resolve_devid_to_device
 
+# 1. Remove the default logger configuration
+logger.remove()
+logger.add(sys.stdout, format="{time:HH:mm:ss} - {level: <8} - {message}",)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Setup
@@ -102,15 +107,16 @@ def dump_window(dev: str, label: str, phys_offset: int, count: int = 3) -> None:
     with open(dev, 'rb') as fp:
         fp.seek(start_offset)
         data = fp.read(window_size)
-    print(f'--- {label} ({dev}) ---')
-    print(hexdump(data, base=start_offset))
+    logger.debug(f'--- {label} ({dev}) ---')
+    logger.debug('\n' + hexdump(data, base=start_offset))
 
 
 def resolve_logical_to_physical(tree, logical: int):
     """Map a btrfs logical address to (devid, phys, chunk_virt_start, chunk_phys_base)."""
     matches = list(tree.offsets(logical))
     if not matches:
-        sys.exit(f'ERROR: No chunk found that contains virtual address {logical}')
+        logger.error(f'No chunk found that contains virtual address {logical}')
+        sys.exit(1)
     devid, phys, _n = matches[0]
     block = next(iter(tree.at(logical)))
     chunk_virt_start = block.begin
@@ -139,8 +145,9 @@ def compute_block_csum(dev: str, phys_offset: int,
         fp.seek(phys_offset)
         block = fp.read(block_size)
     if len(block) < block_size:
-        sys.exit(f'ERROR: short read from {dev} at {phys_offset} '
-                 f'(wanted {block_size}, got {len(block)})')
+        logger.error(f'short read from {dev} at {phys_offset} '
+                     f'(wanted {block_size}, got {len(block)})')
+        sys.exit(1)
     return crc32c(block)
 
 
@@ -159,7 +166,7 @@ def drop_caches() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_test_file(path: str, size_mb: int = 50) -> None:
-    print(f'Creating {size_mb} MB test file at {path}')
+    logger.info(f'Creating {size_mb} MB test file at {path}')
 
     try:
         os.remove(path)
@@ -215,8 +222,7 @@ def main() -> None:
     # Each 4 KiB sector is filled with its sector index repeated as a 4-byte
     # little-endian integer, making any corruption trivially visible in a hex
     # dump and allowing the sector to be identified by its content alone.
-    print()
-    print('=== Step 1: Creating test file ===')
+    logger.info('=== Step 1: Creating test file ===')
     if args.overwrite or not os.path.exists(target):
         if args.overwrite:
             # Also clear any older bigfile* test siblings for cleanliness.
@@ -229,7 +235,7 @@ def main() -> None:
                         pass
         create_test_file(target, size_mb=args.size_mb)
     else:
-        print(f'(keeping existing file {target})')
+        logger.info(f'(keeping existing file {target})')
     os.sync()
     # btrfs keeps new checksum tree writes in its journal until an explicit
     # filesystem sync — without this, the CSUM_TREE walk below would find no
@@ -249,15 +255,14 @@ def main() -> None:
     if args.file_offset is not None:
         file_offset = args.file_offset
         if not (0 <= file_offset < file_size):
-            sys.exit(
-                f'ERROR: --file-offset {file_offset} is out of bounds '
-                f'for a file of {file_size} bytes '
-                f'(valid range: 0 – {file_size - 1})'
-            )
-        print(f'File byte offset  : {file_offset} (0x{file_offset:x}) [user-specified]')
+            logger.error(f'--file-offset {file_offset} is out of bounds '
+                         f'for a file of {file_size} bytes '
+                         f'(valid range: 0 – {file_size - 1})')
+            sys.exit(1)
+        logger.debug(f'File byte offset  : {file_offset} (0x{file_offset:x}) [user-specified]')
     else:
         file_offset = random.randrange(file_size)
-        print(f'File byte offset  : {file_offset} (0x{file_offset:x}) '
+        logger.debug(f'File byte offset  : {file_offset} (0x{file_offset:x}) '
               f'[random, file size={file_size}]')
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -268,31 +273,29 @@ def main() -> None:
     # (no DB, no btrfs-progs) to find:
     #   - the file's EXTENT_DATA record covering file_offset in the FS_TREE
     #   - the chunk mapping it to a physical byte offset on a real device
-    print()
-    print('=== Step 2a: Opening btrfs filesystem and walking trees ===')
+    logger.info('=== Step 2a: Opening btrfs filesystem and walking trees ===')
     with open(mount_dev, 'rb') as fp:
         superblock = parse_superblock(fp)
         devid_fp_map = {superblock.dev_item.devid: fp}
         tree = build_chunk_tree(superblock, devid_fp_map)
 
         inode = os.stat(target).st_ino
-        print(f'target: {target}  inode={inode}')
-        print(f'btrfs device: {mount_dev}')
+        logger.info(f'target: {target}  inode={inode}')
+        logger.info(f'btrfs device: {mount_dev}')
         try:
             fs_root = find_tree_root(superblock, tree, devid_fp_map, ObjectId.FsTree)
             extent_item = find_extent_data(tree, devid_fp_map, fs_root, inode, file_offset)
         except KeyError as e:
-            sys.exit(f'ERROR: {e}')
+            logger.error(f'{e}')
+            sys.exit(1)
 
-        print()
-        print('=== DEBUG: raw extent fields ===')
-        print(f'extent_item.key.offset             = {extent_item.key.offset}')
-        print(f'extent_item.data.ref.disk_bytenr   = {extent_item.data.ref.disk_bytenr}')
-        print(f'extent_item.data.ref.offset        = {extent_item.data.ref.offset}')
-        print(f'extent_item.data.ref.num_bytes     = {extent_item.data.ref.num_bytes}')
-        print(f'extent_item.data.ref.disk_num_bytes= {extent_item.data.ref.disk_num_bytes}')
-        print(f'type(extent_item.data.ref)         = {type(extent_item.data.ref)}')
-        print()
+        logger.trace('=== raw extent fields ===')
+        logger.trace(f'extent_item.key.offset             = {extent_item.key.offset}')
+        logger.trace(f'extent_item.data.ref.disk_bytenr   = {extent_item.data.ref.disk_bytenr}')
+        logger.trace(f'extent_item.data.ref.offset        = {extent_item.data.ref.offset}')
+        logger.trace(f'extent_item.data.ref.num_bytes     = {extent_item.data.ref.num_bytes}')
+        logger.trace(f'extent_item.data.ref.disk_num_bytes= {extent_item.data.ref.disk_num_bytes}')
+        logger.trace(f'type(extent_item.data.ref)         = {type(extent_item.data.ref)}')
 
         if extent_item.data.type != extent_item.data.type.REGULAR:
             sys.exit(f'ERROR: first extent is not REGULAR (type={extent_item.data.type})')
@@ -322,19 +325,18 @@ def main() -> None:
         # ───────────────────────────────────────────────────────────────────
         # Step 2b — Map target logical address → physical offset on device
         # ───────────────────────────────────────────────────────────────────
-        print()
-        print('=== Step 2b: Mapping logical → physical offset ===',)
+        logger.info('=== Step 2b: Mapping logical → physical offset ===')
         devid, real_phys_offset, chunk_virt_start, chunk_phys_base = \
             resolve_logical_to_physical(tree, target_logical)
         sector_phys_offset = real_phys_offset - (target_logical - sector_logical)
-        print(f'Physical offset: {real_phys_offset} (0x{real_phys_offset:x})')
+        logger.debug(f'Physical offset: {real_phys_offset} (0x{real_phys_offset:x})')
 
         # ───────────────────────────────────────────────────────────────────
         # Step 2c — Translate btrfs devid → actual block device path
         # ───────────────────────────────────────────────────────────────────
-        print()
+        logger.info('=== Step 2c: Translate btrfs devid → actual block device path ===')
         underlying_dev = resolve_devid_to_device(devid)
-        print(f'Block device: {underlying_dev}')
+        logger.info(f'Block device: {underlying_dev}')
 
         # ───────────────────────────────────────────────────────────────────
         # Step 2d — Locate the stored checksum for the file's target data block
@@ -349,26 +351,24 @@ def main() -> None:
         # disk partition — the device we write to in Step 4, which is never
         # seen by the array layer so parity remains stale.
         if superblock.csum_type != 0:
-            print()
-            print(f'=== Step 2d: skipping checksum verification '
-                  f'(unsupported csum_type={superblock.csum_type}; only CRC32C=0 supported) ===')
+            logger.warning(f'skipping checksum verification '
+                           f'(unsupported csum_type={superblock.csum_type}; only CRC32C=0 supported)')
             stored_csum_int = None
         else:
-            print()
-            print(f'=== Step 2d: Locating stored checksum (CSUM_TREE walk) ===')
+            logger.info('=== Step 2d: Locating stored checksum (CSUM_TREE walk) ===')
             try:
                 csum_root = find_tree_root(superblock, tree, devid_fp_map, ObjectId.CsumTree)
-                print(f'CSUM_TREE root: 0x{csum_root:x}')
+                logger.debug(f'CSUM_TREE root: 0x{csum_root:x}')
                 stored_csum_int = lookup_csum(fp, tree, csum_root, sector_logical)
             except KeyError as e:
-                sys.exit(f'ERROR: {e} (was a btrfs filesystem sync forced after creation?)')
-            print(f'Stored csum (uint32 LE) : 0x{stored_csum_int:08x}')
+                logger.error(f'{e} (was a btrfs filesystem sync forced after creation?)')
+                sys.exit(1)
+            logger.trace(f'Stored csum (uint32 LE) : 0x{stored_csum_int:08x}')
 
         # ───────────────────────────────────────────────────────────────────
         # Step 3 — Sanity check: confirm both devices show 0xFF at the target
         # ───────────────────────────────────────────────────────────────────
-        print()
-        print(f'=== Step 3: Sanity check — hex dump at target offset {real_phys_offset} ===')
+        logger.info(f'=== Step 3: Sanity check — hex dump at target offset {real_phys_offset} ===')
         dump_window(underlying_dev, 'Underlying partition', real_phys_offset)
 
         # ───────────────────────────────────────────────────────────────────
@@ -378,17 +378,17 @@ def main() -> None:
         # reading from the UNDERLYING partition (the device we will corrupt).
         # For healthy data, this MUST equal the value stored in the CSUM_TREE.
         if stored_csum_int is not None:
-            print()
-            print('=== Step 3a: Pre-corruption checksum verification ===')
+            logger.info('=== Step 3a: Pre-corruption checksum verification ===')
             computed_pre = compute_block_csum(underlying_dev, sector_phys_offset)
-            print(f'  stored csum   : 0x{stored_csum_int:08x}')
-            print(f'  computed csum : 0x{computed_pre:08x}')
+            logger.debug(f'  stored csum   : 0x{stored_csum_int:08x}')
+            logger.debug(f'  computed csum : 0x{computed_pre:08x}')
             if stored_csum_int == computed_pre:
-                print('  ✓ MATCH — on-disk data agrees with stored checksum '
-                      '(data is healthy; corruption below will be detectable)')
+                logger.info('  ✓ MATCH — on-disk data agrees with stored checksum '
+                             '(data is healthy; corruption below will be detectable)')
             else:
-                sys.exit('  ✗ MISMATCH — expected match before corruption; '
-                         'on-disk data already differs from CSUM_TREE')
+                logger.error('  ✗ MISMATCH — expected match before corruption; '
+                             'on-disk data already differs from CSUM_TREE')
+                sys.exit(1)
 
         # ───────────────────────────────────────────────────────────────────
         # Step 4 — Inject the silent corruption
@@ -399,10 +399,9 @@ def main() -> None:
         # NOT updated and cannot heal it).
         byte_value = args.byte_value and int(args.byte_value, 0)
         byte_offset = real_phys_offset
-        print()
         if args.dry_run:
-            print(f'=== Step 4: (dry-run) Would corrupt {underlying_dev} at byte offset {byte_offset} ===')
-            print('(dry-run: not actually writing)')
+            logger.info(f'=== Step 4: (dry-run) Would corrupt {underlying_dev} at byte offset {byte_offset} ===')
+            logger.info('(dry-run: not actually writing)')
         else:
             with open(underlying_dev, 'r+b') as raw_fp:
                 raw_fp.seek(byte_offset)
@@ -411,15 +410,15 @@ def main() -> None:
                     byte_value = current ^ 0xFF
                 elif current == byte_value:
                     byte_value = byte_value ^ 0xFF
-                    print(f'  NOTE: on-disk byte is already 0x{current:02x}; '
-                          f'writing 0x{byte_value:02x} instead so corruption actually takes effect')
-                print(f'=== Step 4: Writing 0x{byte_value:02x} to {underlying_dev} at byte offset {byte_offset} ===')
+                    logger.warning(f'on-disk byte is already 0x{current:02x}; '
+                                   f'writing 0x{byte_value:02x} instead so corruption actually takes effect')
+                logger.info(f'=== Step 4: Writing 0x{byte_value:02x} to {underlying_dev} at byte offset {byte_offset} ===')
                 raw_fp.seek(byte_offset)
                 raw_fp.write(bytes([byte_value]))
                 raw_fp.flush()
                 os.fsync(raw_fp.fileno())
-            print(f'Flipped byte on {underlying_dev}')
-            print(f'Array device {mount_dev} was NOT touched — parity remains stale')
+            logger.info(f'Flipped byte on {underlying_dev}')
+            logger.info(f'Array device {mount_dev} was NOT touched — parity remains stale')
 
         # ───────────────────────────────────────────────────────────────────
         # Step 5 — Drop page cache and confirm the corruption is on disk
@@ -427,11 +426,10 @@ def main() -> None:
         # Linux caches recently-read disk data in RAM. Without flushing, reads
         # from either device might return the old in-memory bytes rather than
         # the now-corrupted on-disk bytes, making the hex dump misleading.
-        print()
-        print('=== Step 5: Drop page cache and verify corruption is on disk ===')
+        logger.info('=== Step 5: Drop page cache and verify corruption is on disk ===')
         os.sync()
         if args.dry_run:
-            print('(dry-run: not dropping caches or re-dumping)')
+            logger.info('(dry-run: not dropping caches or re-dumping)')
         else:
             drop_caches()
             dump_window(underlying_dev, 'Underlying partition (post-corruption)', real_phys_offset)
@@ -440,26 +438,25 @@ def main() -> None:
         # Step 5a — Post-corruption: confirm stored csum NO LONGER matches
         # ───────────────────────────────────────────────────────────────────
         if stored_csum_int is not None and not args.dry_run:
-            print()
-            print('=== Step 5a: Post-corruption checksum verification ===')
+            logger.info('=== Step 5a: Post-corruption checksum verification ===')
             computed_post = compute_block_csum(underlying_dev, sector_phys_offset)
-            print(f'  stored csum   : 0x{stored_csum_int:08x}')
-            print(f'  computed csum : 0x{computed_post:08x}')
+            logger.debug(f'  stored csum   : 0x{stored_csum_int:08x}')
+            logger.debug(f'  computed csum : 0x{computed_post:08x}')
             if stored_csum_int != computed_post:
-                print('  ✓ MISMATCH — corruption successfully invalidated the on-disk checksum')
+                logger.info('  ✓ MISMATCH — corruption successfully invalidated the on-disk checksum')
             else:
-                sys.exit('  ✗ ERROR — checksum still matches! Corruption failed to change the data block.')
+                logger.error('  ✗ ERROR — checksum still matches! Corruption failed to change the data block.')
+                sys.exit(1)
 
-    print()
-    print('=== Summary ===')
+    logger.info('=== Summary ===')
     if args.dry_run:
-        print(f'(dry-run) Would corrupt {underlying_dev} at offset {byte_offset} '
+        logger.info(f'(dry-run) Would corrupt {underlying_dev} at offset {byte_offset} '
               f'(file offset {file_offset})')
     else:
-        print(f'Corrupted byte  : {underlying_dev} at offset {byte_offset} '
+        logger.info(f'Corrupted byte  : {underlying_dev} at offset {byte_offset} '
               f'(file offset {file_offset})')
-        print(f'Parity state    : stale — cannot heal this')
-        print(f'btrfs           : will report checksum error on next read of {target}')
+        logger.info(f'Parity state    : stale — cannot heal this')
+        logger.info(f'btrfs           : will report checksum error on next read of {target}')
 
 
 if __name__ == '__main__':
