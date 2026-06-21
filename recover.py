@@ -4,6 +4,9 @@
 # dependencies = [
 #   "crc32c>=2.2.post0",
 #   "btrfs-recon",
+#   "construct",
+#   "construct-typing",
+#   "intervaltree"
 # ]
 #
 # [tool.uv.sources]
@@ -69,6 +72,45 @@ def find_physical_offset(mount_dev: str, target_ino: int, target_off: int):
         devid = chunk.data['stripes'][0][0]
 
         return devid, abs_phys_offset, logical_addr
+
+
+def find_corrupt_sector(
+    mount_dev: str,
+    data_dev_path: str,
+    base_logical: int,
+    base_phys: int,
+    window: int = 64,
+) -> tuple[int, int] | None:
+    """Scan ±window sectors around base_logical/base_phys for an actual CRC32C mismatch.
+
+    The scrub reports the start of the chunk window, not the exact sector.
+    Returns (logical, phys) of the first mismatching sector, or None if not found.
+    """
+    with open(mount_dev, 'rb') as fp:
+        superblock = parse_superblock(fp)
+        devid_fp_map = {superblock.dev_item.devid: fp}
+        tree = build_chunk_tree(superblock, devid_fp_map)
+        try:
+            csum_root = find_tree_root(superblock, tree, devid_fp_map, ObjectId.CsumTree)
+        except KeyError as e:
+            raise RuntimeError(str(e))
+
+        for delta in range(-window, window + 1):
+            logical = base_logical + delta * BTRFS_SECTOR_SIZE
+            phys    = base_phys    + delta * BTRFS_SECTOR_SIZE
+            if phys < 0:
+                continue
+            with open(data_dev_path, 'rb') as df:
+                df.seek(phys)
+                data = df.read(BTRFS_SECTOR_SIZE)
+            actual = crc32c(data)
+            try:
+                stored = lookup_csum(fp, tree, csum_root, logical)
+            except Exception:
+                continue
+            if actual != stored:
+                return logical, phys
+    return None
 
 def xor_bytes(data_list: list[bytes]) -> bytes:
     result = bytearray(data_list[0])
@@ -198,14 +240,24 @@ def handle_failure(fields: dict):
 
     mount_dev = f"/dev/{failing_dev_name}" if not failing_dev_name.startswith('/') else failing_dev_name
     devid, phys_offset, logical_addr = find_physical_offset(mount_dev, ino, off)
-    expected_csum = lookup_extent_csum(mount_dev, logical_addr)
 
     config = get_array_config()
     failing_path = config.data_devs.get(devid)
     if not failing_path:
         raise RuntimeError(f"Could not map DevID {devid} to path")
 
-    print(f"Failing Device: {failing_path} (DevID: {devid}) | Offset: 0x{phys_offset:x}")
+    print(f"Failing Device: {failing_path} (DevID: {devid}) | Initial offset: 0x{phys_offset:x}")
+
+    # The scrub reports the start of a chunk window, not the exact corrupted
+    # sector. Scan ±64 sectors to find the one that actually mismatches.
+    result = find_corrupt_sector(mount_dev, failing_path, logical_addr, phys_offset)
+    if result is None:
+        print("✗ Could not find any mismatching sector in ±64-sector window. Skipping.")
+        return
+    logical_addr, phys_offset = result
+    print(f"  Found corrupt sector: logical=0x{logical_addr:x}  phys=0x{phys_offset:x}")
+
+    expected_csum = lookup_extent_csum(mount_dev, logical_addr)
 
     with open(failing_path, 'rb') as f:
         f.seek(phys_offset)
@@ -213,11 +265,6 @@ def handle_failure(fields: dict):
 
     current_block_csum = crc32c(corrupted_block)
 
-    # --- Pre-recovery check: confirm that the block is actually corrupt ------
-    # Compare the on-disk csum against what btrfs metadata expects.
-    # If they already agree, either the data is fine (no recovery needed) or
-    # we are reading from the wrong physical location — either way, do not
-    # attempt recovery.
     print(f"  On-disk csum:   0x{current_block_csum:08x}")
     print(f"  Metadata csum:  0x{expected_csum:08x}")
     if current_block_csum == expected_csum:
@@ -250,6 +297,17 @@ def handle_failure(fields: dict):
     with open(config.parity_p, 'rb') as f:
         f.seek(phys_offset)
         blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
+
+    # Check parity consistency before attempting recovery.
+    # XOR of all data blocks + parity must be zero for parity to be usable.
+    all_blocks = [corrupted_block] + blocks_to_xor
+    parity_check = xor_bytes(all_blocks)
+    parity_consistent = all(b == 0 for b in parity_check)
+    if parity_consistent:
+        print("✗ Parity is consistent with the corrupted data — corruption was already "
+              "baked into parity (pre-existing or introduced through the array layer). "
+              "XOR recovery cannot reconstruct the original data.")
+        return
 
     recovered_data = xor_bytes(blocks_to_xor)
     computed_csum = crc32c(recovered_data)
