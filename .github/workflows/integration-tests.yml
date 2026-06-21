@@ -168,8 +168,8 @@ jobs:
         if: always()
         run: |
           # Stop NonRAID array
-          sudo bash tools/nmdctl -u umount || true
-          sudo bash tools/nmdctl -u stop || true
+          sudo nmdctl -u umount || true
+          sudo nmdctl -u stop || true
 
           # Unload modules
           sudo modprobe -r md_nonraid || true
