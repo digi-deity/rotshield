@@ -99,7 +99,7 @@ jobs:
 
           echo "Array operations completed successfully"
 
-      - name: Recovery test
+      - name: Recovery test - single corruption detailed flow
         run: |
           # 1. Induce error
           sudo python3 btrfs_manipulate.py /mnt/disk1/file1 --size-mb 50
@@ -131,6 +131,39 @@ jobs:
             sleep 1
           done
 
+          sudo rm -f /mnt/disk1/file1 || true
+          sudo dmesg -c > /dev/null
+      - name: Recovery test - multiple corruptions
+        run: |
+          # 1. Inject many equally spaced corruptions in one scrub window in a single file on disk1.
+          sudo bash multi_corruptions_test.sh
+
+          # 2. Initial scrub to detect all injected errors.
+          sudo btrfs scrub start /mnt/disk1
+          echo ">>> [scrub] Initial multi-corruption scrub started, waiting for completion..."
+          while true; do
+            status=$(sudo btrfs scrub status /mnt/disk1)
+            if echo "$status" | grep -q "finished"; then
+              echo "$status"
+              break
+            fi
+            sleep 1
+          done
+
+          # 3. Recover all discovered checksum failures.
+          sudo python3 recover.py
+
+          # 4. Final scrub to confirm clean state after recovery.
+          echo ">>> [scrub] Final multi-corruption verification scrub started..."
+          sudo btrfs scrub start /mnt/disk1
+          while true; do
+            status=$(sudo btrfs scrub status /mnt/disk1)
+            if echo "$status" | grep -q "finished"; then
+              echo "$status"
+              break
+            fi
+            sleep 1
+          done
       - name: Cleanup
         if: always()
         run: |
@@ -149,6 +182,7 @@ jobs:
           sudo losetup -d $DISK4 || true
 
           # Remove test files
-          sudo rm -f file1 || true
+          sudo rm -f /mnt/disk1/file1 || true
+          sudo rm -f d1 d2 d3 d4 || true
 
           echo "Cleanup completed"
