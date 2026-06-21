@@ -3,7 +3,10 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "crc32c>=2.2.post0",
-#   "btrfs-recon",  # local package at /root/btrfs-recon (resolved below)
+#   "btrfs-recon",
+#   "construct",
+#   "construct-typing",
+#   "intervaltree"
 # ]
 #
 # [tool.uv.sources]
