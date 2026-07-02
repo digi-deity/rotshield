@@ -78,7 +78,7 @@ jobs:
       - name: Test NonRAID array operations
         run: |
           echo ">>> [mk_array] Creating NonRAID array with disk assignments"
-          sudo nmdctl create --force P:${DISK1}p1:$(basename $DISK1) Q:${DISK2}p1:$(basename $DISK2) 1:${DISK3}p1:$(basename $DISK3) 2:${DISK4}p1:$(basename $DISK4)
+          sudo nmdctl create --force P:${DISK1}:$(basename $DISK1) Q:${DISK2}:$(basename $DISK2) 1:${DISK3}:$(basename $DISK3) 2:${DISK4}:$(basename $DISK4)
 
           echo ">>> [mk_array] Starting the NonRAID array"
           echo 'y' | sudo nmdctl start
