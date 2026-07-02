@@ -99,6 +99,7 @@ jobs:
 
           echo "Array operations completed successfully"
 
+          cat /proc/nmdstat
       - name: Recovery test - single corruption detailed flow
         run: |
           # 1. Induce error
