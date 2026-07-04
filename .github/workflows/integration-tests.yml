@@ -167,33 +167,32 @@ jobs:
               sudo -E bash multi_corruptions_test.sh
           done
 
-          echo ">>> [scrub] Initial multi-corruption scrub started, waiting for completion..."
+          # Disable kernel printk rate-limiting so dmesg captures every
+          # BTRFS csum error from scrub (otherwise only ~2 hints survive
+          # the burst filter and recovery can't find the rest).
+          sudo tee /proc/sys/kernel/printk_ratelimit <<<0
+          sudo tee /proc/sys/kernel/printk_ratelimit_burst <<<0
+
+          echo ">>> [scrub] Scrubbing /mnt/disk1 to detect all corruptions"
           sudo btrfs scrub start /mnt/disk1
           while true; do
             status=$(sudo btrfs scrub status /mnt/disk1)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
+            if echo "$status" | grep -q "finished"; then echo "$status"; break; fi
             sleep 1
           done
 
-          echo ">>> [recover] Running recovery"
+          echo ">>> [recover] Running recovery (all errors logged in dmesg at once)"
           LOGURU_LEVEL=ERROR sudo -E python3 recover.py
 
-          echo ">>> [scrub] Final multi-corruption verification scrub started..."
+          echo ">>> [scrub] Verification scrub"
           sudo btrfs scrub start /mnt/disk1
           while true; do
             status=$(sudo btrfs scrub status /mnt/disk1)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
+            if echo "$status" | grep -q "finished"; then echo "$status"; break; fi
             sleep 1
           done
 
-          # Verify no errors remain after recovery
-          if echo "$status" | grep -qE '^Error summary:\s+no errors found'; then
+          if echo "$status" | grep -qE 'Error summary:\s+no errors found'; then
             echo "✅ Scrub verification passed — no errors"
           else
             echo "❌ Scrub verification FAILED — errors remain after recovery!"
