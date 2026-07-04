@@ -205,7 +205,7 @@ def find_extent_data(
         if item.data.type != item.data.type.REGULAR:
             continue
         ext_start = item.key.offset
-        ext_len = item.data.ref.disk_num_bytes
+        ext_len = item.data.ref.num_bytes
         if ext_start <= file_offset < ext_start + ext_len:
             return item
     raise KeyError(
