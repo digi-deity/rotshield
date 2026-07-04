@@ -128,6 +128,32 @@ def xor_bytes(data_list: list[bytes]) -> bytes:
             result[i] ^= next_block[i]
     return bytes(result)
 
+
+def read_block_or_zeros(dev_path: str, phys_offset: int, size: int) -> bytes:
+    """Read `size` bytes from `dev_path` at `phys_offset`, or zeros if past end.
+
+    NonRAID/Unraid arrays commonly have asymmetric data disks: a data disk may
+    be smaller than the largest data disk, and the parity disks are always at
+    least as large as the largest data disk. The parity relationship treats
+    the missing region of a smaller disk as zeros — verified experimentally:
+    for offsets beyond a data disk's capacity, P == XOR(present disks, 0).
+
+    Reading a raw rdev past its end raises OSError (Invalid argument) or
+    returns a short read. Both cases are handled by substituting zero bytes
+    for the unreadable region, preserving the parity relationship.
+    """
+    try:
+        with open(dev_path, 'rb') as f:
+            f.seek(phys_offset)
+            data = f.read(size)
+    except OSError:
+        return b'\x00' * size
+    if len(data) < size:
+        # Short read (e.g. reading past partition end but within loop device):
+        # pad the trailing unreadable bytes with zeros.
+        data = data + b'\x00' * (size - len(data))
+    return data
+
 def lookup_extent_csum(mount_dev: str, logical_addr: int) -> int:
     """Look up the stored CRC32C for the 4 KiB sector containing logical_addr."""
     sector_logical = (logical_addr // BTRFS_SECTOR_SIZE) * BTRFS_SECTOR_SIZE
@@ -213,12 +239,8 @@ def recover_sector(
     for path in config.data_devs.values():
         if path == failing_path:
             continue
-        with open(path, 'rb') as f:
-            f.seek(phys_offset)
-            blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
-    with open(config.parity_p, 'rb') as f:
-        f.seek(phys_offset)
-        blocks_to_xor.append(f.read(BTRFS_SECTOR_SIZE))
+        blocks_to_xor.append(read_block_or_zeros(path, phys_offset, BTRFS_SECTOR_SIZE))
+    blocks_to_xor.append(read_block_or_zeros(config.parity_p, phys_offset, BTRFS_SECTOR_SIZE))
 
     # Parity must be inconsistent with the corrupted data for XOR recovery to work.
     # XOR(all data blocks, parity) == 0 means parity was computed from the corrupted
