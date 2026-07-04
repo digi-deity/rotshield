@@ -42,14 +42,27 @@ for link in /dev/disk/by-id/${BYID_PREFIX}*; do
 done
 
 echo "=== 6. Sweeping any leftover loop devices backed by d[0-9]* image files ==="
-losetup -a 2>/dev/null | while IFS=: read -r dev _ backing; do
-    backing_file=$(echo "$backing" | sed -e 's/^[[:space:]]*(//' -e 's/)[[:space:]]*$//')
-    case "$(basename "$backing_file")" in
+losetup -l --noheadings -O BACK-FILE,NAME 2>/dev/null | while read -r backing dev; do
+    [ -z "$dev" ] && continue
+    case "$(basename "$backing")" in
         d[0-9]*)
-            echo "  Detaching leftover $dev (backed by $backing_file)..."
+            echo "  Detaching leftover $dev (backed by $backing)..."
             losetup -d "$dev" 2>/dev/null || echo "    Failed to detach $dev."
             ;;
     esac
+done
+
+echo "=== 6b. Cleaning up any remaining partition devices (loop*p1) ==="
+for partdev in /dev/loop*p1; do
+    [ -b "$partdev" ] || continue
+    # Extract parent loop device: /dev/loop0p1 -> /dev/loop0
+    parent="${partdev%p1}"
+    if [ -b "$parent" ]; then
+        echo "  Partition $partdev still present, detaching parent $parent..."
+        losetup -d "$parent" 2>/dev/null && echo "    Detached $parent." || echo "    Failed to detach $parent."
+    else
+        echo "  Orphaned partition $partdev (no parent $parent)."
+    fi
 done
 
 echo "=== 7. Removing disk image files ==="

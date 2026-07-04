@@ -340,6 +340,14 @@ def handle_failure(
                      'phys_offset': base_phys, 'logical_addr': base_logical,
                      'failing_path': None}]
 
+        # Translate the hint offset from array-partition space (what the chunk
+        # tree produces) to raw-rdev space (what every direct disk read/write
+        # needs).  Parity XOR recovery is offset-agnostic: every disk is read
+        # at the exact same raw byte as the failing disk, so we apply the
+        # failing disk's rdevOffset once here and all downstream functions
+        # receive raw-space phys values and need no further adjustment.
+        base_phys += config.raw_offset_for(failing_path)
+
         print(f"Failing Device: {failing_path} (DevID: {devid}) | Hint offset: 0x{base_phys:x}")
 
         corrupt_sectors = find_all_corrupt_sectors(mount_dev, failing_path, base_logical, base_phys)

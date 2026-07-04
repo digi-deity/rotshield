@@ -1,0 +1,4967 @@
+#!/bin/bash
+# shellcheck disable=SC2155,SC2207
+#
+# nmdctl - NonRAID array management utility
+#
+
+# Check for bash version 4 or higher (needed for associative arrays)
+if ((BASH_VERSINFO[0] < 4)); then
+    echo "Error: This script requires bash version 4 or higher"
+    exit 1
+fi
+
+# Our version
+VERSION=1.23.0
+
+# Colors for pretty output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Monitor mode status bars
+HEADER_BG='\033[44;37m'  # Blue background, white text
+FOOTER_BG='\033[100;97m' # Dark gray background, bright white text
+
+# Default superblock path
+DEFAULT_SUPERBLOCK="/nonraid.dat"
+SUPERBLOCK_PATH=""
+
+# LUKS keyfile path
+LUKS_KEYFILE="/etc/nonraid/luks-keyfile"
+
+# Persisted per-disk import offsets (sectors), keyed by disk ID.
+# The kernel driver does not persist a disk's import offset in its on-disk
+# superblock, so nmdctl records any non-zero offset here itself and reuses it
+# when re-importing disks after a module reload (see save_disk_offset/
+# get_saved_disk_offset).
+DISK_OFFSETS_FILE="/etc/nonraid/disk-offsets"
+
+# verbose, unattended
+VERBOSE=0
+UNATTENDED=0
+# status modes
+NO_FS=0
+MONITOR_MODE=0
+MONITOR_INTERVAL=2
+
+# Global associative array for nmdstat values
+declare -g -A NMDSTAT_VALUES
+
+# Global associative arrays for collected status data
+declare -g -A ARRAY_STATUS_DATA
+declare -g -A DISK_STATUS_DATA
+declare -g -A RESYNC_STATUS_DATA
+
+# Driver stats interface, override for mock tests
+PROC_NMDSTAT="${PROC_NMDSTAT:-/proc/nmdstat}"
+
+# Display usage information
+usage() {
+    local exit_code="${1:-1}"
+    cat <<EOF
+nmdctl - NonRAID array management utility (v${VERSION})
+
+Usage:
+    nmdctl [GLOBAL OPTIONS] COMMAND [COMMAND OPTIONS]
+
+Status and monitoring command:
+    status [OPTIONS]                Show current array status
+        -v, --verbose               Show detailed status information
+        --no-fs                     Don't show filesystem information
+        -o, --output FORMAT         Output format: default, prometheus, json, terse
+        -m, --monitor [INTERVAL]    Monitor mode: refresh status every INTERVAL seconds (default: $MONITOR_INTERVAL)
+
+Array Management Commands:
+    create                          Create a new array with interactive disk assignment
+    create [-f] [SLOT:DEV[:ID] ..]  Create a new array with layout directly as arguments
+                                    Example: nmdctl create P:/dev/sdb1 1:/dev/sdc1 2:/dev/sdd1 ...
+                                    Options: -f, --force: Skip device availability checks, allow any block device
+    start                           Start the array
+    stop                            Stop the array
+    import                          Import all disks to the array without starting it
+
+Disk Management Commands:
+    add [SLOT:DEV[:ID]]             Add a new disk to the array
+    replace SLOT[:DEV[:ID]]         Replace a disk in the specified slot
+    unassign SLOT                   Unassign a disk from the specified slot
+
+Maintenance Commands:
+    reload                          Reload nonraid module with specified superblock
+    check [OPTION]                  Start or stop parity check
+                                    Options: CORRECT (default), NOCORRECT, PAUSE, RESUME, CANCEL
+    set [SETTING] [VALUE]           Set array settings
+                                    Use 'nmdctl set' for list of available settings
+
+Filesystem Commands:
+    mount [MOUNTPREFIX]             Mount all active data disks
+                                    Default prefix: /mnt/disk
+    unmount                         Unmount all active data disks
+
+Global Options:
+    -s, --super PATH                Superblock file path (default: ${DEFAULT_SUPERBLOCK})
+    -k, --keyfile PATH              LUKS keyfile path (default: ${LUKS_KEYFILE})
+    -u, --unattended                Enable unattended mode
+    --no-color                      Disable colored output
+    -v, --verbose                   Enable verbose output
+    -V, --version                   Display version information
+    -h, --help                      Display this help message
+
+EOF
+    exit "$exit_code"
+}
+
+# Check if running as root
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}Error: This command must be run as root${NC}"
+        exit 1
+    fi
+}
+
+# Run a command via nmdcmd
+run_nmd_command() {
+    check_root
+    if ! echo -n "$1" > /proc/nmdcmd; then
+        echo -e "${RED}Error: Failed to run command '$1'${NC}"
+        return 1
+    fi
+    return 0
+}
+
+# Check if the nonraid module is loaded, and load it if superblock is provided
+check_module_loaded() {
+    local superblock="${SUPERBLOCK_PATH:-$DEFAULT_SUPERBLOCK}"
+    local is_create_command=0
+
+    # Check if we're being called as part of the create command
+    local call_stack="${FUNCNAME[*]}"
+    if [[ "$call_stack" == *"create_array"* ]]; then
+        is_create_command=1
+    fi
+
+    # Check if module is already loaded
+    if lsmod | grep -q nonraid; then
+        # For create_array, verify the module is using the correct superblock
+        if [ "$is_create_command" -eq 1 ] && [ -f "$PROC_NMDSTAT" ]; then
+            # Get all nmdstat values if we haven't already
+            if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+                get_all_nmdstat_values NMDSTAT_VALUES
+            fi
+            local current_superblock="${NMDSTAT_VALUES[sbName]}"
+
+            # If the current superblock doesn't match what we want to use
+            if [ "$current_superblock" != "$superblock" ] && [ -n "$current_superblock" ] && [ "$current_superblock" != "(null)" ]; then
+                echo -e "${RED}Error: NonRAID module is loaded with a different superblock${NC}"
+                echo -e "Currently loaded with: ${YELLOW}$current_superblock${NC}"
+                echo -e "Attempting to create array with: ${YELLOW}$superblock${NC}"
+                echo -e ""
+                echo -e "This could accidentally modify the wrong superblock file."
+                echo -e "Explicitly reload the module with the new superblock with: ${YELLOW}nmdctl --super $superblock reload${NC}"
+                return 1
+            fi
+        fi
+
+        return 0
+    fi
+
+    # Module not loaded, attempt to load it
+    # For create command, we can accept non-existent superblock files
+    if [ -f "$superblock" ] || [ "$is_create_command" -eq 1 ]; then
+        echo -e "${YELLOW}NonRAID module not loaded, attempting to load with superblock: $superblock${NC}"
+
+        # For create command with new superblock, provide info
+        if [ ! -f "$superblock" ] && [ "$is_create_command" -eq 1 ]; then
+            echo -e "${YELLOW}Note: Superblock file '$superblock' doesn't exist yet${NC}"
+            echo -e "${YELLOW}A new superblock will be created when the array is started${NC}"
+        fi
+
+        if ! modprobe nonraid super="$superblock"; then
+            echo -e "${RED}Error: Failed to load nonraid module${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}Successfully loaded nonraid module${NC}"
+        return 0
+    else
+        echo -e "${RED}Error: nonraid module is not loaded${NC}"
+        echo -e "Superblock file not found: $superblock"
+        echo -e "To create an array with this new superblock, run: ${YELLOW}nmdctl --super $superblock create${NC}"
+        # exit early, but cleanly
+        exit 0
+    fi
+}
+
+# Check if /proc/nmdstat exists
+check_nmdstat_exists() {
+    if [ ! -f "$PROC_NMDSTAT" ]; then
+        # Clear the NMDSTAT_VALUES array since /proc/nmdstat doesn't exist
+        for key in "${!NMDSTAT_VALUES[@]}"; do
+            unset 'NMDSTAT_VALUES["$key"]'
+        done
+
+        # Try to load the module first if it's not loaded
+        if ! lsmod | grep -q nonraid; then
+            check_module_loaded
+        fi
+
+        # Check again after attempted load
+        if [ ! -f "$PROC_NMDSTAT" ]; then
+            echo -e "${RED}Error: /proc/nmdstat not found${NC}"
+            echo -e "Please ensure the nonraid module is properly loaded"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Get all values from nmdstat and store them in an associative array
+# Usage: get_all_nmdstat_values nmdstat_array
+# Afterward, access values with ${nmdstat_array["key"]}
+get_all_nmdstat_values() {
+    local -n array_ref=$1
+
+    # Clear the array first
+    for key in "${!array_ref[@]}"; do
+        unset 'array_ref["$key"]'
+    done
+
+    # Read all values from /proc/nmdstat
+    while IFS='=' read -r key value; do
+        array_ref["$key"]="$value"
+    done < <(cat "$PROC_NMDSTAT" 2>/dev/null)
+
+    # Store timestamp when data was read
+    array_ref["timestamp"]=$(date +%s)
+
+    # Return success only if we read something
+    [ ${#array_ref[@]} -gt 1 ]
+}
+
+# Get value from nmdstat (for backward compatibility)
+get_nmdstat_value() {
+    grep -E "^$1=" "$PROC_NMDSTAT" | cut -d= -f2
+}
+
+# Format disk status
+format_disk_status() {
+    local status="$1"
+    case "$status" in
+        "DISK_OK")
+            echo -e "${GREEN}OK${NC}"
+            ;;
+        "DISK_INVALID")
+            echo -e "${RED}INVALID${NC}"
+            ;;
+        "DISK_NP_MISSING")
+            echo -e "${YELLOW}MISSING${NC}"
+            ;;
+        "DISK_WRONG")
+            echo -e "${RED}WRONG${NC}"
+            ;;
+        "DISK_DSBL"|"DISK_NP_DSBL")
+            echo -e "${YELLOW}DISABLED${NC}"
+            ;;
+        "DISK_NEW"|"DISK_DSBL_NEW")
+            echo -e "${BLUE}NEW${NC}"
+            ;;
+        *)
+            echo -e "${YELLOW}$status${NC}"
+            ;;
+    esac
+}
+
+# Format array state with color
+format_array_state() {
+    local state="$1"
+    case "$state" in
+        "STARTED")
+            echo -e "${GREEN}$state${NC}"
+            ;;
+        "STOPPED")
+            echo -e "${YELLOW}$state${NC}"
+            ;;
+        "NEW_ARRAY")
+            echo -e "${BLUE}$state${NC}"
+            ;;
+        "RECON_DISK"|"DISABLE_DISK"|"SWAP_DSBL")
+            echo -e "${YELLOW}$state${NC}"
+            ;;
+        "ERROR:"*)
+            echo -e "${RED}$state${NC}"
+            ;;
+        *)
+            echo "$state"
+            ;;
+    esac
+}
+
+format_available_devices() {
+    local available_devices=("$@")
+    echo -e "Available devices:"
+    echo ""
+    echo -e "  #   Device      Size(GB)  ID"
+    echo -e "  --  ----------  --------  ---------------------------------"
+
+    local device_index=1
+    for device_info in "${available_devices[@]}"; do
+        IFS='|' read -r dev partition size_kb size_gb disk_id <<< "$device_info"
+
+        # Show shortened disk ID for clarity
+        local short_id="${disk_id}"
+        if [ ${#short_id} -gt 33 ]; then
+            short_id="${short_id:0:30}..."
+        fi
+
+        if [ -z "$short_id" ]; then
+            short_id=$(echo -e "${RED}No disk ID found - cannot use in array${NC}")
+        fi
+
+        printf "  %-2d  %-10s  %-8s  %s\n" \
+            "$device_index" \
+            "$(basename "$dev")" \
+            "$size_gb" \
+            "$short_id"
+
+        device_index=$((device_index + 1))
+    done
+
+    echo ""
+}
+
+# Format health status with appropriate colors
+format_health_status() {
+    local health_status="$1"
+    local health_formatted=""
+
+    case "$health_status" in
+        "ERROR") health_formatted="${RED}ERROR${NC}" ;;
+        "NEW") health_formatted="${BLUE}NEW${NC}" ;;
+        "NEW_DISK") health_formatted="${BLUE}NEW_DISK${NC}" ;;
+        "OFFLINE") health_formatted="${RED}OFFLINE${NC}" ;;
+        "PARTIAL") health_formatted="${YELLOW}PARTIAL${NC}" ;;
+        "DEGRADED") health_formatted="${YELLOW}DEGRADED${NC}" ;;
+        "WARNING") health_formatted="${YELLOW}WARNING${NC}" ;;
+        "READY") health_formatted="${YELLOW}READY${NC}" ;;
+        "HEALTHY") health_formatted="${GREEN}HEALTHY${NC}" ;;
+        *) health_formatted="$health_status" ;;
+    esac
+
+    echo -e "$health_formatted"
+}
+
+# Check if the nonraid driver is in an inconsistent state
+# Returns 0 if inconsistent, 1 if consistent
+check_driver_inconsistent_state() {
+    # If NMDSTAT_VALUES is empty, populate it first
+    if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+        get_all_nmdstat_values NMDSTAT_VALUES
+    fi
+
+    # We check for driver states only if the array is started
+    if [ "${NMDSTAT_VALUES[mdState]}" != "STARTED" ]; then
+        return 1
+    fi
+
+    # Get the mdnum* counter values
+    local mdnummissing="${NMDSTAT_VALUES[mdNumMissing]:-0}"
+    local mdnuminvalid="${NMDSTAT_VALUES[mdNumInvalid]:-0}"
+    local mdnumwrong="${NMDSTAT_VALUES[mdNumWrong]:-0}"
+    local mdnumdisabled="${NMDSTAT_VALUES[mdNumDisabled]:-0}"
+    local mdnumreplaced="${NMDSTAT_VALUES[mdNumReplaced]:-0}"
+    local mdnumnew="${NMDSTAT_VALUES[mdNumNew]:-0}"
+
+    # Check if any counter has a value > 0
+    local has_counter_activity=0
+    if [ "$mdnummissing" -gt 0 ] || [ "$mdnuminvalid" -gt 0 ] ||
+       [ "$mdnumwrong" -gt 0 ] || [ "$mdnumdisabled" -gt 0 ] ||
+       [ "$mdnumreplaced" -gt 0 ] || [ "$mdnumnew" -gt 0 ]; then
+        has_counter_activity=1
+    fi
+
+    # If counters are clean, there's at least no known driver state inconsistency
+    if [ "$has_counter_activity" -eq 0 ]; then
+        return 1
+    fi
+
+    # If array is empty, we should be OK for now
+    if [ "$(get_defined_slots_count)" -eq 0 ]; then
+        return 1
+    fi
+
+    # Check if all defined disks are in DISK_OK state
+    local all_disks_ok=1
+    for slot in $(get_defined_slots); do
+        local rdevstatus="${NMDSTAT_VALUES[rdevStatus.$slot]}"
+        if [ "$rdevstatus" != "DISK_OK" ]; then
+            all_disks_ok=0
+            break
+        fi
+    done
+
+    # Inconsistent state: counters show activity but all disks are OK
+    if [ "$all_disks_ok" -eq 1 ]; then
+        return 0
+    fi
+
+    # No known inconsistencies found
+    return 1
+}
+
+# Get count of defined disk slots in the array
+# Returns the count of all slots with a defined disk
+get_defined_slots_count() {
+    # If NMDSTAT_VALUES is empty, populate it first
+    if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+        get_all_nmdstat_values NMDSTAT_VALUES
+    fi
+
+    local count=0
+    # Count all keys matching diskSize.X with non-zero values
+    for key in "${!NMDSTAT_VALUES[@]}"; do
+        if [[ $key =~ ^diskSize\.([0-9]+)$ ]] && [ "${NMDSTAT_VALUES[$key]}" -gt 0 ]; then
+            count=$((count + 1))
+        fi
+    done
+
+    echo "$count"
+}
+
+# Get array of defined slot numbers
+# Returns space-separated list of slot numbers that have disks defined
+get_defined_slots() {
+    # If NMDSTAT_VALUES is empty, populate it first
+    if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+        get_all_nmdstat_values NMDSTAT_VALUES
+    fi
+
+    local slots=()
+    # Extract slot numbers for keys matching diskSize.X with non-zero values
+    for key in "${!NMDSTAT_VALUES[@]}"; do
+        if [[ $key =~ ^diskSize\.([0-9]+)$ ]] && [ "${NMDSTAT_VALUES[$key]}" -gt 0 ]; then
+            slots+=("${BASH_REMATCH[1]}")
+        fi
+    done
+
+    # Sort the slots numerically and output as space-separated list
+    printf "%s\n" "${slots[@]}" | sort -n | tr '\n' ' '
+}
+
+# Format time duration in seconds to a human-readable format (HH:MM:SS)
+format_time_duration() {
+    local seconds=$1
+    local days=$(( seconds / 86400 ))
+    local hours=$(( (seconds % 86400) / 3600 ))
+    local minutes=$(( (seconds % 3600) / 60 ))
+    local secs=$(( seconds % 60 ))
+
+    if [ "$days" -gt 0 ]; then
+        printf "%d days, %d hours" "$days" "$hours"
+    elif [ "$hours" -gt 0 ]; then
+        printf "%d hours, %02d minutes" "$hours" "$minutes"
+    elif [ "$minutes" -gt 0 ]; then
+        printf "%d minutes, %02d seconds" "$minutes" "$secs"
+    else
+        printf "%d sec" "$secs"
+    fi
+}
+
+# Collect array summary data
+collect_array_summary() {
+    ARRAY_STATUS_DATA["mdstate"]="${NMDSTAT_VALUES[mdState]}"
+    ARRAY_STATUS_DATA["sblabel"]="${NMDSTAT_VALUES[sbLabel]}"
+    ARRAY_STATUS_DATA["sbname"]="${NMDSTAT_VALUES[sbName]}"
+    ARRAY_STATUS_DATA["mdnumdisks"]="${NMDSTAT_VALUES[mdNumDisks]}"
+    ARRAY_STATUS_DATA["total_slots"]=$(get_defined_slots_count)
+}
+
+# Collect array health data
+collect_array_health() {
+    local mdstate="${NMDSTAT_VALUES[mdState]}"
+    local mdnummissing="${NMDSTAT_VALUES[mdNumMissing]}"
+    local mdnuminvalid="${NMDSTAT_VALUES[mdNumInvalid]}"
+    local mdnumwrong="${NMDSTAT_VALUES[mdNumWrong]}"
+    local mdnumdisabled="${NMDSTAT_VALUES[mdNumDisabled]}"
+    local mdnumreplaced="${NMDSTAT_VALUES[mdNumReplaced]}"
+    local mdnumnew="${NMDSTAT_VALUES[mdNumNew]}"
+
+    local sbsynced="${NMDSTAT_VALUES[sbSynced]}"
+    local sbsynced2="${NMDSTAT_VALUES[sbSynced2]}"
+    local sbsyncerrs="${NMDSTAT_VALUES[sbSyncErrs]}"
+    local sbsyncexit="${NMDSTAT_VALUES[sbSyncExit]}"
+
+    # Count the total number of disk slots that are defined in the array
+    local total_slots=$(get_defined_slots_count)
+
+    # Count how many disks have been imported and how many read/write errors there are
+    # and how many unassigned disks there are
+    # XXX: there's still the terminology issue that a disk slot can be unassigned and unimported,
+    # we currently only count imported unassigned slots
+    local imported_disks=0
+    local unassigned_disks=0
+    local disks_num_errors=0
+    for slot in $(get_defined_slots); do
+        local rdevname="${NMDSTAT_VALUES[rdevName.$slot]}"
+        local rdevstatus="${NMDSTAT_VALUES[rdevStatus.$slot]}"
+        if [ -n "$rdevname" ] && [ "$rdevname" != "none" ]; then
+            imported_disks=$((imported_disks + 1))
+        elif [ "$rdevstatus" = "DISK_NP_DSBL" ] || [ "$rdevstatus" = "DISK_NP_MISSING" ]; then
+            unassigned_disks=$((unassigned_disks + 1))
+        fi
+        disks_num_errors=$((disks_num_errors + "${NMDSTAT_VALUES[rdevNumErrors.$slot]}"))
+    done
+
+    # Store all health-related data
+    ARRAY_STATUS_DATA["imported_disks"]="$imported_disks"
+    ARRAY_STATUS_DATA["unassigned_disks"]="$unassigned_disks"
+    ARRAY_STATUS_DATA["disks_num_errors"]="$disks_num_errors"
+    ARRAY_STATUS_DATA["mdnummissing"]="$mdnummissing"
+    ARRAY_STATUS_DATA["mdnuminvalid"]="$mdnuminvalid"
+    ARRAY_STATUS_DATA["mdnumwrong"]="$mdnumwrong"
+    ARRAY_STATUS_DATA["mdnumdisabled"]="$mdnumdisabled"
+    ARRAY_STATUS_DATA["mdnumreplaced"]="$mdnumreplaced"
+    ARRAY_STATUS_DATA["mdnumnew"]="$mdnumnew"
+    ARRAY_STATUS_DATA["sbsyncerrs"]="$sbsyncerrs"
+    ARRAY_STATUS_DATA["sbsyncexit"]="$sbsyncexit"
+
+    # Calculate last sync information
+    local last_sync_human="${YELLOW}never${NC}"
+    local last_sync_timestamp=0
+    local last_sync_ago=0
+    local last_sync_elapsed=0
+    local last_sync_status=""
+
+    if [ "$sbsynced2" != "0" ]; then
+        last_sync_timestamp=$sbsynced2
+        last_sync_ago=$(($(printf "%(%s)T")-sbsynced2))
+        last_sync_elapsed=$((sbsynced2 - sbsynced))
+        last_sync_human="$(format_time_duration "$last_sync_ago") ago"
+        if [ "$last_sync_ago" -gt 8640000 ]; then
+            last_sync_human="${YELLOW}$last_sync_human${NC} (more than 100 days)"
+        fi
+        if [ "$VERBOSE" -gt 0 ]; then
+            last_sync_human="$last_sync_human - completed in $(format_time_duration "$last_sync_elapsed")"
+        fi
+        if [ "$sbsyncexit" -gt 0 ]; then
+            last_sync_human="$last_sync_human ${RED}(errors encountered)${NC}"
+            last_sync_status="errors"
+        else
+            last_sync_status="completed"
+        fi
+    elif [ "$sbsynced" != "0" ]; then
+        last_sync_human="${BLUE}in progress${NC}"
+        last_sync_status="in_progress"
+    else
+        last_sync_status="never"
+    fi
+
+    ARRAY_STATUS_DATA["last_sync_human"]="$last_sync_human"
+    ARRAY_STATUS_DATA["last_sync_timestamp"]="$last_sync_timestamp"
+    ARRAY_STATUS_DATA["last_sync_ago"]="$last_sync_ago"
+    ARRAY_STATUS_DATA["last_sync_status"]="$last_sync_status"
+    ARRAY_STATUS_DATA["last_sync_elapsed"]="$last_sync_elapsed"
+
+    # Determine health status
+    local health_status=""
+    local health_details=""
+    local health_code=1  # 0=healthy, 1=warning/degraded, 2=offline/error
+
+    # Check for critical error conditions first
+    if [[ "$mdstate" = "ERROR:"* ]]; then
+        health_status="ERROR"
+        health_details="Array is in ERROR state"
+        health_code=2
+    elif [ "$mdstate" = "NEW_ARRAY" ]; then
+        health_status="NEW"
+        health_details="New array, parity needs to be built"
+        health_code=1
+    elif [ -n "$mdnumnew" ] && [ "$mdnumnew" -gt 0 ]; then
+        health_status="NEW_DISK"
+        health_details="New disk added to the array"
+        health_code=1
+    elif [ "$imported_disks" -eq 0 ] && [ "$total_slots" -gt 0 ]; then
+        health_status="OFFLINE"
+        health_details="No disks imported"
+        if [ "$unassigned_disks" -gt 0 ]; then
+            health_details="$health_details, $unassigned_disks unassigned"
+        fi
+        health_code=2
+    elif [ "$imported_disks" -eq 0 ] && [ "$total_slots" -eq 0 ]; then
+        health_status="OFFLINE"
+        health_details="Array is unconfigured"
+        health_code=2
+    elif [ "$imported_disks" -lt "$total_slots" ] && [ "$mdstate" != "STARTED" ]; then
+        health_status="PARTIAL"
+        health_details="$imported_disks/$total_slots disks imported"
+        if [ "$unassigned_disks" -gt 0 ]; then
+            health_details="$health_details, $unassigned_disks unassigned"
+        fi
+        health_code=1
+    elif [ "$mdnummissing" -gt 0 ] || [ "$mdnuminvalid" -gt 0 ] ||
+         [ "$mdnumwrong" -gt 0 ] || [ "$mdnumdisabled" -gt 0 ] ||
+         [ "$mdnumreplaced" -gt 0 ] || [ "$sbsyncerrs" -gt 0 ] ||
+         [ "$sbsyncexit" -gt 0 ]; then
+        health_status="DEGRADED"
+
+        local issues=""
+        [ "$mdnummissing" -gt 0 ] && issues="${issues}Missing: $mdnummissing, "
+        [ "$mdnuminvalid" -gt 0 ] && issues="${issues}Invalid: $mdnuminvalid, "
+        [ "$mdnumwrong" -gt 0 ] && issues="${issues}Wrong: $mdnumwrong, "
+        [ "$mdnumdisabled" -gt 0 ] && issues="${issues}Disabled: $mdnumdisabled, "
+        [ "$mdnumreplaced" -gt 0 ] && issues="${issues}Replaced: $mdnumreplaced, "
+        [ "$sbsyncerrs" -gt 0 ] && issues="${issues}Sync Errors: $sbsyncerrs, "
+        [ "$disks_num_errors" -gt 0 ] && issues="${issues}I/O Errors: $disks_num_errors, "
+        health_details=${issues%, }
+        health_code=1
+    elif [ "$disks_num_errors" -gt 0 ]; then
+        health_status="WARNING"
+        health_details="All disks present, but some have I/O errors ($disks_num_errors total)"
+        health_code=1
+    elif [ "$mdstate" = "STOPPED" ]; then
+        health_status="READY"
+        health_details="All disks imported but array is not started"
+        health_code=1
+    else
+        health_status="HEALTHY"
+        health_details="All disks present and functioning"
+        health_code=0
+    fi
+
+    ARRAY_STATUS_DATA["health_status"]="$health_status"
+    ARRAY_STATUS_DATA["health_details"]="$health_details"
+    ARRAY_STATUS_DATA["health_code"]="$health_code"
+}
+
+# Collect array size and parity data
+collect_array_size_and_parity() {
+    local has_parity=false
+    local has_second_parity=false
+    local data_size_gb=0
+    local parity_size_gb=0
+    local second_parity_size_gb=0
+
+    # Check slots 0 and 29 for parity disks
+    local parity_disk_size="${NMDSTAT_VALUES[diskSize.0]}"
+    if [ -n "$parity_disk_size" ] && [ "$parity_disk_size" -gt 0 ]; then
+        has_parity=true
+        parity_size_gb=$(format_kbytes "$parity_disk_size" 0 0 "gb")
+    fi
+
+    # Check P state
+    local parity_disk_status="${NMDSTAT_VALUES[rdevStatus.0]}"
+    if [[ "$parity_disk_status" == DISK_NP* ]] || [ "$parity_disk_status" = "DISK_DSBL_NEW" ] || [ "$parity_disk_status" = "DISK_INVALID" ]; then
+        has_parity=false
+    fi
+
+    local second_parity_disk_size="${NMDSTAT_VALUES[diskSize.29]}"
+    if [ -n "$second_parity_disk_size" ] && [ "$second_parity_disk_size" -gt 0 ]; then
+        has_second_parity=true
+        second_parity_size_gb=$(format_kbytes "$second_parity_disk_size" 0 0 "gb")
+    fi
+
+    # Check Q state
+    local second_parity_disk_status="${NMDSTAT_VALUES[rdevStatus.29]}"
+    if [[ "$second_parity_disk_status" == DISK_NP* ]] || [ "$second_parity_disk_status" = "DISK_DSBL_NEW" ] || [ "$second_parity_disk_status" = "DISK_INVALID" ]; then
+        has_second_parity=false
+    fi
+
+    # Count data disks and sum their sizes
+    local data_disk_count=0
+    local data_size_kb=0
+    for slot in $(seq 1 28); do
+        local disk_size="${NMDSTAT_VALUES[diskSize.$slot]}"
+        if [ -n "$disk_size" ] && [ "$disk_size" -gt 0 ]; then
+            data_disk_count=$((data_disk_count + 1))
+            data_size_kb=$((data_size_kb + disk_size))
+        fi
+    done
+
+    data_size_gb=$(format_kbytes "$data_size_kb" 0 0 "gb")
+
+    ARRAY_STATUS_DATA["has_parity"]="$has_parity"
+    ARRAY_STATUS_DATA["has_second_parity"]="$has_second_parity"
+    ARRAY_STATUS_DATA["data_size_kb"]="$data_size_kb"
+    ARRAY_STATUS_DATA["data_size_gb"]="$data_size_gb"
+    ARRAY_STATUS_DATA["data_disk_count"]="$data_disk_count"
+    ARRAY_STATUS_DATA["parity_size_kb"]="$parity_disk_size"
+    ARRAY_STATUS_DATA["parity_size_gb"]="$parity_size_gb"
+    ARRAY_STATUS_DATA["second_parity_size_kb"]="$second_parity_disk_size"
+    ARRAY_STATUS_DATA["second_parity_size_gb"]="$second_parity_size_gb"
+}
+
+# Collect resync operation status data
+collect_resync_status() {
+    local mdresync="${NMDSTAT_VALUES[mdResync]}"
+    local mdresyncaction="${NMDSTAT_VALUES[mdResyncAction]}"
+    local mdresynccorr="${NMDSTAT_VALUES[mdResyncCorr]}"
+    local mdresyncpos="${NMDSTAT_VALUES[mdResyncPos]}"
+    local mdresyncsize="${NMDSTAT_VALUES[mdResyncSize]}"
+    local mdresyncdt="${NMDSTAT_VALUES[mdResyncDt]}"
+    local mdresyncdb="${NMDSTAT_VALUES[mdResyncDb]}"
+
+    RESYNC_STATUS_DATA["active"]="false"
+    RESYNC_STATUS_DATA["paused"]="false"
+    RESYNC_STATUS_DATA["pending"]="false"
+    RESYNC_STATUS_DATA["action"]="$mdresyncaction"
+    RESYNC_STATUS_DATA["progress_percent"]="0"
+    RESYNC_STATUS_DATA["position_kb"]="0"
+    RESYNC_STATUS_DATA["position_gb"]="0"
+    RESYNC_STATUS_DATA["size_kb"]="0"
+    RESYNC_STATUS_DATA["size_gb"]="0"
+    RESYNC_STATUS_DATA["rate_kb_s"]="0"
+    RESYNC_STATUS_DATA["elapsed_seconds"]="0"
+    RESYNC_STATUS_DATA["eta_seconds"]="0"
+    RESYNC_STATUS_DATA["friendly_action"]=$(format_resync_action "$mdresyncaction" "$mdresynccorr")
+
+    local array_start_maybe="Start the array and use"
+    if [ "${NMDSTAT_VALUES[mdState]}" = "STARTED" ]; then
+        array_start_maybe="Use"
+    fi
+    RESYNC_STATUS_DATA["array_start_hint"]="$array_start_maybe"
+
+    # Check for paused operation
+    if [ "$mdresync" = "0" ] && [ "$mdresyncpos" != "0" ] && [ -n "$mdresyncpos" ]; then
+        RESYNC_STATUS_DATA["paused"]="true"
+        local progress=0
+        if [ "$mdresyncsize" -gt 0 ]; then
+            progress=$(( mdresyncpos * 100 / mdresyncsize ))
+        fi
+        RESYNC_STATUS_DATA["progress_percent"]="$progress"
+        RESYNC_STATUS_DATA["position_kb"]="$mdresyncpos"
+        RESYNC_STATUS_DATA["position_gb"]=$(format_kbytes "$mdresyncpos" 0 1 "gb")
+        RESYNC_STATUS_DATA["size_kb"]="$mdresyncsize"
+        RESYNC_STATUS_DATA["size_gb"]=$(format_kbytes "$mdresyncsize" 0 0 "gb")
+    # Check for pending operations
+    elif [ "$mdresync" = "0" ] && { [ "$mdresyncaction" = "clear" ] || [[ "$mdresyncaction" == recon* ]]; }; then
+        RESYNC_STATUS_DATA["pending"]="true"
+    # Check for active operation
+    elif [ "$mdresync" != "0" ] && [ -n "$mdresync" ]; then
+        RESYNC_STATUS_DATA["active"]="true"
+
+        # Calculate progress percentage
+        local progress=0
+        if [ "$mdresyncsize" -gt 0 ]; then
+            progress=$(( mdresyncpos * 100 / mdresyncsize ))
+        fi
+
+        # Calculate rate (blocks per second to KB/s)
+        local rate_kb_s=0
+        if [ "$mdresyncdt" -gt 0 ]; then
+            rate_kb_s=$(( mdresyncdb / mdresyncdt ))
+        fi
+
+        # Calculate estimated time remaining
+        local eta_seconds=0
+        if [ "$rate_kb_s" -gt 0 ] && [ "$mdresyncsize" -gt "$mdresyncpos" ]; then
+            local remaining_blocks=$(( mdresyncsize - mdresyncpos ))
+            eta_seconds=$(( remaining_blocks / rate_kb_s ))
+        fi
+
+        # Calculate actual elapsed time from start of resync operation
+        local elapsed_seconds=0
+        local sbsynced="${NMDSTAT_VALUES[sbSynced]}"
+        if [ "$sbsynced" != "0" ] && [ -n "$sbsynced" ]; then
+            elapsed_seconds=$(($(printf "%(%s)T")-sbsynced))
+        fi
+
+        RESYNC_STATUS_DATA["progress_percent"]="$progress"
+        RESYNC_STATUS_DATA["position_kb"]="$mdresyncpos"
+        RESYNC_STATUS_DATA["position_gb"]=$(format_kbytes "$mdresyncpos" 0 1 "gb")
+        RESYNC_STATUS_DATA["size_kb"]="$mdresyncsize"
+        RESYNC_STATUS_DATA["size_gb"]=$(format_kbytes "$mdresyncsize" 0 0 "gb")
+        RESYNC_STATUS_DATA["rate_kb_s"]="$rate_kb_s"
+        RESYNC_STATUS_DATA["elapsed_seconds"]="$elapsed_seconds"
+        RESYNC_STATUS_DATA["eta_seconds"]="$eta_seconds"
+    fi
+}
+
+# Collect disk status data
+collect_disk_status() {
+    local mdstate="${NMDSTAT_VALUES[mdState]}"
+
+    # Store general disk status information
+    DISK_STATUS_DATA["array_started"]="false"
+    [ "$mdstate" = "STARTED" ] && DISK_STATUS_DATA["array_started"]="true"
+
+    for idx in $(seq 0 29); do
+        local diskname="${NMDSTAT_VALUES[diskName.$idx]}"
+        local diskid="${NMDSTAT_VALUES[diskId.$idx]}"
+        local rdevstatus="${NMDSTAT_VALUES[rdevStatus.$idx]}"
+
+        # Determine if this slot should be processed
+        local should_process=false
+        local slottype=""
+
+        if [ "$idx" -eq 0 ]; then
+            # Always display P (parity)
+            slottype="P"
+            should_process=true
+        elif [ "$idx" -eq 29 ]; then
+            # Display Q if it has an ID OR it's a newly assigned disk
+            slottype="Q"
+            [ -n "$diskid" ] || [[ "$rdevstatus" == DISK_*_NEW ]] && should_process=true
+        else
+            # Data disks (slots 1-28)
+            slottype="data"
+            [ -n "$diskname" ] || [ "$rdevstatus" = "DISK_NEW" ] && should_process=true
+        fi
+
+        if [ "$should_process" = true ]; then
+            local disksize="${NMDSTAT_VALUES[diskSize.$idx]}"
+            local rdevname="${NMDSTAT_VALUES[rdevName.$idx]}"
+            local rdevnumerrors="${NMDSTAT_VALUES[rdevNumErrors.$idx]}"
+            local rdevreads="${NMDSTAT_VALUES[rdevReads.$idx]}"
+            local rdevwrites="${NMDSTAT_VALUES[rdevWrites.$idx]}"
+
+            # For DISK_NEW, get size from rdevSize instead of diskSize
+            if [[ ("$rdevstatus" = "DISK_NEW" || "$rdevstatus" = "DISK_DSBL_NEW") ]] && { [ -z "$disksize" ] || [ "$disksize" = "0" ]; }; then
+                local rdevsize="${NMDSTAT_VALUES[rdevSize.$idx]}"
+                if [ -n "$rdevsize" ] && [ "$rdevsize" -gt 0 ]; then
+                    disksize="$rdevsize"
+                fi
+
+                if [ -z "$diskid" ]; then
+                    diskid="${NMDSTAT_VALUES[rdevId.$idx]}"
+                fi
+            fi
+
+            # Store common disk data
+            if [ -n "$rdevstatus" ]; then
+                DISK_STATUS_DATA["slot_${idx}_present"]="true"
+                DISK_STATUS_DATA["slot_${idx}_type"]="$slottype"
+                DISK_STATUS_DATA["slot_${idx}_size_kb"]="$disksize"
+                DISK_STATUS_DATA["slot_${idx}_size_gb"]=$(format_kbytes "$disksize" 0 0 "gb")
+                DISK_STATUS_DATA["slot_${idx}_device"]="${rdevname:-none}"
+                DISK_STATUS_DATA["slot_${idx}_status"]="$rdevstatus"
+                DISK_STATUS_DATA["slot_${idx}_errors"]="${rdevnumerrors:-0}"
+                DISK_STATUS_DATA["slot_${idx}_disk_id"]="$diskid"
+                DISK_STATUS_DATA["slot_${idx}_disk_name"]="${diskname:-none}"
+                DISK_STATUS_DATA["slot_${idx}_reads"]="${rdevreads:-0}"
+                DISK_STATUS_DATA["slot_${idx}_writes"]="${rdevwrites:-0}"
+
+                # Get filesystem information if array is started
+                if [ "$slottype" = "data" ] && [ "$mdstate" = "STARTED" ] && [ -n "$diskname" ] && [ "$diskname" != "none" ] && [ "$NO_FS" -eq 0 ]; then
+                    if [ -b "/dev/$diskname" ]; then
+                        local fs_type mountpoint
+
+                        # In MONITOR_MODE, we trust that fs_type and mountpoint dont really change
+                        if [ "$MONITOR_MODE" -eq 1 ] && [ -n "${DISK_STATUS_DATA[slot_${idx}_fs_type]}" ] && [ -n "${DISK_STATUS_DATA[slot_${idx}_mountpoint]}" ]; then
+                            fs_type="${DISK_STATUS_DATA[slot_${idx}_fs_type]}"
+                            mountpoint="${DISK_STATUS_DATA[slot_${idx}_mountpoint]}"
+                        else
+                            fs_type=$(get_fs_type "/dev/$diskname")
+                            mountpoint=$(get_mountpoint "$diskname" "$fs_type")
+                            DISK_STATUS_DATA["slot_${idx}_fs_type"]="${fs_type:-unknown}"
+                            DISK_STATUS_DATA["slot_${idx}_mountpoint"]="${mountpoint:-unmounted}"
+                        fi
+
+                        local usage="-"
+                        if [ "$mountpoint" != "unmounted" ] && [ "$mountpoint" != "-" ]; then
+                            usage=$(get_fs_usage "$mountpoint" "$fs_type")
+                        fi
+                        DISK_STATUS_DATA["slot_${idx}_usage"]="$usage"
+                    fi
+                fi
+            fi
+        fi
+    done
+}
+
+# Output formatting functions
+format_human_output() {
+    # Array summary
+    local mdstate="${ARRAY_STATUS_DATA[mdstate]}"
+    local sblabel="${ARRAY_STATUS_DATA[sblabel]}"
+    local sbname="${ARRAY_STATUS_DATA[sbname]}"
+    local mdnumdisks="${ARRAY_STATUS_DATA[mdnumdisks]}"
+
+    echo -e "Array State   : $(format_array_state "$mdstate")"
+    [ -n "$sblabel" ] && echo -e "Array Label   : $sblabel"
+
+    # Check if superblock is valid
+    if [ "$sbname" = "(null)" ]; then
+        echo -e "Superblock    : ${RED}INVALID${NC}"
+        echo -e "${YELLOW}Warning: Module loaded without specifying superblock.${NC}"
+        echo -e "${YELLOW}Use '${GREEN}nmdctl --super /path/to/superblock.dat reload${YELLOW}' to reload with valid superblock.${NC}"
+    else
+        echo -e "Superblock    : $sbname"
+    fi
+
+    echo -e "Disks Present : $mdnumdisks"
+
+    # Check for driver inconsistent state and show warning
+    if check_driver_inconsistent_state; then
+        echo ""
+        echo -e "${YELLOW}WARNING: Driver internal state is inconsistent!${NC}"
+        echo -e "${YELLOW}The array mdNum* counters show non-zero values, but all individual disks are DISK_OK status.${NC}"
+        echo -e "${YELLOW}This can happen after initial array creation, but it may cause unexpected behavior.${NC}"
+        echo -e "${YELLOW}Recommend reloading the driver and starting the array again: ${GREEN}nmdctl reload && nmdctl start${NC}"
+        echo ""
+    fi
+
+    # Array health
+    local health_status="${ARRAY_STATUS_DATA[health_status]}"
+    local health_details="${ARRAY_STATUS_DATA[health_details]}"
+    local last_sync_human="${ARRAY_STATUS_DATA[last_sync_human]}"
+
+    local health_formatted="$(format_health_status "$health_status")"
+
+    echo -n -e "Array Health  : $health_formatted"
+    if [ -n "$health_details" ]; then
+        echo -e " ($health_details)"
+    else
+        echo ""
+    fi
+    echo -e "Array Checked : $last_sync_human"
+
+    # Array size and parity
+    local data_size_kb="${ARRAY_STATUS_DATA[data_size_kb]}"
+    local data_disk_count="${ARRAY_STATUS_DATA[data_disk_count]}"
+    local has_parity="${ARRAY_STATUS_DATA[has_parity]}"
+    local has_second_parity="${ARRAY_STATUS_DATA[has_second_parity]}"
+    local parity_size_kb="${ARRAY_STATUS_DATA[parity_size_kb]}"
+    local second_parity_size_kb="${ARRAY_STATUS_DATA[second_parity_size_kb]}"
+
+    echo -e "Array Size    : $(format_kbytes "$data_size_kb") (${data_disk_count} data disk(s))"
+
+    echo -n "Parity        : "
+    if [ "$has_parity" = "true" ] && [ "$has_second_parity" = "true" ]; then
+        echo -e "${GREEN}Dual Parity${NC} (P: $(format_kbytes "$parity_size_kb") , Q: $(format_kbytes "$second_parity_size_kb"))"
+    elif [ "$has_parity" = "true" ]; then
+        echo -e "${GREEN}Single Parity${NC} ($(format_kbytes "$parity_size_kb"))"
+    else
+        echo -e "${YELLOW}No Parity${NC}"
+    fi
+
+    # Resync status
+    format_human_resync_status
+
+    # Disk status
+    format_human_disk_status
+}
+
+format_human_resync_status() {
+    local active="${RESYNC_STATUS_DATA[active]}"
+    local paused="${RESYNC_STATUS_DATA[paused]}"
+    local pending="${RESYNC_STATUS_DATA[pending]}"
+    local friendly_action="${RESYNC_STATUS_DATA[friendly_action]}"
+    local array_start_hint="${RESYNC_STATUS_DATA[array_start_hint]}"
+
+    if [ "$paused" = "true" ]; then
+        local progress="${RESYNC_STATUS_DATA[progress_percent]}"
+        local pos_kb="${RESYNC_STATUS_DATA[position_kb]}"
+        local size_kb="${RESYNC_STATUS_DATA[size_kb]}"
+        local pos_kb_formatted=$(format_kbytes "$pos_kb" 1 2)
+        local size_kb_formatted=$(format_kbytes "$size_kb")
+
+        echo ""
+        echo -e "Operation     : ${BLUE}$friendly_action${NC} ${YELLOW}(PAUSED)${NC}"
+        echo -e "Progress      : $progress% ($pos_kb_formatted / $size_kb_formatted)"
+        echo -e "${YELLOW}Resume with   : '${GREEN}nmdctl check resume${YELLOW}' command${NC}"
+    elif [ "$pending" = "true" ]; then
+        local action="${RESYNC_STATUS_DATA[action]}"
+        echo ""
+        if [ "$action" = "clear" ]; then
+            echo -e "${YELLOW}Disk clearing pending: New disk needs to be cleared${NC}"
+        else
+            echo -e "${YELLOW}Disk reconstruction pending: ${BLUE}$friendly_action${NC}"
+        fi
+        echo -e "${YELLOW}${array_start_hint} '${GREEN}nmdctl check${YELLOW}' command to start the operation${NC}"
+    elif [ "$active" = "true" ]; then
+        local progress="${RESYNC_STATUS_DATA[progress_percent]}"
+        local pos_kb="${RESYNC_STATUS_DATA[position_kb]}"
+        local size_kb="${RESYNC_STATUS_DATA[size_kb]}"
+        local rate_kb_s="${RESYNC_STATUS_DATA[rate_kb_s]}"
+        local elapsed_seconds="${RESYNC_STATUS_DATA[elapsed_seconds]}"
+        local eta_seconds="${RESYNC_STATUS_DATA[eta_seconds]}"
+
+        local elapsed_formatted=$(format_time_duration "$elapsed_seconds")
+        local eta_formatted=$(format_time_duration "$eta_seconds")
+        local pos_kb_formatted=$(format_kbytes "$pos_kb" 1 2)
+        local size_kb_formatted=$(format_kbytes "$size_kb")
+        local rate_formatted=$(format_io_rate "$rate_kb_s" 0)
+
+        echo ""
+        echo -e "Operation     : ${BLUE}$friendly_action${NC}"
+        echo -e "Progress      : $progress% ($pos_kb_formatted / $size_kb_formatted)"
+        echo -e "Speed         : $rate_formatted"
+        echo -e "Elapsed Time  : $elapsed_formatted"
+        echo -e "ETA           : $eta_formatted"
+    fi
+}
+
+format_human_disk_status() {
+    local array_started="${DISK_STATUS_DATA[array_started]}"
+
+    echo ""
+    echo "=== Disk Status ==="
+    echo ""
+    local disk_entries=()
+    local old_IFS="$IFS"
+    IFS=$'\n'
+    disk_entries=($(get_disk_entries))
+    IFS="$old_IFS"
+
+    local widths=(4 6 6 4)  # Minimum widths: Slot, Status, Device, Size
+    local headers=("Slot" "Status" "Device")
+
+    if [ "$VERBOSE" -eq 1 ]; then
+        headers+=("Size(1k)")
+    else
+        headers+=("Size")
+    fi
+
+    if [ "$array_started" = "true" ]; then
+        if [ "$VERBOSE" -eq 1 ]; then
+            headers+=("Disk Name")
+            widths+=(9)
+        fi
+
+        headers+=("FS" "Mountpoint" "Usage")
+        widths+=(2 10 5)
+
+        headers+=("Reads" "Writes")
+        widths+=(5 6)
+    fi
+
+    # Update column widths based on actual data lengths
+    for entry in "${disk_entries[@]}"; do
+        IFS='|' read -r slot slot_display status_formatted device size diskname fs mountpoint usage read_rate write_rate <<< "$entry"
+
+        local slot_len=${#slot_display}
+        [ "$slot_len" -gt "${widths[0]}" ] && widths[0]=$slot_len
+
+        local status_len=$(get_visible_length "$status_formatted")
+        [ "$status_len" -gt "${widths[1]}" ] && widths[1]=$status_len
+
+        local device_len=${#device}
+        [ "$device_len" -gt "${widths[2]}" ] && widths[2]=$device_len
+
+        local size_len=${#size}
+        [ "$size_len" -gt "${widths[3]}" ] && widths[3]=$size_len
+
+        if [ "$array_started" = "true" ]; then
+            local col_index=4
+
+            if [ "$VERBOSE" -eq 1 ]; then
+                local diskname_len=${#diskname}
+                [ "$diskname_len" -gt "${widths[4]}" ] && widths[4]=$diskname_len
+                col_index=5
+            fi
+
+            local fs_len=${#fs}
+            [ "$fs_len" -gt "${widths[col_index]}" ] && widths[col_index]=$fs_len
+            ((col_index++))
+
+            local mountpoint_len=${#mountpoint}
+            [ "$mountpoint_len" -gt "${widths[col_index]}" ] && widths[col_index]=$mountpoint_len
+            ((col_index++))
+
+            local usage_len=${#usage}
+            [ "$usage_len" -gt "${widths[col_index]}" ] && widths[col_index]=$usage_len
+            ((col_index++))
+
+            local read_len=$(get_visible_length "$read_rate")
+            [ "$read_len" -gt "${widths[col_index]}" ] && widths[col_index]=$read_len
+            ((col_index++))
+
+            local write_len=$(get_visible_length "$write_rate")
+            [ "$write_len" -gt "${widths[col_index]}" ] && widths[col_index]=$write_len
+        fi
+    done
+
+    # Build and display header
+    local header=""
+    local separator=""
+    for i in "${!headers[@]}"; do
+        local dashes=""
+        printf -v dashes "%*s" "${widths[i]}" ""
+        dashes="${dashes// /-}"
+
+        if [ "$i" -eq 0 ]; then
+            header+=$(printf "%-*s" "${widths[i]}" "${headers[i]}")
+            separator+=$(printf "%-*s" "${widths[i]}" "$dashes")
+        else
+            header+=$(printf "  %-*s" "${widths[i]}" "${headers[i]}")
+            separator+=$(printf "  %-*s" "${widths[i]}" "$dashes")
+        fi
+    done
+
+    echo -e "$header"
+    echo -e "$separator"
+
+    # Display all disk entries using dynamic column widths
+    for entry in "${disk_entries[@]}"; do
+        format_disk_entry_line "$entry" "${widths[@]}"
+    done
+}
+
+# Format and display a single disk entry line using provided column widths
+format_disk_entry_line() {
+    local entry="$1"
+    shift
+    local widths=("$@")
+    local array_started="${DISK_STATUS_DATA[array_started]}"
+
+    IFS='|' read -r slot slot_display status_formatted device size diskname fs mountpoint usage read_rate write_rate <<< "$entry"
+
+    printf "%-*s" "${widths[0]}" "$slot_display"
+
+    local visible_length=$(get_visible_length "$status_formatted")
+    printf "  %s" "$status_formatted"
+    printf "%*s" "$((widths[1] - visible_length))" ""
+
+    printf "  %-*s" "${widths[2]}" "$device"
+    printf "  %-*s" "${widths[3]}" "$size"
+
+    if [ "$array_started" = "true" ]; then
+        local col_index=4
+
+        if [ "$VERBOSE" -eq 1 ]; then
+            printf "  %-*s" "${widths[4]}" "$diskname"
+            col_index=5
+        fi
+
+        printf "  %-*s" "${widths[col_index]}" "$fs"
+        ((col_index++))
+        printf "  %-*s" "${widths[col_index]}" "$mountpoint"
+        ((col_index++))
+        printf "  %-*s" "${widths[col_index]}" "$usage"
+        ((col_index++))
+
+        local read_visible_length=$(get_visible_length "$read_rate")
+        printf "  %s" "$read_rate"
+        printf "%*s" "$((widths[col_index] - read_visible_length))" ""
+        ((col_index++))
+
+        local write_visible_length=$(get_visible_length "$write_rate")
+        printf "  %s" "$write_rate"
+        printf "%*s" "$((widths[col_index] - write_visible_length))" ""
+    fi
+
+    printf "\n"
+}
+
+format_prometheus_output() {
+    local label="${ARRAY_STATUS_DATA[sblabel]:-unknown}"
+    local mdstate="${ARRAY_STATUS_DATA[mdstate]}"
+    local health_code="${ARRAY_STATUS_DATA[health_code]}"
+    local health_status="${ARRAY_STATUS_DATA[health_status]}"
+
+    # Array state metrics
+    echo "# HELP nonraid_array_state Current state of the NonRAID array (0=STOPPED, 1=STARTED, 2=NEW_ARRAY, 3=ERROR)"
+    echo "# TYPE nonraid_array_state gauge"
+    local state_code=0
+    case "$mdstate" in
+        "STOPPED") state_code=0 ;;
+        "STARTED") state_code=1 ;;
+        "NEW_ARRAY") state_code=2 ;;
+        "ERROR:"*) state_code=3 ;;
+        *) state_code=4 ;;
+    esac
+    echo "nonraid_array_state{label=\"$label\"} $state_code"
+
+    # Health metrics
+    echo ""
+    echo "# HELP nonraid_array_health Array health status (0=HEALTHY, 1=WARNING/DEGRADED, 2=OFFLINE/ERROR)"
+    echo "# TYPE nonraid_array_health gauge"
+    echo "nonraid_array_health{label=\"$label\",status=\"$health_status\"} $health_code"
+
+    # Disk count metrics
+    echo ""
+    echo "# HELP nonraid_disks_present Number of disks present in the array"
+    echo "# TYPE nonraid_disks_present gauge"
+    echo "nonraid_disks_present{label=\"$label\"} ${ARRAY_STATUS_DATA[mdnumdisks]}"
+
+    echo ""
+    echo "# HELP nonraid_disks_imported Number of disks imported in the array"
+    echo "# TYPE nonraid_disks_imported gauge"
+    echo "nonraid_disks_imported{label=\"$label\"} ${ARRAY_STATUS_DATA[imported_disks]}"
+
+    echo ""
+    echo "# HELP nonraid_disks_unassigned Number of unassigned disks in the array"
+    echo "# TYPE nonraid_disks_unassigned gauge"
+    echo "nonraid_disks_unassigned{label=\"$label\"} ${ARRAY_STATUS_DATA[unassigned_disks]}"
+
+    # Array size metrics
+    echo ""
+    echo "# HELP nonraid_array_size_gb Total array data size in GB"
+    echo "# TYPE nonraid_array_size_gb gauge"
+    echo "nonraid_array_size_gb{label=\"$label\"} ${ARRAY_STATUS_DATA[data_size_gb]}"
+
+    echo ""
+    echo "# HELP nonraid_data_disks_count Number of data disks in the array"
+    echo "# TYPE nonraid_data_disks_count gauge"
+    echo "nonraid_data_disks_count{label=\"$label\"} ${ARRAY_STATUS_DATA[data_disk_count]}"
+
+    # Parity metrics
+    echo ""
+    echo "# HELP nonraid_parity_disks_count Number of parity disks (0=none, 1=single, 2=dual)"
+    echo "# TYPE nonraid_parity_disks_count gauge"
+    local parity_count=0
+    [ "${ARRAY_STATUS_DATA[has_parity]}" = "true" ] && parity_count=$((parity_count + 1))
+    [ "${ARRAY_STATUS_DATA[has_second_parity]}" = "true" ] && parity_count=$((parity_count + 1))
+    echo "nonraid_parity_disks_count{label=\"$label\"} $parity_count"
+
+    # Error counters
+    echo ""
+    echo "# HELP nonraid_disk_errors_total Total number of disk read/write errors"
+    echo "# TYPE nonraid_disk_errors_total counter"
+    echo "nonraid_disk_errors_total{label=\"$label\"} ${ARRAY_STATUS_DATA[disks_num_errors]}"
+
+    # Missing/invalid disk counters
+    for counter in mdnummissing mdnuminvalid mdnumwrong mdnumdisabled mdnumreplaced mdnumnew; do
+        local count="${ARRAY_STATUS_DATA[$counter]}"
+        local metric_name="nonraid_${counter#md}_count"
+        echo ""
+        echo "# HELP $metric_name Number of disks in $counter state"
+        echo "# TYPE $metric_name gauge"
+        echo "$metric_name{label=\"$label\"} $count"
+    done
+
+    # Last sync metrics
+    echo ""
+    echo "# HELP nonraid_last_sync_timestamp Unix timestamp of last completed sync"
+    echo "# TYPE nonraid_last_sync_timestamp gauge"
+    echo "nonraid_last_sync_timestamp{label=\"$label\"} ${ARRAY_STATUS_DATA[last_sync_timestamp]}"
+
+    echo ""
+    echo "# HELP nonraid_last_sync_age_seconds Seconds since last completed sync"
+    echo "# TYPE nonraid_last_sync_age_seconds gauge"
+    echo "nonraid_last_sync_age_seconds{label=\"$label\"} ${ARRAY_STATUS_DATA[last_sync_ago]}"
+
+    echo ""
+    echo "# HELP nonraid_last_sync_elapsed_seconds Seconds elapsed for last completed sync"
+    echo "# TYPE nonraid_last_sync_elapsed_seconds gauge"
+    echo "nonraid_last_sync_elapsed_seconds{label=\"$label\"} ${ARRAY_STATUS_DATA[last_sync_elapsed]}"
+
+    # Resync operation metrics
+    echo ""
+    echo "# HELP nonraid_resync_active Whether a resync operation is active (0=no, 1=yes)"
+    echo "# TYPE nonraid_resync_active gauge"
+    local resync_active=0
+    [ "${RESYNC_STATUS_DATA[active]}" = "true" ] && resync_active=1
+    echo "nonraid_resync_active{label=\"$label\"} $resync_active"
+
+    echo ""
+    echo "# HELP nonraid_resync_progress_percent Progress percentage of active resync operation"
+    echo "# TYPE nonraid_resync_progress_percent gauge"
+    echo "nonraid_resync_progress_percent{label=\"$label\"} ${RESYNC_STATUS_DATA[progress_percent]}"
+
+    if [ "${RESYNC_STATUS_DATA[active]}" = "true" ]; then
+        echo ""
+        echo "# HELP nonraid_resync_rate_mb_per_sec Current resync rate in MB/s"
+        echo "# TYPE nonraid_resync_rate_mb_per_sec gauge"
+        local rate_mb_numeric=$(format_kbytes "${RESYNC_STATUS_DATA[rate_kb_s]}" 0 2 "mb")
+        echo "nonraid_resync_rate_mb_per_sec{label=\"$label\"} $rate_mb_numeric"
+
+        echo ""
+        echo "# HELP nonraid_resync_eta_seconds Estimated time remaining for resync in seconds"
+        echo "# TYPE nonraid_resync_eta_seconds gauge"
+        echo "nonraid_resync_eta_seconds{label=\"$label\"} ${RESYNC_STATUS_DATA[eta_seconds]}"
+    fi
+
+    # Disk-specific metrics
+    for slot in $(seq 0 29); do
+        if [ "${DISK_STATUS_DATA[slot_${slot}_present]}" = "true" ]; then
+            local slottype="${DISK_STATUS_DATA[slot_${slot}_type]}"
+            local status="${DISK_STATUS_DATA[slot_${slot}_status]}"
+            local errors="${DISK_STATUS_DATA[slot_${slot}_errors]}"
+            local reads="${DISK_STATUS_DATA[slot_${slot}_reads]}"
+            local writes="${DISK_STATUS_DATA[slot_${slot}_writes]}"
+            local size_gb="${DISK_STATUS_DATA[slot_${slot}_size_gb]}"
+
+            # Disk status (0=OK, 1=INVALID/WRONG/etc, 2=MISSING/DISABLED, 3=NEW)
+            local disk_status_code=0
+            case "$status" in
+                "DISK_OK") disk_status_code=0 ;;
+                "DISK_INVALID"|"DISK_WRONG") disk_status_code=1 ;;
+                "DISK_NP_MISSING"|"DISK_DSBL"|"DISK_NP_DSBL"|"DISK_DSBL_NEW") disk_status_code=2 ;;
+                "DISK_NEW") disk_status_code=3 ;;
+                *) disk_status_code=4 ;;
+            esac
+
+            echo ""
+            echo "# HELP nonraid_disk_status Status of individual disk (0=OK, 1=INVALID, 2=MISSING, 3=NEW)"
+            echo "# TYPE nonraid_disk_status gauge"
+            echo "nonraid_disk_status{label=\"$label\",slot=\"$slot\",type=\"$slottype\"} $disk_status_code"
+
+            echo ""
+            echo "# HELP nonraid_disk_errors Number of errors on individual disk"
+            echo "# TYPE nonraid_disk_errors counter"
+            echo "nonraid_disk_errors{label=\"$label\",slot=\"$slot\",type=\"$slottype\"} $errors"
+
+            echo ""
+            echo "# HELP nonraid_disk_reads Total number of read operations for individual disk"
+            echo "# TYPE nonraid_disk_reads counter"
+            echo "nonraid_disk_reads{label=\"$label\",slot=\"$slot\",type=\"$slottype\"} $reads"
+
+            echo ""
+            echo "# HELP nonraid_disk_writes Total number of write operations for individual disk"
+            echo "# TYPE nonraid_disk_writes counter"
+            echo "nonraid_disk_writes{label=\"$label\",slot=\"$slot\",type=\"$slottype\"} $writes"
+
+            echo ""
+            echo "# HELP nonraid_disk_size_gb Size of individual disk in GB"
+            echo "# TYPE nonraid_disk_size_gb gauge"
+            echo "nonraid_disk_size_gb{label=\"$label\",slot=\"$slot\",type=\"$slottype\"} $size_gb"
+        fi
+    done
+}
+
+format_json_output() {
+    echo "{"
+    echo "  \"array\": {"
+    echo "    \"label\": \"${ARRAY_STATUS_DATA[sblabel]}\","
+    echo "    \"state\": \"${ARRAY_STATUS_DATA[mdstate]}\","
+    echo "    \"superblock\": \"${ARRAY_STATUS_DATA[sbname]}\","
+    echo "    \"disks_present\": ${ARRAY_STATUS_DATA[mdnumdisks]},"
+    echo "    \"disks_imported\": ${ARRAY_STATUS_DATA[imported_disks]},"
+    echo "    \"disks_unassigned\": ${ARRAY_STATUS_DATA[unassigned_disks]},"
+    echo "    \"total_slots\": ${ARRAY_STATUS_DATA[total_slots]},"
+    echo "    \"health\": {"
+    echo "      \"status\": \"${ARRAY_STATUS_DATA[health_status]}\","
+    echo "      \"details\": \"${ARRAY_STATUS_DATA[health_details]}\","
+    echo "      \"code\": ${ARRAY_STATUS_DATA[health_code]}"
+    echo "    },"
+    echo "    \"size\": {"
+    echo "      \"data_gb\": ${ARRAY_STATUS_DATA[data_size_gb]},"
+    echo "      \"data_disk_count\": ${ARRAY_STATUS_DATA[data_disk_count]},"
+    echo "      \"has_parity\": ${ARRAY_STATUS_DATA[has_parity]},"
+    echo "      \"has_second_parity\": ${ARRAY_STATUS_DATA[has_second_parity]},"
+    echo "      \"parity_size_gb\": ${ARRAY_STATUS_DATA[parity_size_gb]},"
+    echo "      \"second_parity_size_gb\": ${ARRAY_STATUS_DATA[second_parity_size_gb]}"
+    echo "    },"
+    echo "    \"counters\": {"
+    echo "      \"missing\": ${ARRAY_STATUS_DATA[mdnummissing]},"
+    echo "      \"invalid\": ${ARRAY_STATUS_DATA[mdnuminvalid]},"
+    echo "      \"wrong\": ${ARRAY_STATUS_DATA[mdnumwrong]},"
+    echo "      \"disabled\": ${ARRAY_STATUS_DATA[mdnumdisabled]},"
+    echo "      \"replaced\": ${ARRAY_STATUS_DATA[mdnumreplaced]},"
+    echo "      \"new\": ${ARRAY_STATUS_DATA[mdnumnew]},"
+    echo "      \"sync_errors\": ${ARRAY_STATUS_DATA[sbsyncerrs]},"
+    echo "      \"disk_errors\": ${ARRAY_STATUS_DATA[disks_num_errors]}"
+    echo "    },"
+    echo "    \"last_sync\": {"
+    echo "      \"timestamp\": ${ARRAY_STATUS_DATA[last_sync_timestamp]},"
+    echo "      \"age_seconds\": ${ARRAY_STATUS_DATA[last_sync_ago]},"
+    echo "      \"elapsed_seconds\": ${ARRAY_STATUS_DATA[last_sync_elapsed]},"
+    echo "      \"status\": \"${ARRAY_STATUS_DATA[last_sync_status]}\""
+    echo "    }"
+    echo "  },"
+    echo "  \"resync\": {"
+    echo "    \"active\": ${RESYNC_STATUS_DATA[active]},"
+    echo "    \"paused\": ${RESYNC_STATUS_DATA[paused]},"
+    echo "    \"pending\": ${RESYNC_STATUS_DATA[pending]},"
+    echo "    \"action\": \"${RESYNC_STATUS_DATA[action]}\","
+    echo "    \"progress_percent\": ${RESYNC_STATUS_DATA[progress_percent]},"
+    echo "    \"position_gb\": ${RESYNC_STATUS_DATA[position_gb]},"
+    echo "    \"size_gb\": ${RESYNC_STATUS_DATA[size_gb]},"
+    local rate_mb_numeric=$(format_kbytes "${RESYNC_STATUS_DATA[rate_kb_s]}" 0 2 "mb")
+    echo "    \"rate_mb_s\": $rate_mb_numeric,"
+    echo "    \"elapsed_seconds\": ${RESYNC_STATUS_DATA[elapsed_seconds]},"
+    echo "    \"eta_seconds\": ${RESYNC_STATUS_DATA[eta_seconds]}"
+    echo "  },"
+    echo "  \"disks\": ["
+
+    local first_disk=true
+    for slot in $(seq 0 29); do
+        if [ "${DISK_STATUS_DATA[slot_${slot}_present]}" = "true" ]; then
+            if [ "$first_disk" = "false" ]; then
+                echo ","
+            fi
+            first_disk=false
+
+            echo "    {"
+            echo "      \"slot\": $slot,"
+            echo "      \"type\": \"${DISK_STATUS_DATA[slot_${slot}_type]}\","
+            echo "      \"size_kb\": ${DISK_STATUS_DATA[slot_${slot}_size_kb]},"
+            echo "      \"size_gb\": ${DISK_STATUS_DATA[slot_${slot}_size_gb]},"
+            echo "      \"device\": \"${DISK_STATUS_DATA[slot_${slot}_device]}\","
+            echo "      \"status\": \"${DISK_STATUS_DATA[slot_${slot}_status]}\","
+            echo "      \"errors\": ${DISK_STATUS_DATA[slot_${slot}_errors]},"
+            echo "      \"reads\": ${DISK_STATUS_DATA[slot_${slot}_reads]},"
+            echo "      \"writes\": ${DISK_STATUS_DATA[slot_${slot}_writes]},"
+            echo "      \"disk_id\": \"${DISK_STATUS_DATA[slot_${slot}_disk_id]}\","
+            echo -n "      \"disk_name\": \"${DISK_STATUS_DATA[slot_${slot}_disk_name]}\""
+
+            # Add filesystem info if available
+            if [ -n "${DISK_STATUS_DATA[slot_${slot}_fs_type]}" ]; then
+                echo ","
+                echo "      \"filesystem\": {"
+                echo "        \"type\": \"${DISK_STATUS_DATA[slot_${slot}_fs_type]}\","
+                echo "        \"mountpoint\": \"${DISK_STATUS_DATA[slot_${slot}_mountpoint]}\","
+                echo "        \"usage\": \"${DISK_STATUS_DATA[slot_${slot}_usage]}\""
+                echo "      }"
+            else
+                echo ""
+            fi
+            echo -n "    }"
+        fi
+    done
+
+    echo ""
+    echo "  ]"
+    echo "}"
+}
+
+format_terse_output() {
+    local mdstate="${ARRAY_STATUS_DATA[mdstate]}"
+    local health_status="${ARRAY_STATUS_DATA[health_status]}"
+    local health_details="${ARRAY_STATUS_DATA[health_details]}"
+
+    local health_formatted="$(format_health_status "$health_status")"
+    [ -n "$health_details" ] && health_formatted="$health_formatted ($health_details)"
+
+    echo "NonRAID Array State: $(format_array_state "$mdstate"), Health: $health_formatted"
+}
+
+# Get visible length of a string with ANSI escape codes
+get_visible_length() {
+    local str="$1"
+    shopt -s extglob
+    str="${str//$'\e'\[*([0-9;])m/}"
+    echo "${#str}"
+}
+
+# Get formatted disk entries as array of pipe-separated strings
+get_disk_entries() {
+    local entries=()
+
+    for idx in 0 29 $(seq 1 28); do
+        if [ "${DISK_STATUS_DATA[slot_${idx}_present]}" = "true" ]; then
+            entries+=("$(format_disk_entry_data "$idx")")
+        fi
+    done
+
+    printf '%s\n' "${entries[@]}"
+}
+
+# Format a single disk entry as pipe-separated data
+format_disk_entry_data() {
+    local idx="$1"
+    local slottype="${DISK_STATUS_DATA[slot_${idx}_type]}"
+    local disksize="${DISK_STATUS_DATA[slot_${idx}_size_kb]}"
+    local rdevname="${DISK_STATUS_DATA[slot_${idx}_device]}"
+    local rdevstatus="${DISK_STATUS_DATA[slot_${idx}_status]}"
+    local rdevnumerrors="${DISK_STATUS_DATA[slot_${idx}_errors]}"
+    local diskid="${DISK_STATUS_DATA[slot_${idx}_disk_id]}"
+    local diskname="${DISK_STATUS_DATA[slot_${idx}_disk_name]}"
+    local array_started="${DISK_STATUS_DATA[array_started]}"
+
+    local status_formatted=$(format_disk_status "$rdevstatus")
+    if [ -n "$rdevnumerrors" ] && [ "$rdevnumerrors" -gt 0 ]; then
+        status_formatted="$status_formatted $(echo -e "${RED}($rdevnumerrors errs)${NC}")"
+    fi
+
+    local slot_display="$idx"
+    if [ "$slottype" = "P" ]; then
+        slot_display="P"
+    elif [ "$slottype" = "Q" ]; then
+        slot_display="Q"
+    fi
+
+    local device="$rdevname"
+    if [ "$rdevname" = "none" ] && [ -z "$diskid" ]; then
+        device="(unassigned)"
+    fi
+    if [ "$VERBOSE" -eq 1 ] && [ -n "$diskid" ]; then
+        device="$diskid ($rdevname)"
+    fi
+
+    local size_display="$disksize"
+    if [ "$VERBOSE" -eq 0 ]; then
+        size_display=$(format_kbytes "$disksize")
+    fi
+
+    local diskname_display="${diskname:-$slot_display}"
+    local fs_type="${DISK_STATUS_DATA[slot_${idx}_fs_type]:-"-"}"
+    local mountpoint="${DISK_STATUS_DATA[slot_${idx}_mountpoint]:-"-"}"
+    local usage="${DISK_STATUS_DATA[slot_${idx}_usage]:-"-"}"
+    local read_rate=""
+    local write_rate=""
+
+    if [ -n "$slottype" ] && [ "$slottype" != "data" ]; then
+        mountpoint="-"
+        fs_type="$slottype"
+    fi
+
+    if [ "$array_started" = "true" ]; then
+        read_rate=$(format_rate_or_count "${DISK_STATUS_DATA[slot_${idx}_read_rate_kb_s]:-0}" "slot_${idx}_reads")
+        write_rate=$(format_rate_or_count "${DISK_STATUS_DATA[slot_${idx}_write_rate_kb_s]:-0}" "slot_${idx}_writes")
+    fi
+
+    echo "$idx|$slot_display|$status_formatted|$device|$size_display|$diskname_display|$fs_type|$mountpoint|$usage|$read_rate|$write_rate"
+}
+
+# Main output formatter
+format_output() {
+    local output_format="$1"
+    case "$output_format" in
+        "default")
+            format_human_output
+            ;;
+        "prometheus")
+            format_prometheus_output
+            ;;
+        "json")
+            format_json_output
+            ;;
+        "terse")
+            format_terse_output
+            ;;
+        *)
+            echo "Error: Unknown output format: $output_format" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Terminal manipulation functions for monitor mode
+# Inspired by fff
+setup_monitor_terminal() {
+    # Setup terminal for TUI monitoring mode
+    # '\e[?1049h': Use alternative screen buffer
+    # '\e[?7l':    Disable line wrapping
+    # '\e[?25l':   Hide cursor
+    # '\e[2J':     Clear screen
+    printf '\e[?1049h\e[?7l\e[?25l\e[2J'
+
+    # Hide echoing of user input
+    stty -echo 2>/dev/null || true
+}
+
+reset_monitor_terminal() {
+    # Reset terminal to normal state
+    # '\e[?7h':    Re-enable line wrapping
+    # '\e[?25h':   Show cursor
+    # '\e[2J':     Clear screen
+    # '\e[?1049l': Restore main screen buffer
+    printf '\e[?7h\e[?25h\e[2J\e[?1049l'
+
+    # Show user input
+    stty echo 2>/dev/null || true
+}
+
+update_monitor_line() {
+    # Update line, clear remainder
+    # '\r': Return to beginning of line
+    # '\e[K': Clear line from cursor right
+    printf '\r%s\e[K\n' "$1"
+}
+
+update_status_bar() {
+    # Update a full-width status bar line with background color
+    local text="$1"
+    local bg_color="$2"
+
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo "80")
+    local visible_length=${#text}
+
+    # Create padding to fill the entire line
+    local padding_length=$((term_width - visible_length))
+    [[ $padding_length -lt 0 ]] && padding_length=0
+    local padding=$(printf "%*s" "$padding_length" "")
+
+    # Print the status bar: move to start, write content with background color and padding, clear remainder
+    printf '\r%b%s%s%b\e[K\n' "$bg_color" "$text" "$padding" "$NC"
+}
+
+calculate_disk_io_rates() {
+    # Calculate I/O rates for each disk based on previous readings
+    local current_timestamp="${NMDSTAT_VALUES[timestamp]}"
+
+    # If no previous timestamp, this is the first loop - store current values
+    if [ -z "${DISK_STATUS_DATA[timestamp_prev]}" ]; then
+        for idx in $(seq 0 29); do
+            if [ "${DISK_STATUS_DATA[slot_${idx}_present]}" = "true" ]; then
+                DISK_STATUS_DATA["slot_${idx}_prev_reads"]="${DISK_STATUS_DATA[slot_${idx}_reads]}"
+                DISK_STATUS_DATA["slot_${idx}_prev_writes"]="${DISK_STATUS_DATA[slot_${idx}_writes]}"
+                DISK_STATUS_DATA["slot_${idx}_read_rate_kb_s"]="0"
+                DISK_STATUS_DATA["slot_${idx}_write_rate_kb_s"]="0"
+                DISK_STATUS_DATA["slot_${idx}_total_rate_kb_s"]="0"
+            fi
+        done
+        DISK_STATUS_DATA["timestamp_prev"]="$current_timestamp"
+        return
+    fi
+
+    # Time delta since last measurement
+    local time_diff=$((current_timestamp - DISK_STATUS_DATA[timestamp_prev]))
+    if [ "$time_diff" -le 0 ]; then
+        time_diff=1  # Avoid division by zero
+    fi
+
+    # Calculate rates for each disk
+    for idx in $(seq 0 29); do
+        if [ "${DISK_STATUS_DATA[slot_${idx}_present]}" = "true" ]; then
+            local current_reads="${DISK_STATUS_DATA[slot_${idx}_reads]:-0}"
+            local current_writes="${DISK_STATUS_DATA[slot_${idx}_writes]:-0}"
+            local prev_reads="${DISK_STATUS_DATA[slot_${idx}_prev_reads]:-0}"
+            local prev_writes="${DISK_STATUS_DATA[slot_${idx}_prev_writes]:-0}"
+
+            # Calculate deltas (and handle possible wraparound)
+            local reads_delta=$((current_reads - prev_reads))
+            local writes_delta=$((current_writes - prev_writes))
+            [ "$reads_delta" -lt 0 ] && reads_delta=0
+            [ "$writes_delta" -lt 0 ] && writes_delta=0
+
+            # Driver writes and reads are in 8-sector units = 4kB
+            # Calculate rates in kB/s
+            local read_rate_kb_s=$(( (reads_delta * 4) / time_diff ))
+            local write_rate_kb_s=$(( (writes_delta * 4) / time_diff ))
+            local total_rate_kb_s=$(( read_rate_kb_s + write_rate_kb_s ))
+
+            # Store calculated rates and raw values for next loop
+            DISK_STATUS_DATA["slot_${idx}_read_rate_kb_s"]="$read_rate_kb_s"
+            DISK_STATUS_DATA["slot_${idx}_write_rate_kb_s"]="$write_rate_kb_s"
+            DISK_STATUS_DATA["slot_${idx}_total_rate_kb_s"]="$total_rate_kb_s"
+            DISK_STATUS_DATA["slot_${idx}_prev_reads"]="$current_reads"
+            DISK_STATUS_DATA["slot_${idx}_prev_writes"]="$current_writes"
+        fi
+    done
+
+    DISK_STATUS_DATA["timestamp_prev"]="$current_timestamp"
+}
+
+format_rate_or_count() {
+    local rate_kb_s="$1"
+    local count_key="$2"
+
+    if [ "$MONITOR_MODE" -eq 1 ] && [ "$rate_kb_s" -gt 0 ]; then
+        format_io_rate "$rate_kb_s"
+    else
+        format_io_count "${DISK_STATUS_DATA[$count_key]:-0}"
+    fi
+}
+
+format_io_rate() {
+    local rate_kb_s="$1"
+    local colorize="${2:-1}"
+
+    if [ "$rate_kb_s" -gt 0 ]; then
+        local formatted_rate=$(format_kbytes "$rate_kb_s" 1 2)
+        formatted_rate="${formatted_rate}/s"
+        if [ "$colorize" -eq 1 ]; then
+            formatted_rate="${GREEN}$formatted_rate${NC}"
+        fi
+        echo -e "$formatted_rate"
+    else
+        echo -n "-"
+    fi
+}
+
+format_io_count() {
+    # Format 4kB block counts as bytes with appropriate suffixes (B, kB, MB, GB, TB)
+    local count="$1"
+
+    # Convert 4kB blocks to kB
+    local kb=$((count * 4))
+    format_kbytes "$kb"
+}
+
+format_kbytes() {
+    local kb="$1"
+    local add_unit="${2:-1}"
+    local decimal_places="${3:-1}"
+    local force_unit="${4:-""}"
+
+    local unit=""
+    local bytes=$((kb * 1024))
+
+    # Helper function to format with decimals
+    format_with_decimals() {
+        local value="$1"
+        local remainder="$2"
+        local divisor="$3"
+        local unit_str="$4"
+        local decimals="$5"
+
+        # Calculate threshold for showing as integer (10% of divisor)
+        local threshold=$((divisor / 10))
+
+        if [ "$decimals" -eq 0 ] || [ "$remainder" -le "$threshold" ]; then
+            [ "$remainder" -ge $((divisor / 2)) ] && value=$((value + 1))
+            printf "%d%s" "$value" "$unit_str"
+        elif [ "$decimals" -eq 1 ]; then
+            local dec1=$((remainder * 10 / divisor))
+            printf "%d.%d%s" "$value" "$dec1" "$unit_str"
+        elif [ "$decimals" -eq 2 ]; then
+            local dec2=$((remainder * 100 / divisor))
+            printf "%d.%02d%s" "$value" "$dec2" "$unit_str"
+        fi
+    }
+
+    if [ "$force_unit" = "b" ] || { [ -z "$force_unit" ] && [ "$bytes" -lt 1024 ]; }; then
+        [ "$add_unit" -eq 1 ] && unit=" B"
+        printf "%d%s" "$bytes" "$unit"
+    elif [ "$force_unit" = "kb" ] || { [ -z "$force_unit" ] && [ "$kb" -lt 1024 ]; }; then
+        [ "$add_unit" -eq 1 ] && unit=" kB"
+        printf "%d%s" "$kb" "$unit"
+    elif [ "$force_unit" = "mb" ] || { [ -z "$force_unit" ] && [ "$kb" -lt 1048576 ]; }; then  # 1024^2
+        local mb=$((kb / 1024))
+        local remainder=$((kb % 1024))
+        [ "$add_unit" -eq 1 ] && unit=" MB"
+        format_with_decimals "$mb" "$remainder" "1024" "$unit" "$decimal_places"
+    elif [ "$force_unit" = "gb" ] || { [ -z "$force_unit" ] && [ "$kb" -lt 1073741824 ]; }; then  # 1024^3
+        local gb=$((kb / 1048576))
+        local remainder=$((kb % 1048576))
+        [ "$add_unit" -eq 1 ] && unit=" GB"
+        format_with_decimals "$gb" "$remainder" "1048576" "$unit" "$decimal_places"
+    elif [ "$force_unit" = "tb" ] || [ -z "$force_unit" ]; then
+        local tb=$((kb / 1073741824))
+        local remainder=$((kb % 1073741824))
+        [ "$add_unit" -eq 1 ] && unit=" TB"
+        format_with_decimals "$tb" "$remainder" "1073741824" "$unit" "$decimal_places"
+    fi
+}
+
+redraw_monitor_status() {
+    local timestamp="$(date)"
+
+    # Move to top of screen
+    printf '\e[H'
+
+    update_status_bar " NonRAID Array Status Monitor - $timestamp" "$HEADER_BG"
+    update_status_bar " Refresh interval: ${1}s" "$HEADER_BG"
+    update_monitor_line ""
+
+    local status_output
+    status_output="$(format_human_output)"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        update_monitor_line "$line"
+    done <<< "$status_output"
+
+    update_monitor_line ""
+    update_status_bar " Monitor Mode: Press 'q' to quit, 'r' to refresh immediately, '?' for help" "$FOOTER_BG"
+
+    # Clear to end of screen
+    printf '\e[J'
+}
+
+read_key_with_timeout() {
+    # Read a single key with timeout (non-blocking)
+    # Returns 0 if key was pressed, 1 if timeout
+    local timeout="${1:-0.1}"
+
+    if read -rt "$timeout" -n 1 -s key 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+monitor_status_loop() {
+    # Main monitoring loop
+    local interval="$1"
+
+    setup_monitor_terminal
+
+    # Restore terminal on exit
+    trap 'reset_monitor_terminal; exit 0' EXIT INT TERM
+
+    # Initial screen clear
+    printf '\e[2J\e[H'
+    update_status_bar " NonRAID Array Status Monitor - loading..." "$HEADER_BG"
+
+    while true; do
+        get_all_nmdstat_values NMDSTAT_VALUES
+        collect_array_summary
+        collect_array_health
+        collect_array_size_and_parity
+        collect_resync_status
+        collect_disk_status
+
+        calculate_disk_io_rates
+
+        redraw_monitor_status "$interval"
+
+        local elapsed=0
+        local total_deciseconds=$((interval * 10))
+        local check_deciseconds=1  # 0.1 second = 1 decisecond
+        local should_refresh=0
+
+        while (( elapsed < total_deciseconds )); do
+            if read_key_with_timeout "0.1"; then
+                case "$key" in
+                    'q'|'Q')
+                        reset_monitor_terminal
+                        exit 0
+                        ;;
+                    'r'|'R')
+                        should_refresh=1
+                        break
+                        ;;
+                    'v'|'V')
+                        if [ "$VERBOSE" -eq 1 ]; then
+                            VERBOSE=0
+                        else
+                            VERBOSE=1
+                        fi
+                        should_refresh=1
+                        break
+                        ;;
+                    '?'|'h'|'H')
+                        printf '\e[H\e[J'
+                        echo -e "${YELLOW}Monitor Mode Help:${NC}"
+                        echo ""
+                        echo "  q/Q - Quit monitor mode"
+                        echo "  r/R - Refresh immediately"
+                        echo "  v/V - Toggle verbose mode"
+                        echo "  ?/h/H - Show this help"
+                        echo ""
+                        echo "Press any key to continue..."
+                        read -rn 1 -s
+                        should_refresh=1
+                        break
+                        ;;
+                    *)
+                        ;;
+                esac
+            fi
+            elapsed=$((elapsed + check_deciseconds))
+        done
+
+        # If refresh was requested, continue to next iteration
+        [[ $should_refresh -eq 1 ]] && continue
+    done
+}
+
+# Show current array status
+show_status() {
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    local output_format="default"
+
+    # Parse our options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            "-v"|"--verbose")
+                VERBOSE=1
+                shift
+                ;;
+            "--no-fs")
+                NO_FS=1
+                shift
+                ;;
+            "-o"|"--output")
+                if [ -z "$2" ] || [[ "$2" == -* ]]; then
+                    echo -e "${RED}Error: --output requires an argument${NC}"
+                    return 1
+                fi
+                output_format="$2"
+                shift 2
+                ;;
+            "-m"|"--monitor")
+                MONITOR_MODE=1
+                if [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ]; then
+                    MONITOR_INTERVAL="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            *)
+                echo -e "${RED}Error: Unknown option for ${YELLOW}nmdctl status${NC}: $1${NC}"
+                return 1
+                ;;
+        esac
+    done
+
+    # Validate output format
+    case "$output_format" in
+        "default"|"prometheus"|"prom"|"json"|"terse")
+            # Accept prom alias
+            [[ "$output_format" == "prom" ]] && output_format="prometheus"
+            # Skip getting fs info for prometheus and terse output
+            [[ "$output_format" == "prometheus" ]] && NO_FS=1
+            [[ "$output_format" == "terse" ]] && NO_FS=1
+            ;;
+        *)
+            echo -e "${RED}Error: Invalid output format '$output_format'. Valid formats: default, prometheus, json, terse${NC}"
+            return 1
+            ;;
+    esac
+
+    # Handle monitor mode
+    if [ "$MONITOR_MODE" -eq 1 ]; then
+        # Monitor mode is incompatible with non-default output formats
+        if [ "$output_format" != "default" ]; then
+            echo -e "${RED}Error: Monitor mode only supports default output format${NC}"
+            return 1
+        fi
+
+        monitor_status_loop "$MONITOR_INTERVAL"
+        return $?
+    fi
+
+    # Print default format header early - makes the command feel more snappy
+    if [ "$output_format" == "default" ]; then
+        echo "=== NonRAID Array Status ==="
+        echo ""
+    fi
+
+    # Get all values from nmdstat in one go
+    get_all_nmdstat_values NMDSTAT_VALUES
+
+    # Collect all status data
+    collect_array_summary
+    collect_array_health
+    collect_array_size_and_parity
+    collect_resync_status
+    collect_disk_status
+
+    # Format and output the data
+    format_output "$output_format"
+
+    # Return the health status code
+    return "${ARRAY_STATUS_DATA[health_code]}"
+}
+
+# Format mdResyncAction into user-friendly term
+format_resync_action() {
+    local action="$1"
+    local resynccorr="${2:-}"
+
+    local base_action=${action%% *}
+    local args=""
+    if [[ "$action" == *" "* ]]; then
+        args=${action#* }
+    fi
+
+    local formatted_action=""
+
+    case "$base_action" in
+        "check")
+            formatted_action="Parity-Check $args"
+            if [ -n "$resynccorr" ]; then
+                if [ "$resynccorr" = "0" ]; then
+                    formatted_action+=" (check only)"
+                else
+                    formatted_action+=" (correcting)"
+                fi
+            fi
+            ;;
+        "recon")
+            if [[ $args =~ ^D([0-9]+)$ ]]; then
+                formatted_action="Data-Rebuild Disk ${BASH_REMATCH[1]}"
+            else
+                formatted_action="Parity-Sync $args"
+            fi
+            ;;
+        "clear")
+            formatted_action="Disk clearing"
+            ;;
+        *)
+            formatted_action="$action"
+            ;;
+    esac
+
+    echo "$formatted_action"
+}
+
+get_fs_type() {
+    local device="$1"
+    local fs_type=""
+
+    if [ ! -b "$device" ]; then
+        echo ""
+        return 1
+    fi
+
+    # Try lsblk first, it consults udev cache and is usually fast
+    fs_type=$(lsblk -no FSTYPE "$device" 2>/dev/null | head -n1 | tr -d ' \t\n')
+
+    # Fall back to blkid probing, timeout because it can "block" during very heavy I/O
+    if [ -z "$fs_type" ]; then
+        fs_type=$(timeout 5 blkid -o value -s TYPE -S 4096 "$device" 2>/dev/null)
+    fi
+
+    case "$fs_type" in
+        "zfs_member")
+            echo "zfs"
+            ;;
+        "crypto_LUKS")
+            local luks_fs="$(get_fs_type "/dev/mapper/$(basename "$device")")"
+            if [ -z "$luks_fs" ]; then
+                echo "luks"
+            else
+                echo "luks+$luks_fs"
+            fi
+            ;;
+        *)
+            echo "${fs_type:-unknown}"
+            ;;
+    esac
+    return 0
+}
+
+# Get mountpoint for a device
+# supports both relative and absolute device names
+get_mountpoint() {
+    local device="$1"
+    local fs_type="$2"
+
+    # Default to unmounted
+    local mountpoint="unmounted"
+
+    if [ -z "$device" ] || [ "$device" = "none" ]; then
+        echo "$mountpoint"
+        return 0
+    fi
+
+    # Handle different filesystem types
+    case "$fs_type" in
+        luks\+*)
+            # For LUKS, we need to check the upper filesystem
+            local luks_fs=${fs_type##*+}
+            if [ -n "$luks_fs" ]; then
+                mountpoint=$(get_mountpoint "/dev/mapper/$device" "$luks_fs")
+            fi
+            ;;
+
+        "zfs")
+            # Get ZFS pool name that contains this device
+            if command -v zpool >/dev/null 2>&1; then
+                local abs_device="$device"
+                [[ "$device" != /dev/* ]] && abs_device="/dev/$device"
+
+                # Use zpool list -v to get pool-to-vdev mapping
+                # Recent zpool has json output, but i dont want to add jq dependency
+                local pool=$(zpool list -v -H -P 2>/dev/null | awk -v abs_target="$abs_device" '
+                    # Pool lines
+                    /^[^\t ]/ {
+                        current_pool = $1
+                        next
+                    }
+                    # Vdev lines
+                    /^[\t ]/ {
+                        device_path = $1
+
+                        # Check if this vdev matches our target device
+                        if (device_path == abs_target) {
+                            print current_pool
+                            exit
+                        }
+                    }
+                ')
+
+                if [ -n "$pool" ]; then
+                    local found_mountpoint=$(zfs get -H -o value mountpoint "$pool" 2>/dev/null)
+                    if [ -n "$found_mountpoint" ] && [ "$found_mountpoint" != "none" ]; then
+                        mountpoint="$found_mountpoint"
+                    fi
+                fi
+            fi
+            ;;
+
+        "xfs"|"ext4"|"ext3"|"ext2"|"btrfs"|*)
+            # These filesystems can be found directly in /proc/mounts
+            local abs_device="$device"
+            [[ "$device" != /dev/* ]] && abs_device="/dev/$device"
+            local found_mountpoint=$(grep -w "$abs_device" /proc/mounts 2>/dev/null | awk '{print $2}' | head -1)
+            if [ -n "$found_mountpoint" ]; then
+                mountpoint="$found_mountpoint"
+            fi
+            ;;
+    esac
+
+    echo "$mountpoint"
+    return 0
+}
+
+# Get filesystem usage percentage
+get_fs_usage() {
+    local mountpoint="$1"
+    local fs_type="$2"
+
+    # If not mounted or invalid mountpoint, return empty
+    if [ "$mountpoint" = "unmounted" ] || [ "$mountpoint" = "-" ] || [ ! -d "$mountpoint" ]; then
+        echo "-"
+        return 0
+    fi
+
+    # Opened luks device, get the upper fs type
+    if [[ "$fs_type" =~ ^luks\+.* ]]; then
+        fs_type=${fs_type##*+}
+    fi
+
+    # Handle different filesystem types
+    case "$fs_type" in
+        "zfs")
+            # For ZFS, we need to use zfs command to get usage
+            if command -v zfs >/dev/null 2>&1; then
+                # Extract pool/dataset name from the mountpoint
+                local dataset=$(zfs list -H -o name "$mountpoint" 2>/dev/null)
+                if [ -n "$dataset" ]; then
+                    # Use zfs get to get the percentage directly
+                    local usage=$(zpool list -H -o cap "$dataset" 2>/dev/null)
+                    if [ -n "$usage" ]; then
+                        echo "$usage"
+                        return 0
+                    fi
+                fi
+            fi
+            ;;
+
+        *)
+            # Generic approach using df for standard filesystems
+            if command -v df >/dev/null 2>&1; then
+                local usage=$(df -h "$mountpoint" 2>/dev/null | tail -n 1 | awk '{ print $5 }')
+                if [ -n "$usage" ]; then
+                    echo "$usage"
+                    return 0
+                fi
+            fi
+            ;;
+    esac
+
+    echo "-"
+    return 0
+}
+
+# Get disk size in 1K blocks, optionally subtracting an offset (in 512-byte sectors)
+# Usage: get_disk_size_kb <device> [offset_sectors]
+get_disk_size_kb() {
+    local device="$1"
+    local offset_sectors="${2:-0}"
+    if [ ! -b "$device" ]; then
+        return 1
+    fi
+
+    # Use blockdev to get exact size in 512-byte logical sectors
+    local sectors=$(blockdev --getsz "$device" 2>/dev/null)
+    if [ -n "$sectors" ]; then
+        # Subtract offset if provided
+        if [ "$offset_sectors" -gt 0 ]; then
+            sectors=$(( sectors - offset_sectors ))
+        fi
+        # Round down to nearest multiple of 8 sectors (driver reads/writes 8 sectors at a time)
+        local adjusted_sectors=$(( (sectors / 8) * 8 ))
+        # Convert to 1K blocks (2 sectors = 1KB)
+        local kb_size=$(( adjusted_sectors / 2 ))
+        echo "$kb_size"
+        return 0
+    fi
+    return 1
+}
+
+# Save the import offset (in 512-byte sectors) used for a disk ID, so it can be
+# recovered on a later reload/import. Always clears any previously recorded
+# offset for this disk ID first (e.g. if a disk is later re-added/replaced
+# without an offset, the stale record must not linger), then only writes a
+# new entry if offset is > 0.
+# Usage: save_disk_offset <disk_id> <offset_sectors>
+save_disk_offset() {
+    local disk_id="$1"
+    local offset="${2:-0}"
+
+    [ -z "$disk_id" ] && return 0
+
+    # Remove any existing entry for this disk ID (exact match on first field)
+    if [ -f "$DISK_OFFSETS_FILE" ]; then
+        awk -v id="$disk_id" '$1 != id' "$DISK_OFFSETS_FILE" > "${DISK_OFFSETS_FILE}.tmp" 2>/dev/null
+        mv "${DISK_OFFSETS_FILE}.tmp" "$DISK_OFFSETS_FILE"
+    fi
+
+    [ "$offset" -le 0 ] 2>/dev/null && return 0
+
+    local dir
+    dir=$(dirname "$DISK_OFFSETS_FILE")
+    mkdir -p "$dir" 2>/dev/null
+    echo "$disk_id $offset" >> "$DISK_OFFSETS_FILE"
+    return 0
+}
+
+# Get the previously saved import offset (in 512-byte sectors) for a disk ID.
+# Echoes 0 if none is recorded.
+# Usage: get_saved_disk_offset <disk_id>
+get_saved_disk_offset() {
+    local disk_id="$1"
+    local offset=0
+
+    if [ -n "$disk_id" ] && [ -f "$DISK_OFFSETS_FILE" ]; then
+        offset=$(awk -v id="$disk_id" '$1 == id { val = $2 } END { print val }' "$DISK_OFFSETS_FILE" 2>/dev/null)
+        [ -z "$offset" ] && offset=0
+    fi
+    echo "$offset"
+    return 0
+}
+
+# Find an unused largest partition for a given disk device
+find_partition() {
+    local dev="$1"
+    #           list partitions | sort by size | largest last | use if no mountpoint
+    partition=$(lsblk -bpno kname,size,mountpoint "$dev" | grep -v -w "$dev" |grep "$dev" | sort -k2 -n | tail -1 | awk '{ if($3 == "") print $1}')
+    if [ -n "$partition" ] && [ -b "$partition" ]; then
+        # Check if partition is a parent for some other block device (like LVM)
+        if ! lsblk -pno pkname "$partition" | grep -q -w "$partition"; then
+            # If python is available, check if we can get exclusive lock on the block device
+            # This should detect use by for example zfs
+            local dev_locked=0
+            if command -v python3 >/dev/null 2>&1; then
+                if ! python3 -c "import os; os.open('$partition', os.O_WRONLY|os.O_EXCL)" 2>/dev/null; then
+                    dev_locked=1
+                fi
+            fi
+            if [ "$dev_locked" -eq 0 ]; then
+                # If python is not available or device was not locked, return the partition and return 0
+                echo "$partition"
+                return 0
+            else
+                # If device is locked, return the partition but with a special code to indicate it's in use by another process
+                echo "$partition"
+                return 2
+            fi
+        fi
+    fi
+    return 1
+}
+
+# Find disk device name matching the ID in nmdstat
+find_matching_disk() {
+    local disk_id="$1"
+
+    # Check if disk_id is empty
+    if [ -z "$disk_id" ]; then
+        return 1
+    fi
+
+    # Look through /dev/disk/by-id to find matching disk
+    if [ -d "/dev/disk/by-id" ]; then
+        for id_path in /dev/disk/by-id/*; do
+            # Skip if not a symlink or if it's a partition
+            if [ ! -L "$id_path" ] || [[ "$id_path" == *-part* ]]; then
+                continue
+            fi
+
+            local id_name=$(basename "$id_path")
+            # If the disk ID contains the target ID, consider it a match
+            if [[ "$id_name" == *"$disk_id"* ]]; then
+                # Get the actual device the symlink points to
+                local real_dev=$(readlink -f "$id_path")
+                echo "$real_dev"
+                return 0
+            fi
+        done
+    fi
+
+    return 1
+}
+
+# Import disks to array without starting it
+# shellcheck disable=SC2120 # allow optional argument for quiet mode, not used currently
+import_disks() {
+    local quiet_mode="${1:-0}"
+    check_root
+
+    # Check if module is loaded, will attempt to load if superblock provided
+    if ! check_module_loaded; then
+        return 1
+    fi
+
+    # Check if /proc/nmdstat exists after loading the module
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    echo "Scanning array configuration..."
+
+    # Parse superblock to get disk IDs and slot assignments
+    local num_disks=0
+    local disks_to_import=()
+
+    # Process all defined disk slots
+    for slot in $(get_defined_slots); do
+        local disk_id=$(get_nmdstat_value "diskId.$slot")
+        local disk_state=$(get_nmdstat_value "diskState.$slot")
+        local short_id="${disk_id}"
+        if [ ${#short_id} -gt 33 ]; then
+            # If diskId is longer than 32 characters, truncate it for display
+            short_id="${disk_id:0:30}..."
+        fi
+
+        # Check if this slot already has a device imported
+        local rdevname=$(get_nmdstat_value "rdevName.$slot")
+        if [ -n "$rdevname" ] && [ "$rdevname" != "none" ]; then
+            echo -e "${YELLOW}Skipping slot $slot: Already has device $rdevname imported${NC}"
+            continue
+        fi
+
+        # Check if this slot has been intentionally disabled (DISK_NP_MISSING or DISK_NP_DSBL status)
+        local rdevstatus=$(get_nmdstat_value "rdevStatus.$slot")
+        if [ "$rdevstatus" = "DISK_NP_MISSING" ] || [ "$rdevstatus" = "DISK_NP_DSBL" ]; then
+            echo -e "${YELLOW}Skipping slot $slot: Disk has been unassigned (status: $rdevstatus)${NC}"
+            continue
+        elif [ "$rdevstatus" = "DISK_NP" ] && [ -z "$disk_id" ]; then
+            echo -e "Slot $slot has been ${YELLOW}unassigned${NC}, importing slot as empty"
+            disks_to_import+=("$slot||0|0|0|")
+            num_disks=$((num_disks + 1))
+            continue
+        fi
+
+        # Check if disk has been disabled due to errors
+        if [ "$disk_state" -eq 4 ]; then
+            echo -e "${YELLOW}Skipping slot $slot: Disk has been disabled due to errors and needs to be unassigned (state: $disk_state)${NC}"
+            continue
+        fi
+
+        # Find matching physical disk
+        local found_device=""
+        if [ -d "/dev/disk/by-id" ]; then
+            found_device=$(find_matching_disk "$disk_id")
+        fi
+
+        if [ -z "$found_device" ]; then
+            echo -e "${YELLOW}Warning: Could not find physical disk for ID: ${short_id}${NC}"
+            continue
+        fi
+
+        # The kernel driver does not persist a disk's import offset in its
+        # on-disk superblock, so if this disk was originally imported with an
+        # explicit numeric offset, reuse the offset nmdctl recorded at
+        # create/add time. This ensures the size is (re)computed exactly the
+        # same way it was at creation, avoiding a spurious size mismatch.
+        local saved_offset
+        saved_offset=$(get_saved_disk_offset "$disk_id")
+
+        local import_device=""
+        local offset=0
+
+        if [ "$saved_offset" -gt 0 ]; then
+            # Raw whole-disk import with the recorded offset
+            import_device="$found_device"
+            offset="$saved_offset"
+        else
+            # No recorded offset: fall back to the standard partition-based
+            # import (or a raw whole-disk import if there's no partition at
+            # all, e.g. a raw parity disk).
+            local partition
+            partition="$(find_partition "$found_device")"
+            local find_rc=$?
+            if [ "$find_rc" -eq 2 ]; then
+                echo -e "${YELLOW}Warning: Partition $partition on $found_device is locked by another process, skipping${NC}"
+                partition=""
+            fi
+
+            if [ -n "$partition" ]; then
+                import_device="$partition"
+                offset=0
+            elif [ "$find_rc" -ne 2 ]; then
+                # Determine if this disk has any partition at all (used or not)
+                local has_partition
+                has_partition=$(lsblk -lpno KNAME "$found_device" 2>/dev/null | grep -v -w "^$found_device$" | head -1)
+
+                if [ -z "$has_partition" ]; then
+                    # No partition at all: raw whole-disk import
+                    import_device="$found_device"
+                    offset=0
+                fi
+            fi
+        fi
+
+        if [ -z "$import_device" ]; then
+            echo -e "${YELLOW}Warning: No usable partition found for disk $found_device${NC}"
+            continue
+        fi
+
+        local disk_size=$(get_disk_size_kb "$import_device" "$offset")
+
+        if [ -z "$disk_size" ]; then
+            echo -e "${YELLOW}Warning: Could not determine size for $import_device${NC}"
+            continue
+        fi
+
+        # Get the configured size from nmdstat
+        local configured_size=$(get_nmdstat_value "diskSize.$slot")
+        local size_to_use="$disk_size"
+
+        # If we have a configured size and it differs from actual size
+        if [ -n "$configured_size" ] && [ "$configured_size" -gt 0 ] && [ "$configured_size" -ne "$disk_size" ]; then
+            echo -e "${YELLOW}Warning: Size mismatch for disk in slot $slot${NC}"
+            echo -e "  Disk size     : $disk_size KB"
+            echo -e "  Expected size : $configured_size KB"
+
+            if [ "$UNATTENDED" -eq 1 ]; then
+                # If unattended, do not continue import
+                echo -e "${RED}Error: Size mismatch for disk in slot $slot (unattended mode)${NC}"
+                continue
+            fi
+
+            # Ask for confirmation
+            read -r -p "Use the configured size instead of detected size? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                size_to_use="$configured_size"
+                echo -e "Using configured size: ${BLUE}$configured_size KB${NC}"
+            else
+                echo -e "Using detected disk size: ${BLUE}$disk_size KB${NC}"
+            fi
+        fi
+
+        echo -e "Found disk for slot $slot: ${BLUE}$(basename "$import_device")${NC} (ID: ${short_id})$([ "$offset" -gt 0 ] && echo -e " Offset: ${BLUE}$offset${NC}")"
+
+        # Add to import list: slot, device, offset, size, erased, id
+        disks_to_import+=("$slot|$(basename "$import_device")|$offset|$size_to_use|0|$disk_id")
+        num_disks=$((num_disks + 1))
+    done
+
+    # Check if we found any disks to import
+    if [ "$num_disks" -eq 0 ]; then
+        # Check if disks were already imported (check for any rdevName values)
+        local already_imported=0
+        # shellcheck disable=SC2013
+        for slot in $(grep -E "^diskId\.[0-9]+" "$PROC_NMDSTAT" | cut -d'.' -f2 | cut -d'=' -f1); do
+            local rdevname=$(get_nmdstat_value "rdevName.$slot")
+            if [ -n "$rdevname" ] && [ "$rdevname" != "none" ]; then
+                already_imported=$((already_imported + 1))
+            fi
+        done
+
+        if [ "$already_imported" -gt 0 ]; then
+            echo -e "${GREEN}All disks already imported ($already_imported disk(s) found)${NC}"
+        else
+            echo -e "${RED}Error: No disks found to import${NC}"
+            return 1
+        fi
+    else
+        echo ""
+        echo "Importing $num_disks disks..."
+
+        # Import each disk
+        for disk_data in "${disks_to_import[@]}"; do
+            IFS='|' read -r slot partition offset size erased id <<< "$disk_data"
+
+            echo -e "Importing disk to slot $slot: ${BLUE}${partition:-${YELLOW}(empty)}${NC}"
+            if ! run_nmd_command "import $slot $partition $offset $size $erased $id"; then
+                echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
+            fi
+        done
+
+        echo -e "${GREEN}Successfully imported $num_disks disk(s)${NC}"
+    fi
+
+    echo ""
+    # Show array status after importing
+    if [ "$quiet_mode" -eq 0 ]; then
+        show_status
+    fi
+
+    return 0
+}
+
+# Start the array by importing disks and starting the array
+start_array() {
+    local explicit_state="$1"
+    check_root
+
+    # Check if module is loaded, will attempt to load if superblock provided
+    if ! check_module_loaded; then
+        return 1
+    fi
+
+    # Check if /proc/nmdstat exists after loading the module
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    # Check current array state
+    local mdstate=$(get_nmdstat_value "mdState")
+
+    if [ "$mdstate" = "STARTED" ]; then
+        echo -e "${YELLOW}Array is already started${NC}"
+        return 0
+    fi
+
+    # Import disks first
+    import_disks
+
+    echo ""
+    # Check array state after imports
+    mdstate=$(get_nmdstat_value "mdState")
+
+    # Check if all defined disks have been imported
+    local imported_disks=0
+    local missing_slots=()
+
+    # Count imported disks and track which ones are missing
+    for slot in $(get_defined_slots); do
+        local rdevname=$(get_nmdstat_value "rdevName.$slot")
+        local rdevstatus=$(get_nmdstat_value "rdevStatus.$slot")
+
+        if [ -n "$rdevname" ] && [ "$rdevname" != "none" ]; then
+            imported_disks=$((imported_disks + 1))
+        elif [ "$rdevstatus" != "DISK_NP_MISSING" ] && [ "$rdevstatus" != "DISK_NP_DSBL" ]; then
+            # Only consider it missing if it's not intentionally unassigned
+            missing_slots+=("$slot")
+        fi
+    done
+
+    # If we have missing disks that aren't explicitly unassigned, don't allow starting
+    if [ ${#missing_slots[@]} -gt 0 ]; then
+        echo -e "${RED}Error: Cannot start array with missing disks${NC}"
+        echo -e "${YELLOW}The following disk slots are defined but not imported:${NC} ${missing_slots[*]}"
+        echo -e "${YELLOW}You must either:${NC}"
+        echo -e "  1. Import the missing disk(s) with ${GREEN}nmdctl import${NC}"
+        echo -e "  2. Unassign the missing disk(s) with ${GREEN}nmdctl unassign SLOT${NC}"
+        return 1
+    fi
+
+    # If no disks were imported, warn the user, and refuse to start in unattended mode
+    if [ "$imported_disks" -eq 0 ] && [ "$mdstate" != "NEW_ARRAY" ]; then
+        if [ "$UNATTENDED" -eq 1 ]; then
+            echo -e "${RED}Error: No disks imported. Cannot start array (unattended mode)${NC}"
+            return 1
+        else
+            echo -e "${YELLOW}Warning: No disks imported.${NC}"
+        fi
+    fi
+
+    # Check array state and proceed based on it
+    if [ "$mdstate" = "STOPPED" ]; then
+        # Normal state, proceed without confirmation
+        echo "Array is in normal STOPPED state"
+        if ! run_nmd_command "start"; then
+            echo -e "${RED}Error: Failed to start array${NC}"
+            return 1
+        fi
+    else
+        # Abnormal state, check if explicitly requested
+        if [ -n "$explicit_state" ]; then
+            # Explicit state was provided
+            if [[ "${mdstate,,}" == "${explicit_state,,}" ]]; then
+                # State matches, proceed without prompting
+                echo -e "${GREEN}Proceeding with explicitly requested state: $mdstate${NC}"
+            else
+                # State doesn't match, error out
+                echo -e "${RED}Error: Explicit state '$explicit_state' does not match current array state '$mdstate'${NC}"
+                return 1
+            fi
+        else
+            # No explicit state provided, require confirmation
+            echo -e "${YELLOW}Array is in abnormal state: $mdstate${NC}"
+
+            case "$mdstate" in
+                "NEW_ARRAY")
+                    echo -e "${YELLOW}This is a new array being started for the first time.${NC}"
+                    ;;
+                "RECON_DISK")
+                    echo -e "${YELLOW}One or more disks need reconstruction.${NC}"
+                    ;;
+                "DISABLE_DISK")
+                    echo -e "${YELLOW}Array will run in degraded mode with missing disk(s).${NC}"
+                    ;;
+                "SWAP_DSBL")
+                    echo -e "${YELLOW}Array will do parity swap on start.${NC}"
+                    echo -e "${RED}Existing parity disk contents needs to have been manually copied to new parity disk BEFORE starting array!${NC}"
+                    ;;
+                "ERROR:"*)
+                    echo -e "${RED}Array is in ERROR state. Starting may fail or cause data loss.${NC}"
+                    ;;
+            esac
+
+            if [ "$UNATTENDED" -eq 1 ]; then
+                echo -e "${RED}Error: Cannot start array in abnormal state in unattended mode${NC}"
+                return 1
+            fi
+
+            # Ask for confirmation
+            read -r -p "Do you want to continue starting the array in this state? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "Array start cancelled by user"
+                return 1
+            fi
+        fi
+
+        echo "Proceeding with array start in $mdstate state"
+        if ! run_nmd_command "start $mdstate"; then
+            echo -e "${RED}Error: Failed to start array${NC}"
+            return 1
+        fi
+    fi
+
+    echo -e "${GREEN}Array started successfully${NC}"
+    echo ""
+
+    # Show array status
+    show_status
+
+    return 0
+}
+
+# Stop the array
+stop_array() {
+    check_root
+
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    # Get all nmdstat values if we haven't already
+    if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+        get_all_nmdstat_values NMDSTAT_VALUES
+    fi
+
+    local mdstate=${NMDSTAT_VALUES["mdState"]}
+
+    if [ "$mdstate" != "STARTED" ]; then
+        echo -e "${YELLOW}Array is not running (current state: $mdstate)${NC}"
+        return 0
+    fi
+
+    local unmount_needed=0
+    # Check if we need to unmount any filesystems before stopping
+    for slot in $(get_defined_slots); do
+        if [ "$slot" -eq 0 ] || [ "$slot" -eq 29 ]; then
+            continue
+        fi
+        local diskname="${NMDSTAT_VALUES["diskName.$slot"]}"
+        local fs_type=$(get_fs_type "/dev/$diskname")
+        local current_mountpoint=$(get_mountpoint "$diskname" "$fs_type")
+        if [ -n "$current_mountpoint" ] && [ "$current_mountpoint" != "unmounted" ]; then
+            unmount_needed=1
+            break
+        fi
+    done
+
+    if [ "$unmount_needed" -eq 1 ]; then
+        if [ "$UNATTENDED" -eq 1 ]; then
+            echo -e "${RED}Error: Cannot stop array with mounted filesystems in unattended mode${NC}"
+            return 1
+        fi
+
+        echo -e "${YELLOW}Warning: Some filesystems are mounted. Unmount them before stopping the array.${NC}"
+        read -r -p "Do you want to unmount all filesystems? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Array stop cancelled by user"
+            return 1
+        fi
+
+        if ! unmount_array_disks; then
+            echo ""
+            echo -e "${RED}Error: Failed to unmount some filesystems${NC}"
+            echo "Please unmount them manually before stopping the array"
+            return 1
+        fi
+        echo ""
+    fi
+
+    echo "Stopping array..."
+    if ! run_nmd_command "stop"; then
+        echo -e "${RED}Error: Failed to stop array${NC}"
+        return 1
+    fi
+
+    if [ "$UNATTENDED" -eq 0 ]; then
+        # Reload driver to clear any stale state
+        if ! reload_module 1; then
+            echo -e "${YELLOW}Warning: Failed to reload NonRAID kernel module${NC}"
+        fi
+    fi
+
+    echo -e "${GREEN}Array stopped successfully${NC}"
+    return 0
+}
+
+# Handle resync actions
+handle_check() {
+    local option="${1:-CORRECT}"
+    check_root
+
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+        get_all_nmdstat_values NMDSTAT_VALUES
+    fi
+
+    local mdstate=${NMDSTAT_VALUES[mdState]}
+    local mdresyncaction=${NMDSTAT_VALUES[mdResyncAction]}
+    local mdresynccorr=${NMDSTAT_VALUES[mdResyncCorr]}
+    local mdresyncpos=${NMDSTAT_VALUES[mdResyncPos]}
+    local mdresyncsize=${NMDSTAT_VALUES[mdResyncSize]}
+    local mdresync=${NMDSTAT_VALUES[mdResync]}
+
+    if [ "$mdstate" != "STARTED" ]; then
+        echo -e "${RED}Error: Array must be started to run parity check${NC}"
+        return 1
+    fi
+
+    local friendly_action=$(format_resync_action "$mdresyncaction" "$mdresynccorr")
+
+    # Handle stopping or pausing resync action
+    if [[ "${option^^}" == "PAUSE" ]] || [[ "${option^^}" == "CANCEL" ]]; then
+        if [[ "$mdresync" -eq 0 ]]; then
+            echo -e "${YELLOW}Warning: No resync operation is currently running${NC}"
+            return 0
+        fi
+        echo "$([[ "${option^^}" != "PAUSE" ]] && echo "Stopping" || echo "Pausing") $friendly_action..."
+        if ! run_nmd_command "nocheck $option"; then
+            echo -e "${RED}Error: Failed to $([[ "${option^^}" != "PAUSE" ]] && echo "stop" || echo "pause") $friendly_action${NC}"
+            return 1
+        fi
+
+        echo -e "${GREEN}$friendly_action $([[ "${option^^}" != "PAUSE" ]] && echo "stopped" || echo "paused")${NC}"
+        return 0
+    fi
+
+    if [[ "$mdresync" -gt 0 ]] && [[ "$mdresyncpos" -gt 0 ]]; then
+        echo -e "${RED}Error: Resync operation $friendly_action is already in progress${NC}"
+        return 1
+    fi
+
+    if [[ "${option^^}" == "RESUME" ]] &&  [[ "$mdresyncpos" -eq 0 ]]; then
+        echo -e "${YELLOW}Warning: No paused resync operation to resume${NC}"
+        return 1
+    fi
+
+    # Check if a previous resync operation is paused, and we were not called with resume
+    if [[ "$mdresync" -eq 0 ]] && [[ "$mdresyncpos" -gt 0 ]] && [[ "${option^^}" != "RESUME" ]]; then
+        echo -e "${YELLOW}Warning: Previous resync operation $friendly_action is currently paused at $(( mdresyncpos * 100 / mdresyncsize ))%${NC}"
+        echo -e "${YELLOW}You can resume it with ${GREEN}nmdctl check RESUME${NC}"
+        if [ "$UNATTENDED" -eq 1 ]; then
+            echo -e "${RED}Error: Cannot start new operation with a paused operation pending (unattended mode)${NC}"
+            return 1
+        fi
+        read -r -p "Are you sure you want to start a new operation without resuming? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Parity check cancelled by user"
+            return 1
+        fi
+    fi
+    # Check if some other sync operation is pending, and confirm with the user
+    if [[ "${option^^}" != "RESUME" ]] && [[ "$mdresyncaction" != check* ]]; then
+        # If we're explicitly given an option for the pending sync operation, allow that operation to proceed
+        if [ -n "$1" ] && [[ "$mdresyncaction" == "${option,,}"* ]]; then
+            echo -e "${GREEN}Proceeding with explicitly requested operation: $friendly_action${NC}"
+            option="CORRECT"
+        else
+            echo -e "${YELLOW}Warning: A sync operation other than parity check is pending: $friendly_action${NC}"
+            if [ "$UNATTENDED" -eq 1 ]; then
+                echo -e "${RED}Error: Cannot start parity check with another sync operation pending (unattended mode)${NC}"
+                return 1
+            fi
+
+            read -r -p "Do you want to proceed with $friendly_action? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "Sync operation cancelled by user"
+                return 1
+            fi
+        fi
+    else
+        if [ -z "$1" ] && [ "$UNATTENDED" -eq 1 ]; then
+            echo -e "${YELLOW}Warning: Using NOCORRECT mode by default in unattended mode${NC}"
+            option="NOCORRECT"
+        elif [ -z "$1" ]; then
+            echo -e "${YELLOW}No option provided, defaulting to corrective parity check${NC}"
+            read -r -p "Do you want to continue? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "Parity check cancelled by user"
+                return 1
+            fi
+        fi
+        # reformat with chosen no/correct option
+        if [ "${option^^}" != "RESUME" ]; then
+            friendly_action=$(format_resync_action "$mdresyncaction" "$( [[ ${option^^} == "CORRECT" ]] && echo "1" || echo "0" )")
+        fi
+    fi
+
+    echo "$([[ "${option^^}" != "RESUME" ]] && echo "Starting" || echo "Resuming") $friendly_action..."
+    if ! run_nmd_command "check $option"; then
+        echo -e "${RED}Error: Failed to start $friendly_action${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}$friendly_action $([[ "${option^^}" != "RESUME" ]] && echo "started" || echo "resumed")${NC}"
+    return 0
+}
+
+# Validate if a device/partition path is available for array use
+validate_device_path() {
+    local device_path="$1"
+    local force="${2:-0}"
+    local available_devices_str="$3"
+
+    # Check if device path exists
+    if [ ! -e "$device_path" ]; then
+        echo -e "${RED}Error: Device $device_path does not exist${NC}"
+        return 1
+    fi
+
+    # Check if it's a block device
+    if [ ! -b "$device_path" ]; then
+        echo -e "${RED}Error: $device_path is not a block device${NC}"
+        return 1
+    fi
+
+    # If --force is not used, verify device is in available devices list
+    if [ "$force" -eq 0 ]; then
+        local device_found=0
+        for device_info in $available_devices_str; do
+            IFS='|' read -r dev partition size_kb size_gb disk_id <<< "$device_info"
+            if [ "$partition" = "$device_path" ]; then
+                device_found=1
+                break
+            fi
+        done
+
+        if [ "$device_found" -eq 0 ]; then
+            echo -e "${RED}Error: Device $device_path is not in the list of available devices${NC}"
+            echo -e "${YELLOW}Use --force to override this check${NC}"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# List available block devices with an unused largest partition
+list_available_devices() {
+    local devices=()
+
+    # Find system virtio devices
+    virtio_majors=$(grep virtblk /proc/devices | awk '{print $1}')
+
+    # Include SCSI/SATA in disk devices
+    include_majors="8,65,66,67,68,69,70,71"
+    for major in $virtio_majors; do
+        include_majors+=",$major"
+    done
+
+    # Find all disk devices
+    for dev in $(lsblk -n -d -I "$include_majors" -o path 2>/dev/null); do
+        # Find partition, largest on the disk and must not be mounted
+        local partition
+        partition=$(find_partition "$dev")
+        local find_rc=$?
+        if [ "$find_rc" -eq 2 ]; then
+            continue
+        fi
+        if [ -n "$partition" ]; then
+            # Get disk id
+            local disk_id=""
+            disk_id=$(udevadm info --query=property --property=ID_SERIAL --value --name="$dev" 2>/dev/null)
+
+            # Get disk size information
+            local size_kb=$(get_disk_size_kb "$partition")
+            local size_gb=0
+            if [ -n "$size_kb" ] && [ "$size_kb" -gt 0 ]; then
+                size_gb=$(format_kbytes "$size_kb" 0 0 "gb")
+            fi
+
+            # Add to available devices
+            devices+=("$dev|$partition|$size_kb|$size_gb|$disk_id")
+        fi
+    done
+
+    echo "${devices[@]}"
+}
+
+# Create a new array with interactive disk assignment or from layout parameters
+create_array() {
+    check_root
+
+    # Parse arguments for layout mode or use interactive mode
+    local force=0
+    local -a disk_params
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            "--force"|"-f")
+                force=1
+                shift
+                ;;
+            *)
+                # Collect disk parameters
+                disk_params+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # If disk parameters were provided, use layout mode
+    if [ ${#disk_params[@]} -gt 0 ]; then
+        create_array_layout "${force}" "${disk_params[@]}"
+        return $?
+    fi
+
+    # Otherwise, use interactive mode
+    create_array_interactive
+}
+
+# Create a new array from layout parameters
+create_array_layout() {
+    local force="$1"
+    shift
+    local disk_params=("$@")
+
+    # Get current superblock path
+    local superblock="${SUPERBLOCK_PATH:-$DEFAULT_SUPERBLOCK}"
+    local is_new_superblock=0
+    if [ ! -f "$superblock" ]; then
+        is_new_superblock=1
+        echo -e "${BLUE}Creating a new array with a new superblock at: ${GREEN}$superblock${NC}"
+        echo -e "${YELLOW}Note: The superblock file will be created when the array is started${NC}"
+    fi
+
+    # Check if module is loaded
+    if ! check_module_loaded; then
+        return 1
+    fi
+
+    # Check if /proc/nmdstat exists
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    # Check if the array is already started
+    local mdstate=$(get_nmdstat_value "mdState")
+    if [ "$mdstate" != "STOPPED" ]; then
+        echo -e "${RED}Error: The array is not currently stopped. Please stop it first.${NC}"
+        return 1
+    fi
+
+    # Verify no disks are defined in the array
+    local disk_count=$(get_defined_slots_count)
+    if [ "$disk_count" -gt 0 ] && [ "$is_new_superblock" -eq 0 ]; then
+        echo -e "${RED}Error: The array already has $disk_count disk(s) configured${NC}"
+        echo -e "${YELLOW}Use 'nmdctl stop' first, then create a new superblock to replace the existing configuration.${NC}"
+        return 1
+    fi
+
+    echo -e "=== ${BLUE}Creating NonRAID Array (Non-interactive Mode)${NC} ==="
+    echo ""
+    echo -e "${YELLOW}Validating given array layout...${NC}"
+    echo ""
+
+    # Pre-fetch available devices once if not using --force
+    local cached_available_devices=""
+    if [ "$force" -eq 0 ]; then
+        cached_available_devices=$(list_available_devices)
+    fi
+
+
+    # Parse and validate disk parameters
+    local import_entries=()
+    local assigned_slots=()
+    local -A slot_map
+
+    for param in "${disk_params[@]}"; do
+        # Parse SLOT:DEVICE[:ID-STRING] format
+        local slot_spec="" device_path="" provided_disk_id=""
+
+        # Check basic format: must have at least one colon and valid slot
+        if [[ ! "$param" =~ ^([0-9P-Q]|[12][0-9]|29):.*$ ]]; then
+            echo -e "${RED}Error: Invalid format for parameter: $param${NC}"
+            echo -e "${YELLOW}Expected format: SLOT:/dev/partition or SLOT:/dev/partition:ID-STRING${NC}"
+            return 1
+        fi
+
+        # Parse the slot (first part before first colon)
+        slot_spec="${param%%:*}"
+        local rest="${param#*:}"
+
+        # Now parse the device path, optional ID, and optional offset from rest
+        # Format: SLOT:DEV[:ID[:OFFSET]]
+        local provided_disk_id=""
+        local provided_offset=0
+
+        # Parse colon-separated fields
+        local -a fields
+        IFS=':' read -ra fields <<< "$rest"
+
+        device_path="${fields[0]}"
+        if [ ${#fields[@]} -ge 2 ]; then
+            # If the second field looks like a number (no non-digit chars and starts with digit), it could be offset
+            # Otherwise treat it as disk ID
+            if [[ "${fields[1]}" =~ ^[0-9]+$ ]]; then
+                provided_offset="${fields[1]}"
+            else
+                provided_disk_id="${fields[1]}"
+                if [ ${#fields[@]} -ge 3 ]; then
+                    provided_offset="${fields[2]}"
+                fi
+            fi
+        fi
+
+        # Validate device path is not empty
+        if [ -z "$device_path" ]; then
+            echo -e "${RED}Error: Empty device path in parameter: $param${NC}"
+            return 1
+        fi
+
+        # Convert slot specification to number
+        local slot=""
+        case "$slot_spec" in
+            [Pp])
+                slot="0"
+                ;;
+            [Qq])
+                slot="29"
+                ;;
+            *)
+                slot="$slot_spec"
+                # Validate slot number is 0-29
+                if [ "$slot" -lt 0 ] || [ "$slot" -gt 29 ]; then
+                    echo -e "${RED}Error: Invalid slot number: $slot (must be 0-29, P, or Q)${NC}"
+                    return 1
+                fi
+                ;;
+        esac
+
+        # Check for duplicate slot assignments
+        if [ -n "${slot_map[$slot]}" ]; then
+            echo -e "${RED}Error: Slot $slot specified multiple times${NC}"
+            return 1
+        fi
+        slot_map[$slot]=1
+
+        # Validate device path (pass cached available devices if available)
+        if ! validate_device_path "$device_path" "$force" "$cached_available_devices"; then
+            return 1
+        fi
+
+        # Get disk ID
+        local disk_id=""
+        if [ -n "$provided_disk_id" ]; then
+            # Use provided disk ID directly
+            disk_id="$provided_disk_id"
+        else
+            if [ -b "$device_path" ] || [ -e "$device_path" ]; then
+                local parent_dev=$(lsblk -n -p "$device_path" -o PKNAME 2>/dev/null | head -1)
+                if [ -z "$parent_dev" ]; then
+                    parent_dev="$device_path"
+                fi
+                disk_id=$(udevadm info --query=property --property=ID_SERIAL --value --name="$parent_dev" 2>/dev/null)
+            fi
+        fi
+
+        # Verify we have a disk ID
+        if [ -z "$disk_id" ]; then
+            echo -e "${RED}Error: Could not determine disk ID for $device_path${NC}"
+            echo -e "${YELLOW}You may provide disk ID manually using format: $slot_spec:$device_path:DISK-ID${NC}"
+            return 1
+        fi
+
+        # Get disk size (subtract offset from total size to get usable data region)
+        local size_kb=$(get_disk_size_kb "$device_path" "$provided_offset")
+        if [ -z "$size_kb" ] || [ "$size_kb" -le 0 ]; then
+            echo -e "${RED}Error: Could not determine size for $device_path${NC}"
+            return 1
+        fi
+
+        echo -e "Slot ${BLUE}$slot${NC}: ${BLUE}$(basename "$device_path")${NC} ($(format_kbytes "$size_kb" 0 0 "gb") GB) ID: $disk_id"$([ "$provided_offset" -gt 0 ] && echo -e " Offset: ${BLUE}$provided_offset${NC}")
+
+        import_entries+=("$slot|$device_path|$size_kb|$provided_offset|$disk_id")
+        assigned_slots+=("$slot")
+    done
+
+    echo ""
+
+    echo -e "${GREEN}Array layout validated successfully${NC}"
+    echo ""
+
+    # Import all disks in slot order
+    echo -e "${BLUE}Importing disks in slot order...${NC}"
+
+    # Sort by slot number
+    local old_IFS=$IFS
+    IFS=$'\n' sorted_entries=($(printf '%s\n' "${import_entries[@]}" | sort -t'|' -k1,1n))
+    IFS=$old_IFS
+
+    local import_failed=0
+    for entry in "${sorted_entries[@]}"; do
+        IFS='|' read -r slot device_path size_kb offset disk_id <<< "$entry"
+
+        echo -e "Importing disk to slot $slot: ${BLUE}$(basename "$device_path")${NC}"
+
+        if ! run_nmd_command "import $slot $(basename "$device_path") $offset $size_kb 0 $disk_id"; then
+            echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
+            import_failed=1
+        else
+            echo -e "${GREEN}Successfully imported disk to slot $slot${NC}"
+            save_disk_offset "$disk_id" "$offset"
+        fi
+    done
+
+    if [ "$import_failed" -eq 1 ]; then
+        echo -e "${RED}Array creation failed. Some disk imports failed.${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}All disks imported successfully${NC}"
+    echo ""
+
+    # Show array status
+    show_status
+
+    return 0
+}
+
+# Interactive array creation mode
+create_array_interactive() {
+    # Get current superblock path
+    local superblock="${SUPERBLOCK_PATH:-$DEFAULT_SUPERBLOCK}"
+    local is_new_superblock=0
+    local do_new_config=0
+
+    # Check if this will be a new superblock
+    if [ ! -f "$superblock" ]; then
+        is_new_superblock=1
+        echo -e "${BLUE}Creating a new array with a new superblock at: ${GREEN}$superblock${NC}"
+        echo -e "${YELLOW}Note: The superblock file will be created when the array is started${NC}"
+    fi
+
+    # Check if module is loaded, will attempt to load if superblock provided
+    if ! check_module_loaded; then
+        return 1
+    fi
+
+    # Check if /proc/nmdstat exists after loading the module
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    # Check if the array is already started
+    local mdstate=$(get_nmdstat_value "mdState")
+    if [ "$mdstate" != "STOPPED" ]; then
+        echo -e "${RED}Error: The array is not currently stopped. Please stop it first.${NC}"
+        return 1
+    fi
+
+    # Verify no disks are defined in the array
+    local disk_count=$(get_defined_slots_count)
+    if [ "$disk_count" -gt 0 ] && [ "$is_new_superblock" -eq 0 ]; then
+        echo -e "${YELLOW}Warning: The array already has $disk_count disk(s) configured${NC}"
+        echo ""
+        read -r -p "Do you want to recreate the current array with a new config? [y/N]: " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            get_all_nmdstat_values NMDSTAT_VALUES
+            do_new_config=1
+            echo -e "Saving old superblock as ${GREEN}${superblock}.bak${NC}"
+            if ! mv "$superblock" "${superblock}.bak" 2>/dev/null; then
+                echo -e "${RED}Error: Failed to move old superblock${NC}"
+                return 1
+            fi
+            echo -e "${YELLOW}Reloading module with empty superblock...${NC}"
+            if ! reload_module 1; then
+                echo -e "${RED}Error: Failed to reload module with empty superblock - restoring old superblock and aborting${NC}"
+                mv "${superblock}.bak" "$superblock" 2>/dev/null
+                return 1
+            fi
+            echo -e "${GREEN}Module reloaded successfully${NC}"
+        else
+            echo "Operation cancelled."
+            return 1
+        fi
+    fi
+
+    echo -e "=== ${BLUE}Creating New NonRAID Array${NC} ==="
+    echo ""
+    echo -e "${YELLOW}This will create a new array and assign disks to slots.${NC}"
+    echo -e "${YELLOW}Only devices with an unused largest partition will be shown.${NC}"
+    echo ""
+
+    # Get available devices
+    echo "Scanning for available disks..."
+    local available_devices=($(list_available_devices))
+
+    if [ ${#available_devices[@]} -eq 0 ]; then
+        echo -e "${RED}Error: No suitable disk devices found${NC}"
+        echo -e "${YELLOW}Make sure disks are connected and are partitioned correctly${NC}"
+        return 1
+    fi
+
+    echo -e "Found ${GREEN}${#available_devices[@]}${NC} suitable devices with partitions"
+    echo ""
+
+    format_available_devices "${available_devices[@]}"
+
+    # Ask for array label
+    local array_label=""
+    read -r -p "Enter a label for the array (optional): " array_label
+    if [ -n "$array_label" ]; then
+        # Defer setting the label until disks have been added to array
+        echo "Will set array label to: $array_label"
+    fi
+    echo ""
+
+    local assigned_slots=()
+    local assigned_count=0
+    local import_entries=()
+
+    # Display available slots explanation
+    echo -e "${BLUE}Slot Assignment Guidelines:${NC}"
+    echo -e " - Slot P (0): Parity disk (largest disk recommended)"
+    echo -e " - Slot Q (29): Optional second parity for dual parity (not required)"
+    echo -e " - Slots 1-28: Data disks"
+    echo ""
+
+    # Process each device
+    for device_info in "${available_devices[@]}"; do
+        IFS='|' read -r dev partition size_kb size_gb disk_id <<< "$device_info"
+
+        echo -e "=== Disk: ${BLUE}$(basename "$dev")${NC} ==="
+        echo -e "Partition: $(basename "$partition")"
+        echo -e "Size: $size_gb GB"
+        if [ -n "$disk_id" ]; then
+            echo -e "ID: $disk_id"
+        else
+            echo -e "ID: Unknown"
+            echo -e "${RED}No disk ID found for this device - unable to use it in the array${NC}"
+            read -r -p "Press enter to continue..." _
+            continue
+        fi
+        echo ""
+        if [ "$do_new_config" -eq 1 ]; then
+            # Check if this disk was previously assigned to the array
+            local prev_slot=""
+            local prev_slot_type=""
+            if [ -n "$disk_id" ]; then
+                # Search through all previously configured slots to find where this disk was assigned
+                for check_slot in $(get_defined_slots); do
+                    local check_disk_id="${NMDSTAT_VALUES[diskId.$check_slot]}"
+                    if [ -n "$check_disk_id" ] && [[ "$disk_id" == *"$check_disk_id"* ]] || [[ "$check_disk_id" == *"$disk_id"* ]]; then
+                        prev_slot="$check_slot"
+                        if [ "$check_slot" = "0" ]; then
+                            prev_slot_type="P (Parity)"
+                        elif [ "$check_slot" = "29" ]; then
+                            prev_slot_type="Q (Second Parity)"
+                        else
+                            prev_slot_type="Data"
+                        fi
+                        break
+                    fi
+                done
+
+                if [ -n "$prev_slot" ]; then
+                    echo -e "${GREEN}Previously assigned:${NC} Slot $prev_slot ($prev_slot_type)"
+                    echo ""
+                else
+                    echo -e "${YELLOW}No previous slot assignment found for this disk${NC}"
+                fi
+            fi
+        fi
+
+        # Show which slots are already assigned
+        if [ ${#assigned_slots[@]} -gt 0 ]; then
+            echo -e "Assigned slots: ${GREEN}${assigned_slots[*]}${NC}"
+            echo ""
+        fi
+
+        # Ask for slot assignment
+        while true; do
+            echo -e "Enter slot assignment for this disk:"
+            echo -e " P or 0: Parity disk"
+            echo -e " Q or 29: Second parity disk (optional)"
+            echo -e " 1-28: Data disk"
+            if [ "$do_new_config" -eq 1 ] && [ -n "$prev_slot" ]; then
+                echo -e " o: Use old slot ($prev_slot - $prev_slot_type)"
+            fi
+            echo -e " s: Skip this disk"
+            echo -e " f: Finish array creation"
+            read -r -p "Choice: " choice
+
+            local slot=""
+            case "$choice" in
+                [Pp])
+                    slot="0"
+                    ;;
+                [Qq])
+                    slot="29"
+                    ;;
+                [0-9]|[0-2][0-9])
+                    # Check if slot is valid (0-29)
+                    if [ "$choice" -ge 0 ] && [ "$choice" -le 29 ]; then
+                        slot="$choice"
+                    else
+                        echo -e "${RED}Invalid slot number. Please use 0-29.${NC}"
+                        continue
+                    fi
+                    ;;
+                [Oo])
+                    if [ "$do_new_config" -eq 1 ] && [ -n "$prev_slot" ]; then
+                        slot="$prev_slot"
+                        echo -e "${GREEN}Using previous slot assignment: $slot${NC}"
+                    else
+                        echo -e "${RED}No previous slot assigned for this disk.${NC}"
+                        continue
+                    fi
+                    ;;
+                [Ss])
+                    echo -e "${YELLOW}Skipping disk ${BLUE}$(basename "$dev")${NC}"
+                    break
+                    ;;
+                [Ff])
+                    echo "Finishing array creation..."
+                    break 2  # Break out of both loops
+                    ;;
+                *)
+                    echo -e "${RED}Invalid choice. Please try again.${NC}"
+                    continue
+                    ;;
+            esac
+
+            if [ -n "$slot" ]; then
+                # Check if slot is already assigned
+                # shellcheck disable=SC2076
+                if [[ " ${assigned_slots[*]} " =~ " $slot " ]]; then
+                    echo -e "${RED}Error: Slot $slot is already assigned. Please choose another slot.${NC}"
+                    continue
+                fi
+
+                echo -e "Assigning disk for slot $slot: ${BLUE}$(basename "$partition")${NC}"
+                import_entries+=("$slot|$partition|$size_kb|$disk_id")
+                assigned_slots+=("$slot")
+                assigned_count=$((assigned_count + 1))
+                break
+            fi
+        done
+
+        echo ""
+    done
+
+    # Check if any disks were assigned
+    if [ "$assigned_count" -eq 0 ]; then
+        echo -e "${YELLOW}No disks were assigned to the array.${NC}"
+        return 0
+    fi
+
+    echo -e "${GREEN}Assigned $assigned_count disk(s) to the array${NC}"
+
+    # Now import all disks in slot order
+    if [ ${#import_entries[@]} -gt 0 ]; then
+        echo ""
+        echo -e "${BLUE}Importing disks in slot order...${NC}"
+
+        # Sort by slot number
+        local old_IFS=$IFS
+        IFS=$'\n' sorted_entries=($(printf '%s\n' "${import_entries[@]}" | sort -t'|' -k1,1n))
+        IFS=$old_IFS
+
+        local import_failed=0
+        for entry in "${sorted_entries[@]}"; do
+            IFS='|' read -r slot partition size_kb disk_id <<< "$entry"
+
+            echo -e "Importing disk to slot $slot: ${BLUE}$(basename "$partition")${NC}"
+
+            if ! run_nmd_command "import $slot $(basename "$partition") 0 $size_kb 0 $disk_id"; then
+                echo -e "${RED}Error: Failed to import disk to slot $slot${NC}"
+                import_failed=1
+            else
+                echo -e "${GREEN}Successfully imported disk to slot $slot${NC}"
+            fi
+        done
+
+        if [ "$import_failed" -eq 1 ]; then
+            echo -e "${YELLOW}Some disk imports failed. Check the output above.${NC}"
+        else
+            echo -e "${GREEN}All disks imported successfully${NC}"
+        fi
+    fi
+
+    # Now set the array label if provided
+    if [ -n "$array_label" ]; then
+        run_nmd_command "label $array_label"
+    fi
+
+    # Offer "parity is valid" option
+    if [ "$do_new_config" -eq 1 ]; then
+        echo ""
+        echo "If you have done the new configuration in a very particular way, you can mark the parity valid for the new array."
+        echo "This avoids parity reconstruction when starting the array."
+        echo ""
+        echo -e "Only do this if you are SURE the ${YELLOW}parity is already valid.${NC}"
+        read -r -p "Is the array parity already valid? (y/N): " parity_valid
+        if [[ "$parity_valid" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Marking parity valid for the next array start.${NC}"
+            local invalidslot="98"
+            # mark Q valid only if it is still in the array
+            if [[ " ${assigned_slots[*]} " =~ " 29 " ]]; then
+                invalidslot="$invalidslot 99"
+            else
+                invalidslot="$invalidslot 29"
+            fi
+            if ! run_nmd_command "set invalidslot $invalidslot"; then
+                echo -e "${RED}Error: Failed to mark parity valid${NC}"
+                return 1
+            fi
+        else
+            echo -e "${YELLOW}Parity will require reconstruction when the array is started.${NC}"
+        fi
+    fi
+
+    # Show array status
+    echo ""
+    show_status
+
+    # Ask if user wants to start the array now
+    echo ""
+    read -r -p "Do you want to start the array now? (y/N): " start_now
+    if [[ "$start_now" =~ ^[Yy]$ ]]; then
+        start_array
+    else
+        echo -e "${YELLOW}Array creation complete. You can start it with: ${GREEN}nmdctl start${NC}"
+    fi
+
+    if [ "$do_new_config" -eq 0 ]; then
+        echo ""
+        echo -e "${YELLOW}Next you may proceed with creating filesystems on the data disk(s).${NC}"
+        echo ""
+        echo -e "${YELLOW}For example to create a filesystem on the first data disk:${NC}"
+        echo -e "  ${GREEN}mkfs.xfs /dev/nmd1p1${NC}            - Create XFS filesystem"
+        echo -e "  ${GREEN}zpool create disk1 /dev/nmd1p1${NC}  - Create ZFS filesystem (use diskN as the pool name)"
+        echo -e "  ${GREEN}mkfs.btrfs /dev/nmd1p1${NC}          - Create Btrfs filesystem"
+        echo -e "${YELLOW}Replace nmd1p1 with the appropriate data disk slot.${NC}"
+        echo ""
+        echo -e "${YELLOW}If you want encryption, create a LUKS container first and use the mapped device instead.${NC}"
+        echo -e "  ${GREEN}cryptsetup luksFormat /dev/nmd1p1${NC}"
+        echo -e "  ${GREEN}cryptsetup open /dev/nmd1p1 nmd1p1${NC} (use the NonRAID device name as the mapped name)"
+        echo -e "  ${GREEN}mkfs.xfs /dev/mapper/nmd1p1${NC} (or any other filesystem)"
+    fi
+
+    return 0
+}
+
+# Add a new disk to the array
+add_disk() {
+    local force=0
+    local disk_param=""
+    local replace_slot=""
+    local parity_swap=0
+    local preclear_done=0
+
+    # Parse force flag if present
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--force)
+                force=1
+                shift
+                ;;
+            *)
+                # First non-flag argument is the disk parameter
+                if [ -z "$disk_param" ]; then
+                    disk_param="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Parse parameter if provided in SLOT:DEVICE[:ID[:OFFSET]] format
+    local param_slot=""
+    local param_device=""
+    local param_disk_id=""
+    local param_offset=0
+    local use_param_mode=0
+
+    if [ -n "$disk_param" ] && [[ "$disk_param" =~ : ]]; then
+        # Check if it matches SLOT:DEVICE[:...] format
+        if [[ "$disk_param" =~ ^([0-9P-Q]|[12][0-9]|29):(.+)$ ]]; then
+            use_param_mode=1
+
+            # Parse the slot (first part before first colon)
+            param_slot="${disk_param%%:*}"
+            local rest="${disk_param#*:}"
+
+            # Parse colon-separated fields: DEVICE[:ID[:OFFSET]]
+            local -a fields
+            IFS=':' read -ra fields <<< "$rest"
+
+            param_device="${fields[0]}"
+            if [ ${#fields[@]} -ge 2 ]; then
+                # If the second field is numeric, treat as offset
+                if [[ "${fields[1]}" =~ ^[0-9]+$ ]]; then
+                    param_offset="${fields[1]}"
+                else
+                    param_disk_id="${fields[1]}"
+                    if [ ${#fields[@]} -ge 3 ]; then
+                        param_offset="${fields[2]}"
+                    fi
+                fi
+            fi
+
+            # Convert P/Q notation to slot numbers
+            case "$param_slot" in
+                [Pp])
+                    param_slot="0"
+                    ;;
+                [Qq])
+                    param_slot="29"
+                    ;;
+            esac
+
+            # Validate slot number
+            if ! [[ "$param_slot" =~ ^[0-9]+$ ]] || [ "$param_slot" -lt 0 ] || [ "$param_slot" -gt 29 ]; then
+                echo -e "${RED}Error: Invalid slot number: $param_slot (must be 0-29, P, or Q)${NC}"
+                return 1
+            fi
+
+            # Validate device path is not empty
+            if [ -z "$param_device" ]; then
+                echo -e "${RED}Error: Empty device path in parameter: $disk_param${NC}"
+                return 1
+            fi
+        else
+            # If it has a colon but doesn't match the format, it's an error
+            echo -e "${RED}Error: Invalid format for parameter: $disk_param${NC}"
+            echo -e "${YELLOW}Expected format: SLOT:DEVICE or SLOT:DEVICE:ID-STRING${NC}"
+            echo -e "${YELLOW}Example: nmdctl add 1:/dev/sdb1 or nmdctl add P:/dev/sda1:WD-12345${NC}"
+            return 1
+        fi
+    elif [ -n "$disk_param" ]; then
+        # Single parameter without colon is treated as replace_slot
+        replace_slot="$disk_param"
+    fi
+
+    check_root
+
+    # Check if module is loaded, will attempt to load if superblock provided
+    if ! check_module_loaded; then
+        return 1
+    fi
+
+    # Check if /proc/nmdstat exists after loading the module
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    # Get all nmdstat values if we haven't already
+    if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+        get_all_nmdstat_values NMDSTAT_VALUES
+    fi
+
+    # Check current array state
+    local mdstate="${NMDSTAT_VALUES[mdState]}"
+
+    if [ "$mdstate" = "NEW_ARRAY" ]; then
+        echo -e "${RED}Error: Cannot add disk to a new array${NC}"
+        echo -e "${YELLOW}Start the array first to build parity: ${GREEN}nmdctl start${NC}"
+        return 1
+    fi
+
+    if [ "$mdstate" = "STARTED" ]; then
+        echo -e "${RED}Error: Array is currently not in stopped state (${mdstate})${NC}"
+        echo -e "${YELLOW}Stop the array first with: ${GREEN}nmdctl stop${NC}"
+        return 1
+    fi
+
+    # In parameter mode, determine if we're replacing or adding based on slot state
+    if [ "$use_param_mode" -eq 1 ]; then
+        if [ "${NMDSTAT_VALUES[diskSize.$param_slot]}" -gt 0 ]; then
+            if [ -z "${NMDSTAT_VALUES[diskId.$param_slot]}" ]; then
+                # Slot has size but no disk ID - this is a replace operation
+                replace_slot="$param_slot"
+            else
+                # Slot has a disk ID - check if it's a parity swap case
+                if [ "$param_slot" -eq 0 ] || [ "$param_slot" -eq 29 ]; then
+                    # Check that array already has an unassigned data slot for parity swap
+                    local has_empty_slot=0
+                    for slot in $(seq 1 28); do
+                        if [ "${NMDSTAT_VALUES[diskSize.$slot]}" -gt 0 ] && [ -z "${NMDSTAT_VALUES[diskId.$slot]}" ]; then
+                            has_empty_slot=1
+                            break
+                        fi
+                    done
+                    if [ "$has_empty_slot" -eq 0 ]; then
+                        echo -e "${RED}Error: No unassigned data slot available for parity swap${NC}"
+                        echo -e "${YELLOW}You must first unassign a data disk slot with ${GREEN}nmdctl unassign SLOT${NC}"
+                        return 1
+                    fi
+                    replace_slot="$param_slot"
+                else
+                    echo -e "${RED}Error: Slot $param_slot already has a disk assigned${NC}"
+                    echo -e "${YELLOW}Unassign slot first with ${GREEN}nmdctl unassign $param_slot${NC}"
+                    return 1
+                fi
+            fi
+        else
+            # Empty slot - this is an add operation
+            if [ -n "${NMDSTAT_VALUES[rdevId.$param_slot]}" ] || [ -n "${NMDSTAT_VALUES[diskId.$param_slot]}" ]; then
+                echo -e "${RED}Error: Slot $param_slot is already assigned${NC}"
+                return 1
+            fi
+        fi
+    fi
+
+    if [ -n "$replace_slot" ]; then
+        # Handle P/Q notation
+        case "$replace_slot" in
+            [Pp])
+                replace_slot="0"
+                ;;
+            [Qq])
+                replace_slot="29"
+                ;;
+        esac
+        if [ "${NMDSTAT_VALUES[diskSize.$replace_slot]}" -gt 0 ]; then
+            if [ -z "${NMDSTAT_VALUES[diskId.$replace_slot]}" ]; then
+                echo -e "=== ${BLUE}Replacing disk in slot $replace_slot${NC} ==="
+            else
+                if [ "$replace_slot" -eq 0 ] || [ "$replace_slot" -eq 29 ]; then
+                    # Check that array already has an unassigned data slot for parity swap
+                    local has_empty_slot=0
+                    for slot in $(seq 1 28); do
+                        if [ "${NMDSTAT_VALUES[diskSize.$slot]}" -gt 0 ] && [ -z "${NMDSTAT_VALUES[diskId.$slot]}" ]; then
+                            has_empty_slot=1
+                            break
+                        fi
+                    done
+                    if [ "$has_empty_slot" -eq 0 ]; then
+                        echo -e "${RED}Error: No unassigned data slot available for parity swap${NC}"
+                        echo -e "${YELLOW}You must first unassign a data disk slot with ${GREEN}nmdctl unassign SLOT${NC}"
+                        return 1
+                    fi
+                    echo -e "=== ${BLUE}Replacing parity disk in slot $replace_slot${NC} ==="
+                    parity_swap=1
+                else
+                    echo -e "${RED}Error: Unassign slot first with ${GREEN}nmdctl unassign $replace_slot${NC}"
+                    return 1
+                fi
+            fi
+        else
+            echo -e "${RED}Error: Empty slot, add new disk with ${GREEN}nmdctl add${NC}"
+            return 1
+        fi
+    else
+        echo -e "=== ${BLUE}Add New Disk to Array${NC} ==="
+    fi
+    echo ""
+    if [ "$parity_swap" -eq 1 ]; then
+        echo -e "${YELLOW}This will start a parity swap operation on slot $replace_slot.${NC}"
+        echo -e "${YELLOW}The current parity disk can then be replaced into an already unassigned data slot.${NC}"
+        echo -e "${YELLOW}You will then ${RED}need to manually copy${YELLOW} the parity disk contents onto the new parity disk ${RED}BEFORE${YELLOW} array start.${NC}"
+        echo ""
+    else
+        echo -e "${YELLOW}This will add a new disk to the array.${NC}"
+    fi
+    echo -e "${YELLOW}After adding the disk(s), the changes will be committed and new disks processed when the array is started.${NC}"
+    if [ "$use_param_mode" -eq 0 ] || [ "$force" -eq 0 ]; then
+        echo -e "${YELLOW}Only devices with an unused largest partition will be shown.${NC}"
+    fi
+    echo ""
+
+    # Get available devices (skip if in parameter mode with force)
+    local all_available_devices=()
+    if [ "$use_param_mode" -eq 0 ] || [ "$force" -eq 0 ]; then
+        echo "Scanning for available disks..."
+        all_available_devices=($(list_available_devices))
+
+        if [ ${#all_available_devices[@]} -eq 0 ]; then
+            echo -e "${RED}Error: No suitable disk devices found${NC}"
+            echo -e "${YELLOW}Make sure disks are connected and are partitioned correctly${NC}"
+            return 1
+        fi
+    fi
+
+    # Get list of all disk IDs already in the array
+    local array_disk_ids=()
+    for slot in $(seq 0 29); do
+        local disk_id="${NMDSTAT_VALUES[diskId.$slot]}"
+        local rdev_status="${NMDSTAT_VALUES[rdevStatus.$slot]}"
+        if [ -n "$disk_id" ] && [ "$disk_id" != "none" ]; then
+            # Allow reuse of parity disk ID if a parity swap is being done
+            if ! { [ "$rdev_status" == "DISK_WRONG" ] && { [ "$slot" -eq 0 ] || [ "$slot" -eq 29 ]; }; }; then
+                array_disk_ids+=("$disk_id")
+            fi
+        fi
+
+        # Also check rdevId for newly added/already imported disks
+        local rdev_id="${NMDSTAT_VALUES[rdevId.$slot]}"
+        if [ -n "$rdev_id" ] && [ "$rdev_id" != "none" ]; then
+            array_disk_ids+=("$rdev_id")
+        fi
+    done
+
+    # Filter out disks that are already part of the array
+    local available_devices=()
+    local filtered_count=0
+
+    for device_info in "${all_available_devices[@]}"; do
+        IFS='|' read -r dev partition size_kb size_gb disk_id <<< "$device_info"
+        local already_in_array=false
+
+        # Skip if disk has no ID (unusual but possible)
+        if [ -z "$disk_id" ]; then
+            continue
+        fi
+
+        # Check if this disk ID is already in the array
+        for array_id in "${array_disk_ids[@]}"; do
+            # If the disk ID contains the array ID or vice versa, consider it a match
+            if [[ "$disk_id" == *"$array_id"* ]] || [[ "$array_id" == *"$disk_id"* ]]; then
+                already_in_array=true
+                filtered_count=$((filtered_count + 1))
+                break
+            fi
+        done
+
+        # If not already in array, add to available devices
+        if ! $already_in_array; then
+            available_devices+=("$device_info")
+        fi
+    done
+
+    # Only check for available devices if not in parameter mode with force
+    if [ "$use_param_mode" -eq 0 ] || [ "$force" -eq 0 ]; then
+        if [ ${#available_devices[@]} -eq 0 ]; then
+            echo -e "${RED}Error: No suitable disk devices found${NC}"
+            if [ $filtered_count -gt 0 ]; then
+                echo -e "${YELLOW}Found $filtered_count disk(s), but all are already part of the array${NC}"
+            else
+                echo -e "${YELLOW}Make sure disks are connected and are partitioned correctly${NC}"
+            fi
+            return 1
+        fi
+
+        echo -e "Found ${GREEN}${#available_devices[@]}${NC} suitable devices with partitions"
+        if [ $filtered_count -gt 0 ]; then
+            echo -e "(Filtered out $filtered_count disk(s) that are already part of the array)"
+        fi
+        echo ""
+    fi
+
+    # Only display available slots info in interactive mode (not needed in parameter mode)
+    if [ -z "$replace_slot" ] && [ "$use_param_mode" -eq 0 ]; then
+        # Find available slots
+        local available_slots=()
+        local replaceable_slots=()
+        for slot in $(seq 0 29); do
+
+            if  [ -z "${NMDSTAT_VALUES[rdevId.$slot]}" ] && [ -z "${NMDSTAT_VALUES[diskId.$slot]}" ]; then
+                available_slots+=("$slot")
+                if [ "${NMDSTAT_VALUES[diskSize.$slot]}" -gt 0 ]; then
+                    replaceable_slots+=("$slot")
+                fi
+            fi
+        done
+
+        # Priority suggestion list: any missing disks, then parity disks
+        if [ ${#replaceable_slots[@]} -gt 0 ]; then
+            echo -e "${YELLOW}You should replace unassigned disk in slots: ${GREEN}${replaceable_slots[*]}${NC}"
+        elif [ -z "${NMDSTAT_VALUES[rdevId.0]}" ] && [ -z "${NMDSTAT_VALUES[diskId.0]}" ]; then
+            echo -e "${YELLOW}No parity disk found. Consider adding a parity disk (slot 0).${NC}"
+        elif [ -z "${NMDSTAT_VALUES[rdevId.29]}" ] && [ -z "${NMDSTAT_VALUES[diskId.29]}" ]; then
+            echo -e "${YELLOW}No second parity disk found. You may add one (slot 29) for dual parity.${NC}"
+        fi
+
+        # Check if we have any available slots
+        if [ ${#available_slots[@]} -eq 0 ]; then
+            echo -e "${RED}Error: No available slots in the array${NC}"
+            echo -e "${YELLOW}All possible slots are already assigned.${NC}"
+            return 1
+        fi
+
+        echo -e "Available slots: ${GREEN}${available_slots[*]}${NC}"
+        echo ""
+
+        # Display information about slot types
+        echo -e "${BLUE}Slot Types:${NC}"
+        echo -e " - Slot 0: Primary parity disk"
+        echo -e " - Slot 29: Secondary parity disk (for dual parity)"
+        echo -e " - Slots 1-28: Data disks"
+        echo ""
+    fi
+
+    # Select a single device
+    local selected_device=""
+    local selected_dev=""
+    local selected_partition=""
+    local selected_size_kb=0
+    local selected_size_gb=0
+    local selected_disk_id=""
+    local selected_offset=0
+
+    if [ "$use_param_mode" -eq 1 ]; then
+        # Parameter mode: validate and use the provided device
+        echo -e "=== ${BLUE}Add Disk (Non-interactive Mode)${NC} ==="
+        echo ""
+
+        # Build available devices string for validation (if we have scanned devices)
+        local cached_available_devices=""
+        if [ "$force" -eq 0 ]; then
+            # Join available_devices array into a space-separated string
+            cached_available_devices="${all_available_devices[*]}"
+        fi
+
+        # Validate device path using the shared validation function
+        if ! validate_device_path "$param_device" "$force" "$cached_available_devices"; then
+            return 1
+        fi
+
+        # Get device info
+        local parent_dev=$(lsblk -n -p "$param_device" -o PKNAME 2>/dev/null | head -1)
+        if [ -z "$parent_dev" ]; then
+            parent_dev="$param_device"
+        fi
+
+        # Set selected device info
+        selected_partition="$param_device"
+        selected_dev="$parent_dev"
+        selected_size_kb=$(get_disk_size_kb "$param_device" "$param_offset")
+
+        if [ -z "$selected_size_kb" ] || [ "$selected_size_kb" -le 0 ]; then
+            echo -e "${RED}Error: Could not determine size for $param_device${NC}"
+            return 1
+        fi
+
+        selected_size_gb=$(format_kbytes "$selected_size_kb" 0 0 "gb")
+        selected_offset="$param_offset"
+
+        # Get or use provided disk ID
+        if [ -n "$param_disk_id" ]; then
+            selected_disk_id="$param_disk_id"
+        else
+            selected_disk_id=$(udevadm info --query=property --property=ID_SERIAL --value --name="$parent_dev" 2>/dev/null)
+        fi
+
+        if [ -z "$selected_disk_id" ]; then
+            echo -e "${RED}Error: Could not determine disk ID for $param_device${NC}"
+            echo -e "${YELLOW}You may provide disk ID manually using format: $param_slot:$param_device:DISK-ID${NC}"
+            return 1
+        fi
+
+        # Check if disk is already in array (skip with --force)
+        if [ "$force" -eq 0 ]; then
+            local already_in_array=false
+            for array_id in "${array_disk_ids[@]}"; do
+                if [[ "$selected_disk_id" == *"$array_id"* ]] || [[ "$array_id" == *"$selected_disk_id"* ]]; then
+                    already_in_array=true
+                    break
+                fi
+            done
+
+            if $already_in_array; then
+                echo -e "${RED}Error: Disk $param_device is already part of the array${NC}"
+                return 1
+            fi
+        fi
+
+        # Display selected disk details
+        echo -e "Device: ${BLUE}$(basename "$selected_dev")${NC}"
+        echo -e "Partition: $(basename "$selected_partition")"
+        echo -e "Size: $selected_size_gb GB"
+        echo -e "ID: $selected_disk_id"
+        [ "$selected_offset" -gt 0 ] && echo -e "Offset: ${BLUE}$selected_offset${NC} sectors"
+        echo ""
+    else
+        # Interactive mode: display menu and let user select
+        format_available_devices "${available_devices[@]}"
+
+        # Select device
+        while true; do
+            read -r -p "Enter device number to add (1-${#available_devices[@]}) or 'q' to quit: " choice
+
+            if [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
+                echo "Operation cancelled."
+                return 0
+            fi
+
+            if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#available_devices[@]} ]; then
+                echo -e "${RED}Invalid choice. Please enter a number between 1 and ${#available_devices[@]}.${NC}"
+                continue
+            fi
+
+            selected_device="${available_devices[$((choice-1))]}"
+            IFS='|' read -r selected_dev selected_partition selected_size_kb selected_size_gb selected_disk_id <<< "$selected_device"
+
+            # Display selected disk details in the same format as create_array
+            echo ""
+            echo -e "=== Selected disk: ${BLUE}$(basename "$selected_dev")${NC} ==="
+            echo -e "Partition: $(basename "$selected_partition")"
+            echo -e "Size: $selected_size_gb GB"
+            if [ -n "$selected_disk_id" ]; then
+                echo -e "ID: $selected_disk_id"
+            else
+                echo -e "ID: Unknown"
+                echo -e "${RED}No disk ID found for this device - unable to use it in the array${NC}"
+                continue
+            fi
+            echo ""
+
+            break
+        done
+    fi
+
+    # Select slot
+    local selected_slot=""
+    if [ -n "$replace_slot" ]; then
+        selected_slot="$replace_slot"
+        echo -e "Replacing disk in slot ${BLUE}$selected_slot${NC}"
+    elif [ "$use_param_mode" -eq 1 ]; then
+        # In parameter mode, use the provided slot
+        selected_slot="$param_slot"
+    else
+        while true; do
+            echo -e "Enter slot assignment for this disk:"
+            echo -e " P or 0: Parity disk"
+            echo -e " Q or 29: Second parity disk (optional)"
+            echo -e " 1-28: Data disk"
+            echo -e " a: Abort adding disk"
+            read -r -p "Choice: " choice
+
+            if [ "$choice" = "a" ] || [ "$choice" = "A" ]; then
+                echo "Operation cancelled."
+                return 0
+            fi
+
+            # Convert P/Q to slot numbers
+            case "$choice" in
+                [Pp])
+                    choice="0"
+                    ;;
+                [Qq])
+                    choice="29"
+                    ;;
+            esac
+
+            if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+                echo -e "${RED}Invalid choice. Please enter a valid slot number or P/Q.${NC}"
+                continue
+            fi
+
+            # Check if selected slot is available
+            # shellcheck disable=SC2076
+            if ! [[ " ${available_slots[*]} " =~ " $choice " ]]; then
+                echo -e "${RED}Invalid slot. Please choose from available slots: ${available_slots[*]}.${NC}"
+                continue
+            fi
+
+            selected_slot="$choice"
+            break
+        done
+    fi
+
+    # Format the slot name for display
+    local slot_display="$selected_slot"
+    if [ "$selected_slot" = "0" ]; then
+        slot_display="P (0)"
+    elif [ "$selected_slot" = "29" ]; then
+        slot_display="Q (29)"
+    fi
+
+    echo -e "Selected slot: ${BLUE}$slot_display${NC}"
+    echo ""
+
+    local verb="add"
+    if [ -n "$replace_slot" ]; then
+        verb="replace"
+    elif [ "$selected_slot" -ne 0 ] && [ "$selected_slot" -ne 29 ]; then
+        if [ "$use_param_mode" -eq 0 ]; then
+            # Interactive mode: ask user about preclear
+            echo -e "${YELLOW}Note: If you have precleared the disk, you can optionally skip the clearing process done by the NonRAID driver${NC}"
+            echo -e "${RED}Warning:${YELLOW} If the disk has not been pre-cleared, skipping the clearing will lead to ${RED}array parity becoming invalid.${NC}"
+            echo ""
+            echo -e "${YELLOW}You can pre-clear the disk with: ${GREEN}dd if=/dev/zero of=$selected_partition bs=1M status=progress${NC}"
+            echo ""
+            read -r -p "Has the disk been pre-cleared? (y/N): " preclear
+            if [[ "$preclear" =~ ^[Yy]$ ]]; then
+                preclear_done=1
+                echo -e "${YELLOW}The disk will be marked as ${RED}pre-cleared.${NC}"
+            else
+                echo -e "${YELLOW}The disk will be cleared when the array is started.${NC}"
+            fi
+            echo ""
+        else
+            # Parameter mode: assume disk is NOT pre-cleared by default
+            echo -e "${YELLOW}The disk will be cleared when the array is started.${NC}"
+            echo ""
+        fi
+    fi
+
+    if [ "$use_param_mode" -eq 0 ]; then
+        # Confirm selection in interactive mode
+        echo -e "You are about to ${YELLOW}$verb${NC}: ${YELLOW}$(basename "$selected_dev")${NC} to slot ${YELLOW}$slot_display${NC}"
+        read -r -p "Proceed with the operation? (y/N): " confirm
+
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            return 0
+        fi
+    else
+        # In parameter mode, show what we're doing
+        echo -e "${YELLOW}Adding${NC}: ${YELLOW}$(basename "$selected_dev")${NC} ($(basename "$selected_partition")) to slot ${YELLOW}$slot_display${NC}"
+    fi
+
+    echo ""
+    echo -e "Adding disk to array..."
+
+    # Import disk: slot, partition, offset, size, erased, id
+    if ! run_nmd_command "import $selected_slot $(basename "$selected_partition") $selected_offset $selected_size_kb $preclear_done $selected_disk_id"; then
+        echo -e "${RED}Error: Failed to add disk to slot $selected_slot${NC}"
+        return 1
+    fi
+
+    save_disk_offset "$selected_disk_id" "$selected_offset"
+
+    echo -e "${GREEN}Successfully added disk to slot $selected_slot${NC}"
+    echo ""
+
+    # Show array status
+    show_status
+
+    echo ""
+    if [ "$parity_swap" -eq 1 ]; then
+        echo -e "${YELLOW}You must next first ${RED}replace${YELLOW} the old parity disk into the unassigned data disk slot${NC}"
+        echo ""
+        echo -e "${YELLOW}Use: ${GREEN}nmdctl replace <unassigned data disk>${NC}"
+        echo ""
+    elif [ "${NMDSTAT_VALUES[mdState]}" = "SWAP_DSBL" ]; then
+        local parity_swap_slot=""
+        for slot in 0 29; do
+            if [ "${NMDSTAT_VALUES[rdevStatus.$slot]}" = "DISK_WRONG" ]; then
+                parity_swap_slot="$slot"
+                break
+            fi
+        done
+        echo -e "${YELLOW}You must now ${RED}manually copy${YELLOW} the contents from the old parity disk to the new parity disk!${NC}"
+        echo ""
+        echo -e "${YELLOW}Use: ${GREEN}( dd if=$selected_partition bs=1M status=progress ; dd if=/dev/zero bs=1M status=progress ) > /dev/${NMDSTAT_VALUES[rdevName.$parity_swap_slot]}${NC}"
+        echo ""
+    else
+        echo -e "${YELLOW}To complete adding the disk, you need to:${NC}"
+        echo -e "1. ${YELLOW}Start the array:${NC} ${GREEN}nmdctl start${NC}"
+        if [ "$selected_slot" -eq 0 ] || [ "$selected_slot" -eq 29 ]; then
+            echo -e "2. ${YELLOW}Reconstruct new parity: ${GREEN}nmdctl check${NC}"
+        else
+            echo -e "2. ${YELLOW}Clear the new data disk: ${GREEN}nmdctl check${NC}"
+        fi
+    fi
+
+    return 0
+}
+
+# Unassign a disk from a specified slot
+unassign_disk() {
+    local slot="$1"
+
+    # Check if we have a slot parameter
+    if [ -z "$slot" ]; then
+        echo -e "${RED}Error: Missing slot parameter${NC}"
+        echo -e "Usage: ${YELLOW}nmdctl unassign SLOT${NC}"
+        echo -e "Example: ${YELLOW}nmdctl unassign 1${NC} (to unassign disk from slot 1)"
+        echo -e "Special slots: ${YELLOW}P${NC} or ${YELLOW}0${NC} (parity disk), ${YELLOW}Q${NC} or ${YELLOW}29${NC} (second parity)"
+        return 1
+    fi
+
+    # Handle P/Q notation
+    case "$slot" in
+        [Pp])
+            slot="0"
+            ;;
+        [Qq])
+            slot="29"
+            ;;
+    esac
+
+    # Validate slot is a number
+    if ! [[ "$slot" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Error: Slot must be a number${NC}"
+        return 1
+    fi
+
+    # Check if valid slot range (0-29)
+    if [ "$slot" -lt 0 ] || [ "$slot" -gt 29 ]; then
+        echo -e "${RED}Error: Invalid slot number. Valid slots are 0-29${NC}"
+        return 1
+    fi
+
+    check_root
+
+    # Check if module is loaded
+    if ! check_module_loaded; then
+        return 1
+    fi
+
+    # Check if /proc/nmdstat exists
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    # Get all nmdstat values if we haven't already
+    if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+        get_all_nmdstat_values NMDSTAT_VALUES
+    fi
+
+    # Check if array is stopped
+    local mdstate="${NMDSTAT_VALUES[mdState]}"
+    if [ "$mdstate" = "STARTED" ]; then
+        echo -e "${RED}Error: Array must be stopped before unassigning disks${NC}"
+        echo -e "Stop the array with: ${YELLOW}nmdctl stop${NC}"
+        return 1
+    fi
+
+    # Get disk information for the slot
+    local disk_id="${NMDSTAT_VALUES[diskId.$slot]}"
+    local rdev_name="${NMDSTAT_VALUES[rdevName.$slot]}"
+    local rdev_status="${NMDSTAT_VALUES[rdevStatus.$slot]}"
+    local disk_size="${NMDSTAT_VALUES[diskSize.$slot]}"
+    local rdev_size="${NMDSTAT_VALUES[rdevSize.$slot]}"
+    local size_gb=0
+
+    # Calculate size in GB if available
+    if [ -n "$disk_size" ] && [ "$disk_size" -gt 0 ]; then
+        size_gb=$(format_kbytes "$disk_size" 0 0 "gb")
+    elif [ -n "$rdev_size" ] && [ "$rdev_size" -gt 0 ]; then
+        size_gb=$(format_kbytes "$rdev_size" 0 0 "gb")
+    fi
+
+    # Format the slot name for display
+    local slot_display="$slot"
+    if [ "$slot" = "0" ]; then
+        slot_display="P (0)"
+    elif [ "$slot" = "29" ]; then
+        slot_display="Q (29)"
+    fi
+
+    # Check if the slot currently has a disk assigned
+    if [ -z "$disk_id" ]; then
+        # If ID is empty, but size is 0, it means the disk was already previously unassigned, and we can skip asking confirmation
+        if [ "$disk_size" -eq 0 ]; then
+            echo -e "${RED}Error: No disk assigned to slot $slot${NC}"
+            return 1
+        fi
+        if [ "$rdev_status" = "DISK_NP_DSBL" ]; then
+            echo -e "${RED}Error: Disk in slot $slot is already unassigned${NC}"
+            return 1
+        fi
+    else
+        # Display slot information
+        echo -e "=== Disk in Slot ${BLUE}$slot_display${NC} ==="
+        echo -e "Disk ID      : $disk_id"
+        if [ -n "$rdev_name" ] && [ "$rdev_name" != "none" ]; then
+            echo -e "Device       : $rdev_name"
+        else
+            echo -e "Device       : ${YELLOW}Not imported${NC}"
+        fi
+        echo -e "Status       : $(format_disk_status "$rdev_status")"
+        echo -e "Size         : $size_gb GB"
+        echo ""
+
+        # Warn about potential data loss
+        echo -e "${RED}WARNING: Unassigning this disk will remove it from the array.${NC}"
+        if [ "$slot" = "0" ] || [ "$slot" = "29" ]; then
+            echo -e "${RED}This is a PARITY disk. Unassigning it will remove parity protection.${NC}"
+        else
+            echo -e "${RED}This is a DATA disk. Unassigning it will cause its contents to be emulated via parity (if available).${NC}"
+        fi
+        echo ""
+
+        # Ask for confirmation
+        read -r -p "Are you sure you want to unassign this disk? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Operation cancelled."
+            return 1
+        fi
+        echo ""
+    fi
+
+    local unassigned_disks=0
+    local parity_count=0
+    # Check if other slots are already unassigned
+    for check_slot in $(get_defined_slots); do
+        local rdevstatus="${NMDSTAT_VALUES[rdevStatus.$check_slot]}"
+        if [ -n "$rdevstatus" ] && { [ "$rdevstatus" = "DISK_NP_MISSING" ] || [ "$rdevstatus" = "DISK_NP_DSBL" ]; }; then
+            unassigned_disks=$((unassigned_disks + 1))
+        fi
+    done
+    [ "${NMDSTAT_VALUES[diskSize.0]}" -gt 0 ] && parity_count=$((parity_count + 1))
+    [ "${NMDSTAT_VALUES[diskSize.29]}" -gt 0 ] && parity_count=$((parity_count + 1))
+
+    if [ "$((unassigned_disks+1))" -gt "$parity_count" ]; then
+        echo -e "${RED}Error: Parity count in array does not allow unassigning more disks${NC}"
+        echo -e "${YELLOW}You can only unassign disks if there are enough parity disks to maintain data integrity.${NC}"
+        echo -e "${YELLOW}Current parity count: $parity_count, unassigned disks: $unassigned_disks${NC}"
+        return 1
+    fi
+
+    echo -e "Unassigning disk from slot $slot_display..."
+
+    # Unassign the disk by importing an empty device
+    if ! run_nmd_command "import $slot '' 0 0 0 ''"; then
+        echo -e "${RED}Error: Failed to unassign disk from slot $slot${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}Successfully unassigned disk from slot $slot_display${NC}"
+    echo -e "${YELLOW}Note: To commit the change, you need to start the array.${NC}"
+    echo ""
+
+    # Show array status
+    show_status
+
+    return 0
+}
+
+# Reload nonraid module with superblock
+reload_module() {
+    local quiet_mode="${1:-0}"
+    check_root
+
+    # Get current superblock path
+    local superblock=""
+
+    # If --super wasn't provided, try to get the current superblock path from nmdstat
+    if [ -z "$SUPERBLOCK_PATH" ] && [ -f "$PROC_NMDSTAT" ]; then
+        local current_superblock=$(get_nmdstat_value "sbName")
+        if [ -n "$current_superblock" ] && [ "$current_superblock" != "(null)" ]; then
+            superblock="$current_superblock"
+            if [ "$quiet_mode" -eq 0 ]; then
+                echo -e "Using current superblock from running module: ${GREEN}$superblock${NC}"
+            fi
+        else
+            superblock="$DEFAULT_SUPERBLOCK"
+        fi
+    else
+        superblock="${SUPERBLOCK_PATH:-$DEFAULT_SUPERBLOCK}"
+    fi
+
+    # Check if superblock file exists, but allow non-existent files for creating new arrays
+    if [ ! -f "$superblock" ]; then
+        if [ "$quiet_mode" -eq 0 ]; then
+            echo -e "${YELLOW}Warning: Superblock file not found: $superblock${NC}"
+            echo -e "${YELLOW}This will create a new superblock when the array is started.${NC}"
+
+            # Ask for confirmation if creating a new superblock
+            read -r -p "Continue with a new superblock? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "Operation cancelled."
+                return 1
+            fi
+            echo -e "Proceeding with new superblock at: ${GREEN}$superblock${NC}"
+        fi
+    fi
+
+    # Check if module is loaded
+    if ! lsmod | grep -q nonraid; then
+        if [ "$quiet_mode" -eq 0 ]; then
+            echo -e "${YELLOW}NonRAID module not loaded. Loading with superblock: $superblock${NC}"
+        fi
+        if ! modprobe nonraid super="$superblock"; then
+            echo -e "${RED}Error: Failed to load nonraid module${NC}"
+            return 1
+        fi
+        if [ "$quiet_mode" -eq 0 ]; then
+            echo -e "${GREEN}Successfully loaded nonraid module${NC}"
+        fi
+        return 0
+    fi
+
+    if [ "$quiet_mode" -eq 0 ]; then
+        echo -e "${YELLOW}Stopping array and reloading nonraid module...${NC}"
+    fi
+
+    # Stop array if it's running
+    local mdstate=""
+    if [ -f "$PROC_NMDSTAT" ]; then
+        mdstate=$(get_nmdstat_value "mdState")
+        if [ "$mdstate" = "STARTED" ]; then
+            if [ "$quiet_mode" -eq 0 ]; then
+                echo "Stopping array first..."
+            fi
+            if ! run_nmd_command "stop"; then
+                echo -e "${RED}Error: Failed to stop array. Cannot safely reload module.${NC}"
+                return 1
+            fi
+            if [ "$quiet_mode" -eq 0 ]; then
+                echo -e "Array stopped successfully."
+            fi
+        fi
+    fi
+
+    # Unload module
+    if [ "$quiet_mode" -eq 0 ]; then
+        echo "Unloading nonraid module..."
+    fi
+    if ! modprobe -r nonraid; then
+        echo -e "${RED}Error: Failed to unload nonraid module. It may be in use.${NC}"
+        return 1
+    fi
+
+    # Load module with specified superblock
+    if [ "$quiet_mode" -eq 0 ]; then
+        echo "Loading nonraid module with superblock: $superblock"
+    fi
+    if ! modprobe nonraid super="$superblock"; then
+        echo -e "${RED}Error: Failed to reload nonraid module${NC}"
+        return 1
+    fi
+
+    if [ "$quiet_mode" -eq 0 ]; then
+        echo -e "${GREEN}Successfully reloaded nonraid module with superblock: $superblock${NC}"
+    fi
+    return 0
+}
+
+# Mount all active data disks with identified filesystems
+mount_array_disks() {
+    check_root
+
+    local mount_prefix="${1:-/mnt/disk}"
+
+    # Check if array is running
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    # Get all values from nmdstat
+    get_all_nmdstat_values NMDSTAT_VALUES
+
+    local mdstate="${NMDSTAT_VALUES[mdState]}"
+    if [ "$mdstate" != "STARTED" ]; then
+        if [ "$UNATTENDED" -eq 1 ]; then
+            echo -e "${RED}Error: Array must be started before mounting disks (unattended mode)${NC}"
+            return 1
+        fi
+        echo -e "${YELLOW}Array must be started before mounting disks${NC}"
+        read -r -p "Do you want to start the array now? (y/N): " start_now
+        if [[ "$start_now" =~ ^[Yy]$ ]]; then
+            start_array
+        else
+            echo -e "Start the array with: ${YELLOW}nmdctl start${NC}"
+            return 1
+        fi
+    fi
+
+    echo "=== Mounting NonRAID Array Disks ==="
+    echo ""
+    echo "Using mount prefix: $mount_prefix"
+    echo ""
+
+    local mounted_count=0
+    local skipped_count=0
+    local error_count=0
+
+    # Get all defined slots
+    local defined_slots=$(get_defined_slots)
+
+    # Process data disks (skip parity slots 0 and 29)
+    for slot in $defined_slots; do
+        # Skip parity disks (slots 0 and 29)
+        if [ "$slot" = "0" ] || [ "$slot" = "29" ]; then
+            continue
+        fi
+
+        local diskname="${NMDSTAT_VALUES[diskName.$slot]}"
+        local diskid="${NMDSTAT_VALUES[diskId.$slot]}"
+        local disksize="${NMDSTAT_VALUES[diskSize.$slot]}"
+
+        # Skip slots with no nmd device or size 0
+        if [ -z "$diskname" ] || [ "$disksize" -eq 0 ]; then
+            continue
+        fi
+
+        # Get filesystem type and current mountpoint
+        local device="/dev/${diskname}"
+        local fs_type=$(get_fs_type "$device")
+        local current_mountpoint=$(get_mountpoint "$diskname" "$fs_type")
+
+        # Skip if no filesystem or already mounted
+        if [ -z "$fs_type" ] || [ "$fs_type" = "unknown" ]; then
+            echo -e "Slot $slot (${YELLOW}${diskname}${NC}): ${YELLOW}No filesystem detected${NC}"
+            skipped_count=$((skipped_count + 1))
+            continue
+        elif [ "$current_mountpoint" != "unmounted" ]; then
+            echo -e "Slot $slot (${BLUE}${diskname}${NC}): Already mounted at ${GREEN}$current_mountpoint${NC}"
+            skipped_count=$((skipped_count + 1))
+            continue
+        fi
+
+        if [ "$fs_type" = "luks" ]; then
+            # Open LUKS device
+            echo -n "Slot $slot (${diskname}): Opening LUKS device... "
+            if [ -z "$LUKS_KEYFILE" ] || [ ! -f "$LUKS_KEYFILE" ]; then
+                echo -e "${RED}FAILED${NC}: ${YELLOW}Keyfile '${LUKS_KEYFILE}' does not exist. Cannot open LUKS device.${NC}"
+                error_count=$((error_count + 1))
+                continue
+            else
+                local luks_output
+                luks_output=$(cryptsetup luksOpen --key-file "$LUKS_KEYFILE" "$device" "$diskname" 2>&1)
+                local luks_status=$?
+
+                if [ $luks_status -eq 0 ]; then
+                    echo -e "${GREEN}SUCCESS${NC}"
+                    # redetect layered filesystem type after opening LUKS
+                    fs_type="$(get_fs_type "$device")"
+                else
+                    echo -e "${RED}FAILED${NC}: ${YELLOW}${luks_output}${NC}"
+                    error_count=$((error_count + 1))
+                    continue
+                fi
+            fi
+        fi
+        # Opened luks device, mount the filesystem
+        if [[ "$fs_type" =~ ^luks\+.* ]]; then
+            fs_type=${fs_type##*+}
+            device="/dev/mapper/$diskname"
+        fi
+
+        # Handle mounting based on filesystem type
+        case "$fs_type" in
+            "zfs")
+                # For ZFS, we need to import the pool
+                local pool_name="disk${slot}"
+                local mountpoint="${mount_prefix}${slot}"
+
+                # Create mountpoint if it doesn't exist
+                if [ ! -d "$mountpoint" ]; then
+                    mkdir -p "$mountpoint"
+                fi
+
+                echo -n "Slot $slot (${diskname}): Importing ZFS pool $pool_name to $mountpoint... "
+
+                local import_output
+                import_output=$(zpool import -o cachefile=none -d "$device" "$pool_name" 2>&1)
+                local import_status=$?
+
+                if [ $import_status -eq 0 ]; then
+                    if [ "$(zfs get -H -o value mountpoint "$pool_name")" != "$mountpoint" ]; then
+                        zfs set mountpoint="$mountpoint" "$pool_name"
+                    fi
+                    echo -e "${GREEN}SUCCESS${NC}"
+                    mounted_count=$((mounted_count + 1))
+                else
+                    echo -e "${RED}FAILED${NC}: ${YELLOW}${import_output}${NC}"
+                    error_count=$((error_count + 1))
+                fi
+                ;;
+
+            "xfs"|"ext4"|"ext3"|"ext2"|"btrfs"|*)
+                # Standard filesystems
+                local mountpoint="${mount_prefix}${slot}"
+
+                # Create mountpoint if it doesn't exist
+                if [ ! -d "$mountpoint" ]; then
+                    mkdir -p "$mountpoint"
+                fi
+
+                echo -n "Slot $slot (${diskname}): Mounting ${fs_type^^} to $mountpoint... "
+
+                # Check if device is defined in /etc/nonraid/fstab
+                local mount_opts=""
+                if [ -f "/etc/nonraid/fstab" ] && grep -q "^${device}[[:space:]]" "/etc/nonraid/fstab"; then
+                    mount_opts="--fstab /etc/nonraid/fstab --options-source-force"
+                fi
+
+                local mount_output
+                # shellcheck disable=SC2086 # We want word splitting for mount options
+                mount_output=$(mount $mount_opts "$device" "$mountpoint" 2>&1)
+                local mount_status=$?
+
+                if [ $mount_status -eq 0 ]; then
+                    echo -e "${GREEN}SUCCESS${NC}"
+                    mounted_count=$((mounted_count + 1))
+                else
+                    echo -e "${RED}FAILED${NC}: ${YELLOW}${mount_output}${NC}"
+                    error_count=$((error_count + 1))
+                fi
+                ;;
+        esac
+    done
+
+    echo ""
+    echo "Mount summary:"
+    echo -e "  ${GREEN}$mounted_count${NC} disks mounted successfully"
+    echo -e "  ${BLUE}$skipped_count${NC} disks skipped (already mounted or no filesystem)"
+    if [ $error_count -gt 0 ]; then
+        echo -e "  ${RED}$error_count${NC} disks failed to mount"
+        return 1
+    fi
+
+    return 0
+}
+
+# Unmount all active data disks
+unmount_array_disks() {
+    check_root
+
+    # Check if array is running
+    if ! check_nmdstat_exists; then
+        return 1
+    fi
+
+    # Get all values from nmdstat
+    get_all_nmdstat_values NMDSTAT_VALUES
+
+    local mdstate="${NMDSTAT_VALUES[mdState]}"
+    if [ "$mdstate" != "STARTED" ]; then
+        echo -e "${YELLOW}Array is not running (current state: $mdstate)${NC}"
+        return 0
+    fi
+
+    echo "=== Unmounting NonRAID Array Disks ==="
+    echo ""
+
+    local unmounted_count=0
+    local skipped_count=0
+    local error_count=0
+
+    # Get all defined slots
+    local defined_slots=$(get_defined_slots)
+
+    # Process data disks (skip parity slots 0 and 29)
+    for slot in $defined_slots; do
+        # Skip parity disks (slots 0 and 29)
+        if [ "$slot" = "0" ] || [ "$slot" = "29" ]; then
+            continue
+        fi
+
+        local diskname="${NMDSTAT_VALUES[diskName.$slot]}"
+        local diskid="${NMDSTAT_VALUES[diskId.$slot]}"
+        local disksize="${NMDSTAT_VALUES[diskSize.$slot]}"
+
+        # Skip slots with no nmd device or size 0
+        if [ -z "$diskname" ] || [ "$disksize" -eq 0 ]; then
+            continue
+        fi
+
+        # Get filesystem type and current mountpoint
+        local device="/dev/${diskname}"
+        local fs_type=$(get_fs_type "$device")
+        local current_mountpoint=$(get_mountpoint "$diskname" "$fs_type")
+
+        # Skip if no filesystem or already unmounted
+        if [ -z "$fs_type" ] || [ "$fs_type" = "unknown" ]; then
+            echo -e "Slot $slot (${YELLOW}${diskname}${NC}): ${YELLOW}No filesystem detected${NC}"
+            skipped_count=$((skipped_count + 1))
+            continue
+        elif [ "$current_mountpoint" = "unmounted" ] && [[ ! "$fs_type" =~ ^luks\+.* ]]; then
+            echo -e "Slot $slot (${BLUE}${diskname}${NC}): Already unmounted"
+            skipped_count=$((skipped_count + 1))
+            continue
+        fi
+
+        local luks_fs=0
+        if [[ "$fs_type" =~ ^luks\+.* ]]; then
+            fs_type=${fs_type##*+}
+            luks_fs=1
+        fi
+
+        if [ "$current_mountpoint" != "unmounted" ]; then
+            # Handle unmounting based on filesystem type
+            case "$fs_type" in
+                "zfs")
+                    # For ZFS, we need to export the pool
+                    # Get the pool name that contains this device
+                    local pool_name=""
+                    if command -v zpool >/dev/null 2>&1; then
+                        pool_name=$(zpool list -H -o name | while read -r pool; do
+                            if zpool list -v -H -o name "$pool" 2>/dev/null | grep -q "$diskname"; then
+                                echo "$pool"
+                                break
+                            fi
+                        done)
+                    fi
+
+                    if [ -n "$pool_name" ]; then
+                        echo -n "Slot $slot (${diskname}): Exporting ZFS pool $pool_name... "
+                        if zpool export "$pool_name" 2>/dev/null; then
+                            echo -e "${GREEN}SUCCESS${NC}"
+                            unmounted_count=$((unmounted_count + 1))
+                        else
+                            echo -e "${RED}FAILED${NC} (Device may be busy)"
+                            error_count=$((error_count + 1))
+                        fi
+                    else
+                        echo -e "Slot $slot (${YELLOW}${diskname}${NC}): ${YELLOW}ZFS pool not found${NC}"
+                        skipped_count=$((skipped_count + 1))
+                    fi
+                    ;;
+
+                "xfs"|"ext4"|"ext3"|"ext2"|"btrfs"|*)
+                    echo -n "Slot $slot (${diskname}): Unmounting ${fs_type^^} from $current_mountpoint... "
+
+                    # Try unmounting with increasing force if needed
+                    if umount "$current_mountpoint" 2>/dev/null ||
+                    umount -f "$current_mountpoint" 2>/dev/null; then
+                        echo -e "${GREEN}SUCCESS${NC}"
+                        unmounted_count=$((unmounted_count + 1))
+                    else
+                        echo -e "${RED}FAILED${NC} (Device may be busy)"
+                        error_count=$((error_count + 1))
+                    fi
+                    ;;
+            esac
+        fi
+
+        # If it was a luks filesystem, close it
+        if [ $luks_fs -eq 1 ]; then
+            echo -n "Slot $slot (${diskname}): Closing LUKS device... "
+            if cryptsetup luksClose "$diskname" 2>/dev/null; then
+                echo -e "${GREEN}SUCCESS${NC}"
+            else
+                echo -e "${RED}FAILED${NC}"
+                error_count=$((error_count + 1))
+            fi
+        fi
+    done
+
+    echo ""
+    echo "Unmount summary:"
+    echo -e "  ${GREEN}$unmounted_count${NC} disks unmounted successfully"
+    echo -e "  ${BLUE}$skipped_count${NC} disks skipped (already unmounted or no filesystem)"
+    if [ $error_count -gt 0 ]; then
+        echo -e "  ${RED}$error_count${NC} disks failed to unmount"
+        return 1
+    fi
+
+    return 0
+}
+
+set_array_setting() {
+    check_module_loaded || return 1
+    check_nmdstat_exists || return 1
+
+    if [ ${#NMDSTAT_VALUES[@]} -eq 0 ]; then
+        get_all_nmdstat_values NMDSTAT_VALUES
+    fi
+
+    # Some aliases for most common settings
+    declare -A setting_aliases
+    setting_aliases=(
+        ["turbo"]="md_write_method"
+        ["debug"]="md_trace"
+    )
+
+    # Descriptions for each setting
+    declare -A setting_desc
+    setting_desc["md_write_method"]="Controls the write algorithm (0=READ_MODIFY_WRITE (standard mode), 1=RECONSTRUCT_WRITE (\"turbo write mode\"))\n \
+                         Note: turbo mode needs to have all disks spinning, standard mode only needs parity and the data disk being written to spinning"
+    setting_desc["md_trace"]="Debug trace level (0=off, 1=cmd (default), 2=debug, 3=IO, 4=detailed)"
+    setting_desc["label"]="Sets or changes the array label (max 32 characters)"
+    setting_desc["md_num_stripes"]="Number of stripe cache entries (default: 1280)"
+    setting_desc["md_queue_limit"]="I/O queue limit as percentage (1-100, throttles normal I/O)"
+    setting_desc["md_sync_limit"]="Sync queue limit as percentage (0-100, throttles parity operations)"
+    setting_desc["md_restrict"]="Restriction flags (bitfield controlling array behavior)"
+    setting_desc["invalidslot"]="Sets slots to start as invalid (format: SLOT1 SLOT2)"
+    setting_desc["resync_start"]="Sets parity sync start position in sectors"
+    setting_desc["resync_end"]="Sets parity sync end position in sectors (0=auto)"
+    setting_desc["rderror"]="Simulates read error on next operation for specified slot"
+    setting_desc["wrerror"]="Simulates write error on next operation for specified slot"
+
+    # Show help if no parameter is provided
+    if [ -z "$1" ]; then
+        echo -e "${BLUE}NonRAID Array Settings${NC}"
+        echo ""
+        echo -e "${GREEN}Available settings:${NC}"
+        echo ""
+        echo -e "${YELLOW}Common settings${NC}:"
+        echo -e "  md_write_method [0|1]   ${setting_desc["md_write_method"]}"
+        echo -e "  md_trace [0-4]          ${setting_desc["md_trace"]}"
+        echo -e "  md_queue_limit [1-100]  ${setting_desc["md_queue_limit"]}"
+        echo -e "  md_sync_limit [0-100]   ${setting_desc["md_sync_limit"]}"
+        echo -e "  label [LABEL]           ${setting_desc["label"]}"
+        echo ""
+        echo -e "${YELLOW}Advanced settings:${NC}"
+        echo -e "  md_num_stripes [COUNT]  ${setting_desc["md_num_stripes"]}"
+        echo -e "  invalidslot [SLOT1 [2]] ${setting_desc["invalidslot"]}"
+        echo -e "  resync_start [SECTOR]   ${setting_desc["resync_start"]}"
+        echo -e "  resync_end [SECTOR]     ${setting_desc["resync_end"]}"
+        echo ""
+        echo -e "${YELLOW}Debug settings:${NC}"
+        echo -e "  rderror SLOT            ${setting_desc["rderror"]}"
+        echo -e "  wrerror SLOT            ${setting_desc["wrerror"]}"
+        echo -e "  md_restrict [VALUE]     ${setting_desc["md_restrict"]}"
+        echo ""
+        echo -e "${GREEN}Usage:${NC} nmdctl set SETTING [VALUE]"
+        echo -e "If VALUE is omitted, parameter is reset to its default value."
+        return 0
+    fi
+
+    local setting="$1"
+    shift
+    local value="$*"
+
+    # Substitute alias for actual setting
+    if [[ -n "${setting_aliases[$setting]}" ]]; then
+        setting="${setting_aliases[$setting]}"
+    fi
+
+    # Handle different settings
+    case "$setting" in
+        "md_write_method")
+            if [ "$value" = "" ]; then
+                echo -e "${YELLOW}Resetting write method to default (0 - READ_MODIFY_WRITE)${NC}"
+                value="0"
+            elif [ "$value" = "1" ]; then
+                echo -e "${GREEN}Enabling turbo write mode (RECONSTRUCT_WRITE)${NC}"
+            elif [ "$value" = "0" ]; then
+                echo -e "${GREEN}Setting standard write mode (READ_MODIFY_WRITE)${NC}"
+            else
+                echo -e "${RED}Error: Invalid value for md_write_method. Use 0 or 1${NC}"
+                return 1
+            fi
+            ;;
+        "md_trace")
+            if [ "$value" = "" ]; then
+                echo -e "${YELLOW}Resetting debug trace level to default (1)${NC}"
+                value="1"
+            elif [[ "$value" =~ ^[0-4]$ ]]; then
+                echo -e "${GREEN}Setting debug trace level to $value${NC}"
+            else
+                echo -e "${RED}Error: Invalid value for md_trace. Use 0-4${NC}"
+                return 1
+            fi
+            ;;
+        "md_num_stripes")
+            if [ "$value" = "" ]; then
+                echo -e "${YELLOW}Resetting stripe cache size to default (1280)${NC}"
+                value="1280"
+            elif [[ "$value" =~ ^[0-9]+$ ]]; then
+                echo -e "${GREEN}Setting stripe cache size to $value entries${NC}"
+            else
+                echo -e "${RED}Error: Invalid value for md_num_stripes. Use a positive integer${NC}"
+                return 1
+            fi
+            ;;
+        "md_queue_limit")
+            if [ "$value" = "" ]; then
+                echo -e "${YELLOW}Resetting I/O queue limit to default (80%)${NC}"
+                value="80"
+            elif [[ "$value" =~ ^[1-9][0-9]?$|^100$ ]]; then
+                echo -e "${GREEN}Setting I/O queue limit to $value%${NC}"
+            else
+                echo -e "${RED}Error: Invalid value for md_queue_limit. Use 1-100${NC}"
+                return 1
+            fi
+            ;;
+        "md_sync_limit")
+            if [ "$value" = "" ]; then
+                echo -e "${YELLOW}Resetting sync queue limit to default (5%)${NC}"
+                value="5"
+            elif [[ "$value" =~ ^[0-9]?[0-9]$|^100$ ]]; then
+                echo -e "${GREEN}Setting sync queue limit to $value%${NC}"
+            else
+                echo -e "${RED}Error: Invalid value for md_sync_limit. Use 0-100${NC}"
+                return 1
+            fi
+            ;;
+        "md_restrict")
+            if [ "$value" = "" ]; then
+                echo -e "${YELLOW}Resetting restriction flags to default (1)${NC}"
+                value="1"
+            elif [[ "$value" =~ ^[0-9]+$ ]]; then
+                echo -e "${GREEN}Setting restriction flags to $value${NC}"
+            else
+                echo -e "${RED}Error: Invalid value for md_restrict. Use a positive integer${NC}"
+                return 1
+            fi
+            ;;
+        "invalidslot")
+            if [ "$value" = "" ]; then
+                echo -e "${YELLOW}Resetting invalid slots to defaults (0 29)${NC}"
+                value="0 29"
+            elif [[ "$value" =~ ^[0-9]+\ +[0-9]+$ ]]; then
+                echo -e "${GREEN}Setting invalid slots to $value${NC}"
+            else
+                echo -e "${RED}Error: Invalid format for invalidslot. Use 'SLOT1 SLOT2'${NC}"
+                return 1
+            fi
+            ;;
+        "resync_start"|"resync_end")
+            if [ "$value" = "" ]; then
+                echo -e "${YELLOW}Resetting $setting to default (0)${NC}"
+                value="0"
+            elif [[ "$value" =~ ^[0-9]+$ ]]; then
+                echo -e "${GREEN}Setting $setting to sector $value${NC}"
+            else
+                echo -e "${RED}Error: Invalid value for $setting. Use a non-negative integer${NC}"
+                return 1
+            fi
+            ;;
+        "rderror"|"wrerror")
+            if [ "$value" = "" ] || ! [[ "$value" =~ ^[0-9]+$ ]]; then
+                echo -e "${RED}Error: $setting requires a valid disk slot number${NC}"
+                return 1
+            else
+                echo -e "${YELLOW}Simulating ${setting:0:2} error on slot $value${NC}"
+            fi
+            ;;
+        "label")
+            if [ "${NMDSTAT_VALUES[mdState]}" != "STOPPED" ]; then
+                echo -e "${YELLOW}Label can only be set when the array is stopped.${NC}"
+                return 1
+            fi
+            if [ -z "$value" ]; then
+                echo -e "${YELLOW}Resetting array label to default (empty)${NC}"
+                value=""
+            elif [[ "$value" =~ ^[a-zA-Z0-9_-]{1,32}$ ]]; then
+                echo -e "${GREEN}Setting array label to '$value'${NC}"
+            else
+                echo -e "${RED}Error: Invalid label format. Use alphanumeric characters, underscores, and dashes only, max 32 characters${NC}"
+                return 1
+            fi
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown setting '$setting'${NC}"
+            echo -e "Run 'nmdctl set' without parameters to see available settings"
+            return 1
+            ;;
+    esac
+
+    # Prepare and execute the command
+    local cmd="set $setting $value"
+    if [ "$setting" = "label" ]; then
+        # label is its own command
+        cmd="label $value"
+    fi
+    echo -e "${YELLOW}Executing: $cmd${NC}"
+
+    if run_nmd_command "$cmd"; then
+        echo -e "${GREEN}Setting applied successfully${NC}"
+        return 0
+    else
+        echo -e "${RED}Failed to apply setting (check dmesg for details)${NC}"
+        return 1
+    fi
+}
+
+# Main entry point
+main() {
+    # Check for at least one argument
+    if [ $# -eq 0 ]; then
+        usage
+    fi
+
+    # Parse global options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            "-s"|"--super")
+                if [ -z "$2" ] || [[ "$2" == -* ]]; then
+                    echo -e "${RED}Error: --super requires a path argument${NC}"
+                    usage
+                fi
+                SUPERBLOCK_PATH="$2"
+                shift 2
+                ;;
+            "-k"|"--keyfile")
+                if [ -z "$2" ] || [[ "$2" == -* ]]; then
+                    echo -e "${RED}Error: --keyfile requires a path argument${NC}"
+                    usage
+                fi
+                LUKS_KEYFILE="$2"
+                shift 2
+                ;;
+            "-v"|"--verbose")
+                VERBOSE=1
+                shift
+                ;;
+            "-u"|"--unattended")
+                UNATTENDED=1
+                shift
+                ;;
+            "--no-color")
+                RED=""
+                GREEN=""
+                BLUE=""
+                YELLOW=""
+                NC=""
+                HEADER_BG=""
+                FOOTER_BG=""
+                shift
+                ;;
+            "-V"|"--version")
+                echo "nmdctl version $VERSION"
+                exit 0
+                ;;
+            "-h"|"--help"|"help")
+                usage 0
+                ;;
+            *)
+                # Not a global option, should be a command
+                break
+                ;;
+        esac
+    done
+
+    # No command provided after global options
+    if [ $# -eq 0 ]; then
+        usage
+    fi
+
+    # Parse command
+    local command="$1"
+    shift
+
+    case "$command" in
+        "status")
+            show_status "$@"
+            ;;
+        "create")
+            create_array "$@"
+            ;;
+        "start")
+            start_array "$1"
+            ;;
+        "stop")
+            stop_array
+            ;;
+        "import")
+            import_disks
+            ;;
+        "add")
+            add_disk "$@"
+            ;;
+        "replace")
+            # Check if we have at least one non-flag argument
+            local has_slot=0
+            for arg in "$@"; do
+                if [[ ! "$arg" =~ ^- ]]; then
+                    has_slot=1
+                    break
+                fi
+            done
+
+            if [ "$has_slot" -eq 0 ]; then
+                echo -e "${RED}Error: Missing slot parameter for replace command${NC}"
+                return 1
+            fi
+            add_disk "$@"
+            ;;
+        "unassign")
+            unassign_disk "$1"
+            ;;
+        "reload")
+            reload_module
+            ;;
+        "check")
+            handle_check "$1"
+            ;;
+        "nocheck")
+            # separate command kept for backwards compatibility
+            handle_check "${1:-CANCEL}"
+            ;;
+        "mount")
+            if [ "$1" = "-k" ] || [ "$1" = "--key-file" ]; then
+                if [ -z "$2" ] || [[ "$2" == -* ]]; then
+                    echo -e "${RED}Error: --keyfile requires a path argument${NC}"
+                    usage
+                fi
+                LUKS_KEYFILE="$2"
+                shift 2
+            fi
+            mount_array_disks "$1"
+            ;;
+        "unmount"|"umount")
+            unmount_array_disks
+            ;;
+        "set")
+            set_array_setting "$@"
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown command '$command'${NC}"
+            usage
+            ;;
+    esac
+
+    exit $?
+}
+
+# Run main function
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

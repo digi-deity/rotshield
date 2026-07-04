@@ -75,7 +75,7 @@ from btrfs_recon.parsing import (
     lookup_csum,
 )
 from btrfs_recon.structure import ObjectId
-from md_array import find_mount_for_path, must_be_root, resolve_devid_to_device
+from md_array import find_mount_for_path, get_array_config, must_be_root, resolve_devid_to_device
 
 # 1. Remove the default logger configuration
 logger.remove()
@@ -98,11 +98,31 @@ def hexdump(data: bytes, base: int = 0, width: int = 16) -> str:
     return '\n'.join(lines)
 
 
+def _raw_offset(dev: str) -> int:
+    """Bytes to add to an array-space address when accessing *dev* directly.
+
+    Array partitions (e.g. /dev/nmd1p1) need no shift; raw rdevs (e.g.
+    /dev/loop2 named by rdevName.N in /proc/nmdstat) need rdevOffset.N*512
+    added because btrfs sees addresses relative to the array partition while
+    the raw device has a per-disk header before that partition.  Returns 0
+    when no array config is present (e.g. plain btrfs on a single disk).
+    """
+    try:
+        return get_array_config().raw_offset_for(dev)
+    except SystemExit:
+        return 0
+
+
 def dump_window(dev: str, label: str, phys_offset: int, count: int = 3) -> None:
-    """Hex-dump a 64-byte window centred on `phys_offset` on `dev`."""
+    """Hex-dump a 64-byte window centred on `phys_offset` on `dev`.
+
+    *phys_offset* is always in array-partition space; the per-disk rdevOffset
+    is added internally so callers can use the same value for array
+    partitions and raw rdevs alike.
+    """
     # 64-byte window: 32 bytes before the target through 32 bytes after.
     window_size = 64
-    start_offset = max(phys_offset - 32, 0)
+    start_offset = max(phys_offset - 32, 0) + _raw_offset(dev)
     
     with open(dev, 'rb') as fp:
         fp.seek(start_offset)
@@ -140,9 +160,14 @@ def btrfs_sync(mount_point: str) -> None:
 
 def compute_block_csum(dev: str, phys_offset: int,
                        block_size: int = BTRFS_SECTOR_SIZE) -> int:
-    """Read `block_size` bytes from `dev` at `phys_offset` and return crc32c."""
+    """Read `block_size` bytes from `dev` at `phys_offset` and return crc32c.
+
+    *phys_offset* is in array-partition space; the per-disk rdevOffset is
+    added internally so callers can use the same value for array partitions
+    and raw rdevs alike.
+    """
     with open(dev, 'rb') as fp:
-        fp.seek(phys_offset)
+        fp.seek(phys_offset + _raw_offset(dev))
         block = fp.read(block_size)
     if len(block) < block_size:
         logger.error(f'short read from {dev} at {phys_offset} '
@@ -399,12 +424,17 @@ def main() -> None:
         # NOT updated and cannot heal it).
         byte_value = args.byte_value and int(args.byte_value, 0)
         byte_offset = real_phys_offset
+        # The corruption target lives on the underlying raw rdev, whose
+        # block layout starts rdevOffset*512 bytes after the array partition
+        # the chunk tree addresses. Add that shift only when the underlying
+        # device is a raw rdev (the array partition itself already strips it).
+        raw_shift = _raw_offset(underlying_dev)
         if args.dry_run:
             logger.info(f'=== Step 4: (dry-run) Would corrupt {underlying_dev} at byte offset {byte_offset} ===')
             logger.info('(dry-run: not actually writing)')
         else:
             with open(underlying_dev, 'r+b') as raw_fp:
-                raw_fp.seek(byte_offset)
+                raw_fp.seek(byte_offset + raw_shift)
                 current = raw_fp.read(1)[0]
                 if byte_value is None:
                     byte_value = current ^ 0xFF
@@ -413,7 +443,7 @@ def main() -> None:
                     logger.warning(f'on-disk byte is already 0x{current:02x}; '
                                    f'writing 0x{byte_value:02x} instead so corruption actually takes effect')
                 logger.info(f'=== Step 4: Writing 0x{byte_value:02x} to {underlying_dev} at byte offset {byte_offset} ===')
-                raw_fp.seek(byte_offset)
+                raw_fp.seek(byte_offset + raw_shift)
                 raw_fp.write(bytes([byte_value]))
                 raw_fp.flush()
                 os.fsync(raw_fp.fileno())

@@ -60,14 +60,14 @@ jobs:
           sudo sgdisk -o -a 8 -n 1:32K:0 $disk4
 
           # Create symlinks for device discovery
-          sudo ln -s $disk1 -t /dev/disk/by-id/
-          sudo ln -s $disk2 -t /dev/disk/by-id/
-          sudo ln -s $disk3 -t /dev/disk/by-id/
-          sudo ln -s $disk4 -t /dev/disk/by-id/
+          sudo ln -s $disk1 /dev/disk/by-id/virtdisk-001
+          sudo ln -s $disk2 /dev/disk/by-id/virtdisk-002
+          sudo ln -s $disk3 /dev/disk/by-id/virtdisk-003
+          sudo ln -s $disk4 /dev/disk/by-id/virtdisk-004
 
           # Make btrfs filesystems
-          sudo mkfs.btrfs -f -L disk3 ${disk3}p1
-          sudo mkfs.btrfs -f -L disk4 ${disk4}p1
+          sudo mkfs.btrfs -f -L "data3" "${disk3}p1"
+          sudo mkfs.btrfs -f -L "data4" "${disk4}p1"
 
           # Enable compression on the 4th disk (maps to 2nd disk in NonRAID array due to parity disks)
           sudo mkdir -p /etc/nonraid
@@ -78,7 +78,7 @@ jobs:
       - name: Test NonRAID array operations
         run: |
           echo ">>> [mk_array] Creating NonRAID array with disk assignments"
-          sudo nmdctl create --force P:${DISK1}p1:$(basename $DISK1) Q:${DISK2}p1:$(basename $DISK2) 1:${DISK3}p1:$(basename $DISK3) 2:${DISK4}p1:$(basename $DISK4)
+          sudo ./nmdctl create --force P:/dev/loop0p1:virtdisk-001 Q:/dev/loop1p1:virtdisk-002 1:/dev/loop2p1:virtdisk-003 2:/dev/loop3p1:virtdisk-004
 
           echo ">>> [mk_array] Starting the NonRAID array"
           echo 'y' | sudo nmdctl start

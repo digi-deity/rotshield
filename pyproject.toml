@@ -11,5 +11,6 @@ dependencies = [
   "crc32c",
   "construct",
   "construct-typing",
-  "intervaltree"
+  "intervaltree",
+  "loguru"
 ]

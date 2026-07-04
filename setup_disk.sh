@@ -1,7 +1,5 @@
 #!/bin/bash
 
-DISK_COUNT=4
-SIZE_MB=256
 WORKDIR="/root/nonraid-test"
 
 if [ "$EUID" -ne 0 ]; then
@@ -18,43 +16,30 @@ if ! command -v mkfs.btrfs >/dev/null 2>&1; then
     apt-get update && apt-get install -y btrfs-progs
 fi
 
-for i in $(seq 1 $DISK_COUNT); do
-    IMG="d$i"
-    LINKNAME="virtdisk-00$i"
-    NEW_IMAGE=0
+# Create test disk images
+sudo dd if=/dev/urandom of=d1 bs=1M count=256 status=progress
+sudo dd if=/dev/urandom of=d2 bs=1M count=256 status=progress
+sudo dd if=/dev/urandom of=d3 bs=1M count=256 status=progress
+sudo dd if=/dev/urandom of=d4 bs=1M count=128 status=progress
 
-    if [ ! -f "$IMG" ]; then
-        echo "Creating $IMG ($SIZE_MB MB)..."
-        dd if=/dev/zero of="$IMG" bs=1M count=$SIZE_MB status=progress
-        NEW_IMAGE=1
-    fi
+# Set up loop devices
+disk1=$(sudo losetup -fP --show d1)
+disk2=$(sudo losetup -fP --show d2)
+disk3=$(sudo losetup -fP --show d3)
+disk4=$(sudo losetup -fP --show d4)
 
-    LOOP_DEV=$(losetup -j "$IMG" | cut -d: -f1)
-    if [ -z "$LOOP_DEV" ]; then
-        LOOP_DEV=$(losetup -fP --show "$IMG")
-    fi
-    echo "Disk $i -> $LOOP_DEV"
+echo "Created loop devices: $disk1, $disk2, $disk3, $disk4"
 
-    # Create GPT partition table (32K-aligned, single partition to end of disk)
-    sgdisk -o -a 8 -n 1:32K:0 "$LOOP_DEV"
-    partprobe "$LOOP_DEV" 2>/dev/null
-    udevadm settle
+# Create partitions
+sudo sgdisk -o -a 8 -n 1:32K:0 $disk1
+sudo sgdisk -o -a 8 -n 1:32K:0 $disk2
+sudo sgdisk -o -a 8 -n 1:32K:0 $disk3
+sudo sgdisk -o -a 8 -n 1:32K:0 $disk4
 
-    PART_DEV="${LOOP_DEV}p1"
+sudo ln -s $disk1 /dev/disk/by-id/virtdisk-001
+sudo ln -s $disk2 /dev/disk/by-id/virtdisk-002
+sudo ln -s $disk3 /dev/disk/by-id/virtdisk-003
+sudo ln -s $disk4 /dev/disk/by-id/virtdisk-004
 
-    # Disks 3 and 4 are the data disks; disks 1 and 2 stay zero'd as parity disks.
-    if [ "$i" -ge 3 ] && [ "$NEW_IMAGE" -eq 1 ]; then
-        echo "Formatting $PART_DEV as btrfs..."
-        mkfs.btrfs -f -L "data$((i-2))" "$PART_DEV"
-    fi
-
-    # nmdctl requires a /dev/disk/by-id entry for each disk
-    ln -sf "$LOOP_DEV" "/dev/disk/by-id/$LINKNAME"
-done
-
-udevadm settle
-
-echo "----"
-lsblk
-echo "----"
-ls -l /dev/disk/by-id/ | grep virtdisk
+sudo mkfs.btrfs -f -L "data3" "${disk3}p1"
+sudo mkfs.btrfs -f -L "data4" "${disk4}p1"

@@ -34,13 +34,32 @@ _NMDSTAT_Q_SLOT = 29
 class ArrayConfig:
     """Parsed array configuration.
 
-    data_devs maps slot/btrfs-devid → full /dev/... path for every data disk.
-    parity_p / parity_q are the primary and secondary parity disks (may be
-    None if not present in the array).
+    data_devs maps slot/btrfs-devid → full /dev/... raw-rdev path for every
+    data disk. parity_p / parity_q are the primary and secondary parity
+    disks (raw-rdev paths; may be None if not present in the array).
+
+    rdev_offsets maps the same raw-rdev path → byte offset that must be
+    added to array-partition-space addresses when reading/writing the raw
+    rdev device directly.  For array partitions (e.g. /dev/nmd1p1) this is
+    0 because the array driver already strips the per-disk header; for raw
+    rdevs (e.g. /dev/loop2 named by rdevName.N) it is rdevOffset.N × 512.
+
+    A single helper, raw_offset_for(dev_path), returns this value for any
+    path so callers do not need to know which kind of device they hold.
     """
     data_devs: dict[int, str] = field(default_factory=dict)
     parity_p: str | None = None
     parity_q: str | None = None
+    rdev_offsets: dict[str, int] = field(default_factory=dict)
+
+    def raw_offset_for(self, dev_path: str) -> int:
+        """Bytes to add to an array-space address when accessing ``dev_path``.
+
+        Array partitions (paths not listed in rdev_offsets) get 0; raw rdevs
+        get their per-disk rdevOffset.  This is the single chokepoint every
+        caller should use so the array-vs-raw distinction lives in one place.
+        """
+        return self.rdev_offsets.get(dev_path, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,6 +151,16 @@ def _parse_nmdstat(path: str) -> ArrayConfig:
         full_path = _normalize_dev(value.strip())
         if not os.path.exists(full_path) or not _is_block_device(full_path):
             continue
+
+        # rdevOffset is reported in 512-byte sectors on the raw device; it is
+        # 0 for unconfigured slots and >0 for every present raw rdev (typically
+        # 64 sectors = 32 KiB, leaving room for a partition table / boot loader
+        # at the start of the disk that backs the array partition). The chunk
+        # tree and btrfs metadata all see offsets relative to the array
+        # partition, so any direct access to the raw rdev must add this.
+        rdev_off_key = f'rdevOffset.{slot}'
+        rdev_off_sectors = int(values.get(rdev_off_key, '0') or '0')
+        config.rdev_offsets[full_path] = rdev_off_sectors * 512
 
         if slot == 0:
             config.parity_p = full_path
