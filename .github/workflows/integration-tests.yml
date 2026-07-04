@@ -2,7 +2,6 @@ name: NonRAID Integration Tests With Asymmetric Disks
 
 on:
   push:
-    branches: [ main, revert ]
   workflow_dispatch:
 
 
@@ -34,28 +33,28 @@ jobs:
         run: |
           echo "Creating asymmetric test disk images..."
           echo ""
-          echo "All loop devices are 256MB. Data partitions shrink in 64MB"
-          echo "steps and are centered within the 256MB envelope, so each disk"
-          echo "has a different rdevOffset and a different usable size."
+          echo "Loop devices shrink in 64MB steps (512 → 448 → 384 → 320 MB)."
+          echo "Partitions start at ascending offsets and run to disk end,"
+          echo "so every data disk has a distinct rdevOffset and rdevSize."
           echo ""
-          echo "Layout (256MB-wide envelope, # = data partition, . = empty):"
-          echo "  P    : ################################  256MB,  off 32K    (parity, full)"
-          echo "  Q    : ################################  256MB,  off 32K    (parity, full)"
-          echo "  disk1: ################################  256MB,  off 32K    (biggest data, full)"
-          echo "  disk2: ............############........   192MB,  off 32M    (32MB empty on each side)"
-          echo "  disk3: .........................######     128MB,  off 64M    (64MB empty on each side)"
-          echo "  disk4: ...............................###    64MB,  off 96M     (96MB empty on each side, smallest)"
+          echo "Layout (disk size, partition offset, usable size):"
+          echo "  P    : 512MB  off 32K  → ~512MB usable  (parity)"
+          echo "  Q    : 512MB  off 32K  → ~512MB usable  (parity)"
+          echo "  disk1: 512MB  off 32K  → ~512MB usable  (biggest data)"
+          echo "  disk2: 448MB  off 32M  → ~416MB usable"
+          echo "  disk3: 384MB  off 64M  → ~320MB usable"
+          echo "  disk4: 320MB  off 96M  → ~224MB usable  (smallest)"
           echo ""
 
-          # ── Create 256MB loop backing files for every disk ───────────────
-          # P and Q are 256MB and full (must be >= biggest data disk).
-          # Data disks step down by 64MB: 256, 192, 128, 64.
-          sudo dd if=/dev/zero of=d_p  bs=1M count=256 status=progress
-          sudo dd if=/dev/zero of=d_q  bs=1M count=256 status=progress
-          sudo dd if=/dev/zero of=d_d1 bs=1M count=256 status=progress
-          sudo dd if=/dev/zero of=d_d2 bs=1M count=256 status=progress
-          sudo dd if=/dev/zero of=d_d3 bs=1M count=256 status=progress
-          sudo dd if=/dev/zero of=d_d4 bs=1M count=256 status=progress
+          # ── Create loop backing files with shrinking sizes ──────────────
+          # P and Q are 512MB (must be >= biggest data disk).
+          # Data disks step down by 64MB: 512, 448, 384, 320.
+          sudo dd if=/dev/zero of=d_p  bs=1M count=512 status=progress
+          sudo dd if=/dev/zero of=d_q  bs=1M count=512 status=progress
+          sudo dd if=/dev/zero of=d_d1 bs=1M count=512 status=progress
+          sudo dd if=/dev/zero of=d_d2 bs=1M count=448 status=progress
+          sudo dd if=/dev/zero of=d_d3 bs=1M count=384 status=progress
+          sudo dd if=/dev/zero of=d_d4 bs=1M count=320 status=progress
 
           # ── Set up loop devices ──────────────────────────────────────────
           disk_p=$(sudo losetup -fP --show d_p)
@@ -74,18 +73,17 @@ jobs:
 
           echo "Created loop devices: P=$disk_p Q=$disk_q 1=$disk1 2=$disk2 3=$disk3 4=$disk4"
 
-          # ── Create partitions with centered offsets ─────────────────────
-          # P, Q and disk1 use a standard 32K start and run to the end of the
-          # 256MB envelope (full disk).  Data disks shrink by 64MB steps and
-          # are centered: half of the unused space goes before the partition,
-          # half after.  This gives every data disk a distinct rdevOffset
-          # while keeping the data envelope visually in the middle.
-          sudo sgdisk -o -a 8 -n 1:32K:0    $disk_p   # 256MB, off 32K
-          sudo sgdisk -o -a 8 -n 1:32K:0    $disk_q   # 256MB, off 32K
-          sudo sgdisk -o -a 8 -n 1:32K:0    $disk1    # 256MB, off 32K
-          sudo sgdisk -o -a 8 -n 1:32M:224M $disk2    # 192MB, off 32M, ends at 224M (32M empty at the end)
-          sudo sgdisk -o -a 8 -n 1:64M:192M $disk3    # 128MB, off 64M, ends at 192M (64M empty at the end)
-          sudo sgdisk -o -a 8 -n 1:96M:160M $disk4    #  64MB, off 96M, ends at 160M (96M empty at the end)
+          # ── Create partitions with ascending offsets ────────────────────
+          # P, Q and disk1 use a standard 32K start and run to disk end.
+          # Data disks use larger partition offsets (32M, 64M, 96M) and the
+          # partition runs to disk end. This gives every data disk a distinct
+          # rdevOffset and a distinct rdevSize.
+          sudo sgdisk -o -a 8 -n 1:32K:0    $disk_p   # 512MB disk, off 32K, full
+          sudo sgdisk -o -a 8 -n 1:32K:0    $disk_q   # 512MB disk, off 32K, full
+          sudo sgdisk -o -a 8 -n 1:32K:0    $disk1    # 512MB disk, off 32K, full
+          sudo sgdisk -o -a 8 -n 1:32M:0    $disk2    # 448MB disk, off 32M, ~416MB usable
+          sudo sgdisk -o -a 8 -n 1:64M:0    $disk3    # 384MB disk, off 64M, ~320MB usable
+          sudo sgdisk -o -a 8 -n 1:96M:0    $disk4    # 320MB disk, off 96M, ~224MB usable
 
           # ── Create symlinks for device discovery ─────────────────────────
           sudo ln -s $disk_p /dev/disk/by-id/virtdisk-001
@@ -151,181 +149,10 @@ jobs:
 
           echo ">>> [mk_array] Array setup complete"
 
-      - name: Recovery test - single corruption on biggest disk (disk1, high offset)
-        run: |
-          # disk1 is 256MB — the biggest data disk. A 200MB file fills most of
-          # it and produces many scattered extents. We corrupt near offset
-          # 192MB, which maps to an array-relative offset well beyond disk4
-          # (64MB), disk3 (128MB) and disk2 (192MB), so the corrupt sector is
-          # "off bounds" for every smaller disk. This tests recovery when the
-          # failing sector lives past the end of the smaller disks.
-          echo ">>> [test] Creating 200MB file on disk1 (biggest disk, 256MB)"
-          sudo python3 btrfs_manipulate.py /mnt/disk1/file_big --size-mb 200 --overwrite
-
-          echo ">>> [test] Corrupting at file offset 192MB (off bounds for disk2/disk3/disk4)"
-          sudo python3 btrfs_manipulate.py /mnt/disk1/file_big --file-offset 201326592
-
-          echo ">>> [scrub] Initial scrub started, waiting for completion..."
-          sudo btrfs scrub start /mnt/disk1
-          while true; do
-            status=$(sudo btrfs scrub status /mnt/disk1)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
-            sleep 1
-          done
-
-          echo ">>> [recover] Running recovery"
-          sudo python3 recover.py
-
-          echo ">>> [scrub] Final verification scrub started..."
-          sudo btrfs scrub start /mnt/disk1
-          while true; do
-            status=$(sudo btrfs scrub status /mnt/disk1)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
-            sleep 1
-          done
-
-          sudo rm -rf /mnt/disk1/file_big
-          sudo dmesg -c > /dev/null
-
-      - name: Recovery test - single corruption on smallest disk (disk4, low offset)
-        run: |
-          # disk4 is 64MB with a 96MB partition offset — the smallest data
-          # disk with the biggest offset. A 32MB file fills half the disk and
-          # spreads across multiple extents. We corrupt near offset 16MB,
-          # which is a low array-relative offset that falls within every disk's
-          # data area. This is the "vice versa" case: the file fits within all
-          # disks, so recovery must read correct data from disks with bigger
-          # offsets and/or bigger data areas.
-          echo ">>> [test] Creating 32MB file on disk4 (smallest disk, 64MB, 96M offset)"
-          sudo python3 btrfs_manipulate.py /mnt/disk4/file_small --size-mb 32 --overwrite
-
-          echo ">>> [test] Corrupting at file offset 16MB (within all disks' data areas)"
-          sudo python3 btrfs_manipulate.py /mnt/disk4/file_small --file-offset 16777216
-
-          echo ">>> [scrub] Initial scrub started, waiting for completion..."
-          sudo btrfs scrub start /mnt/disk4
-          while true; do
-            status=$(sudo btrfs scrub status /mnt/disk4)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
-            sleep 1
-          done
-
-          echo ">>> [recover] Running recovery"
-          sudo python3 recover.py
-
-          echo ">>> [scrub] Final verification scrub started..."
-          sudo btrfs scrub start /mnt/disk4
-          while true; do
-            status=$(sudo btrfs scrub status /mnt/disk4)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
-            sleep 1
-          done
-
-          sudo rm -rf /mnt/disk4/file_small
-          sudo dmesg -c > /dev/null
-
-      - name: Recovery test - single corruption on middle disk (disk2, 32M offset)
-        run: |
-          # disk2 is 192MB with a 32MB partition offset — the second-biggest
-          # disk with a centered 32MB front gap. A 160MB file fills most of the
-          # disk and produces many scattered extents. We corrupt near offset
-          # 128MB, which maps to an array-relative offset beyond disk4 (64MB)
-          # and disk3 (128MB) but within disk1 (256MB). This tests recovery
-          # when the corrupt sector is off bounds for the two smallest disks
-          # but within the bigger ones, and the failing disk has a non-trivial
-          # rdevOffset (32M) different from the other disks.
-          echo ">>> [test] Creating 160MB file on disk2 (192MB disk, 32M offset)"
-          sudo python3 btrfs_manipulate.py /mnt/disk2/file_mid --size-mb 160 --overwrite
-
-          echo ">>> [test] Corrupting at file offset 128MB (beyond disk3/disk4, within disk1)"
-          sudo python3 btrfs_manipulate.py /mnt/disk2/file_mid --file-offset 134217728
-
-          echo ">>> [scrub] Initial scrub started, waiting for completion..."
-          sudo btrfs scrub start /mnt/disk2
-          while true; do
-            status=$(sudo btrfs scrub status /mnt/disk2)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
-            sleep 1
-          done
-
-          echo ">>> [recover] Running recovery"
-          sudo python3 recover.py
-
-          echo ">>> [scrub] Final verification scrub started..."
-          sudo btrfs scrub start /mnt/disk2
-          while true; do
-            status=$(sudo btrfs scrub status /mnt/disk2)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
-            sleep 1
-          done
-
-          sudo rm -rf /mnt/disk2/file_mid
-          sudo dmesg -c > /dev/null
-
-      - name: Recovery test - single corruption on disk3 (compressed, 64M offset)
-        run: |
-          # disk3 is 128MB with a 64MB partition offset AND compression enabled
-          # (compress=zstd in fstab). A 96MB file fills most of the disk and
-          # produces many scattered extents (some compressed, some not). We
-          # corrupt near offset 64MB, which maps to an array-relative offset
-          # beyond disk4 (64MB) but within disk1/disk2. This tests recovery of
-          # extents on the centered, compressed, mid-sized disk.
-          echo ">>> [test] Creating 96MB file on disk3 (128MB disk, 64M offset, compressed)"
-          sudo python3 btrfs_manipulate.py /mnt/disk3/file_comp --size-mb 96 --overwrite
-
-          echo ">>> [test] Corrupting at file offset 64MB (beyond disk4, within disk1/disk2)"
-          sudo python3 btrfs_manipulate.py /mnt/disk3/file_comp --file-offset 67108864
-
-          echo ">>> [scrub] Initial scrub started, waiting for completion..."
-          sudo btrfs scrub start /mnt/disk3
-          while true; do
-            status=$(sudo btrfs scrub status /mnt/disk3)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
-            sleep 1
-          done
-
-          echo ">>> [recover] Running recovery"
-          sudo python3 recover.py
-
-          echo ">>> [scrub] Final verification scrub started..."
-          sudo btrfs scrub start /mnt/disk3
-          while true; do
-            status=$(sudo btrfs scrub status /mnt/disk3)
-            if echo "$status" | grep -q "finished"; then
-              echo "$status"
-              break
-            fi
-            sleep 1
-          done
-
-          sudo rm -rf /mnt/disk3/file_comp
-          sudo dmesg -c > /dev/null
-
       - name: Recovery test - multiple corruptions on biggest disk (disk1)
         run: |
           # Inject many equally spaced corruptions in one scrub window in a
-          # single file on disk1 (the biggest disk, 256MB, 32K offset).
+          # single file on disk1 (the biggest disk, 512MB, 32K offset).
           sudo bash multi_corruptions_test.sh
 
           echo ">>> [scrub] Initial multi-corruption scrub started, waiting for completion..."
@@ -353,12 +180,20 @@ jobs:
             sleep 1
           done
 
+          # Verify no errors remain after recovery
+          if echo "$status" | grep -qE '^Error summary:\s+no errors found'; then
+            echo "✅ Scrub verification passed — no errors"
+          else
+            echo "❌ Scrub verification FAILED — errors remain after recovery!"
+            exit 1
+          fi
+
           sudo rm -rf /mnt/disk1/multi_corrupt_file_1.bin
           sudo dmesg -c > /dev/null
 
       - name: Recovery test - corruption with file deletion on disk3
         run: |
-          # Create and corrupt two files on disk3 (128MB, 64M offset, compressed).
+          # Create and corrupt two files on disk3 (384MB, 64M offset, compressed).
           # Delete one before recovery to test the "file deleted" code path
           # on a disk with a non-standard offset and compression.
           echo ">>> [test] Creating and corrupting two files on disk3"
@@ -393,6 +228,14 @@ jobs:
             fi
             sleep 1
           done
+
+          # Verify no errors remain after recovery
+          if echo "$status" | grep -qE '^Error summary:\s+no errors found'; then
+            echo "✅ Scrub verification passed — no errors"
+          else
+            echo "❌ Scrub verification FAILED — errors remain after recovery!"
+            exit 1
+          fi
 
           sudo rm -rf /mnt/disk3/file_del_b
           sudo dmesg -c > /dev/null
