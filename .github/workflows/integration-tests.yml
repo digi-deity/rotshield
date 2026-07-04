@@ -151,9 +151,21 @@ jobs:
 
       - name: Recovery test - multiple corruptions on biggest disk (disk1)
         run: |
-          # Inject many equally spaced corruptions in one scrub window in a
-          # single file on disk1 (the biggest disk, 512MB, 32K offset).
-          sudo bash multi_corruptions_test.sh
+          # Inject many equally spaced corruptions on disk1 (biggest disk, 512MB, 32K offset).
+          # We create SEVERAL files to fill disk1, ensuring data extents span the full
+          # 512 MB array-relative range – well beyond disk2 (416 MB), disk3 (320 MB)
+          # and disk4 (224 MB).  This guarantees that some corrupt sectors land at
+          # offsets that are off-bounds for the smaller data disks, exercising the
+          # zero-pad short-read code path in recover.py.
+          FILE_SIZE=50                                 # each file is 50 MB
+          FILES=$(python3 -c 'print(max(3, 400 // 50))')   #
+          echo ">>> [multi] Creating ${FILES} × ${FILE_SIZE} MB files on /mnt/disk1 to fill ~${FILE_SIZE}×${FILES}=$((FILE_SIZE * FILES)) MB of the 512 MB disk"
+          for i in $(seq 1 "$FILES"); do
+            echo ">>> [multi] File $i/${FILES}"
+            LOGURU_LEVEL=ERROR \
+              FILES_COUNT=1 FILE_SIZE_MB="$FILE_SIZE" FILE_PREFIX="multi_corrupt_${i}" \
+              sudo -E bash multi_corruptions_test.sh
+          done
 
           echo ">>> [scrub] Initial multi-corruption scrub started, waiting for completion..."
           sudo btrfs scrub start /mnt/disk1
@@ -167,7 +179,7 @@ jobs:
           done
 
           echo ">>> [recover] Running recovery"
-          sudo python3 recover.py
+          LOGURU_LEVEL=ERROR sudo -E python3 recover.py
 
           echo ">>> [scrub] Final multi-corruption verification scrub started..."
           sudo btrfs scrub start /mnt/disk1
@@ -188,17 +200,17 @@ jobs:
             exit 1
           fi
 
-          sudo rm -rf /mnt/disk1/multi_corrupt_file_1.bin
+          sudo rm -rf /mnt/disk1/multi_corrupt_*.bin
           sudo dmesg -c > /dev/null
 
       - name: Recovery test - corruption with file deletion on disk3
         run: |
-          # Create and corrupt two files on disk3 (384MB, 64M offset, compressed).
-          # Delete one before recovery to test the "file deleted" code path
-          # on a disk with a non-standard offset and compression.
+          # Create and corrupt two files on disk3 (384MB disk, 64M offset, compressed,
+          # ~320MB usable).  Delete one before recovery to test the "file deleted" code
+          # path on a disk with a non-standard offset and compression.
           echo ">>> [test] Creating and corrupting two files on disk3"
-          sudo python3 btrfs_manipulate.py /mnt/disk3/file_del_a --size-mb 20 --overwrite
-          sudo python3 btrfs_manipulate.py /mnt/disk3/file_del_b --size-mb 20 --overwrite
+          sudo python3 btrfs_manipulate.py /mnt/disk3/file_del_a --size-mb 40 --overwrite
+          sudo python3 btrfs_manipulate.py /mnt/disk3/file_del_b --size-mb 40 --overwrite
 
           echo ">>> [scrub] Initial scrub started, waiting for completion..."
           sudo btrfs scrub start /mnt/disk3
@@ -216,7 +228,7 @@ jobs:
           sudo sync
 
           echo ">>> [recover] Running recovery"
-          sudo python3 recover.py
+          LOGURU_LEVEL=ERROR sudo -E python3 recover.py
 
           echo ">>> [scrub] Final verification scrub started..."
           sudo btrfs scrub start /mnt/disk3

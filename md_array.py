@@ -226,3 +226,26 @@ def resolve_devid_to_device(devid: int) -> str:
             f'refusing to proceed without a confirmed device mapping.'
         )
     return dev
+
+
+_NMD_PART_PATTERN = re.compile(r'nmd(\d+)p\d+$')
+
+
+def resolve_mount_dev_to_raw_rdev(mount_dev_path: str) -> str:
+    """Given an array partition device (e.g. /dev/nmd3p1), return the raw rdev
+    that backs it (e.g. /dev/loop4).
+
+    Parses the slot number from the partition name (nmd<N>p1 → N) and looks it
+    up in the array config.  Falls back to returning *mount_dev_path* unchanged
+    when no array config is present (standalone btrfs on a single disk).
+    """
+    config = get_array_config()
+    base = os.path.basename(mount_dev_path)
+    m = _NMD_PART_PATTERN.search(base)
+    if m:
+        slot = int(m.group(1))
+        dev = config.data_devs.get(slot)
+        if dev:
+            return dev
+    # Not an array partition or slot not found — assume standalone btrfs.
+    return mount_dev_path

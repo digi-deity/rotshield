@@ -75,7 +75,7 @@ from btrfs_recon.parsing import (
     lookup_csum,
 )
 from btrfs_recon.structure import ObjectId
-from md_array import find_mount_for_path, get_array_config, must_be_root, resolve_devid_to_device
+from md_array import find_mount_for_path, get_array_config, must_be_root, resolve_devid_to_device, resolve_mount_dev_to_raw_rdev
 
 # 1. Remove the default logger configuration
 logger.remove()
@@ -357,11 +357,11 @@ def main() -> None:
         logger.debug(f'Physical offset: {real_phys_offset} (0x{real_phys_offset:x})')
 
         # ───────────────────────────────────────────────────────────────────
-        # Step 2c — Translate btrfs devid → actual block device path
+        # Step 2c — Determine which raw rdev backs this array partition
         # ───────────────────────────────────────────────────────────────────
-        logger.info('=== Step 2c: Translate btrfs devid → actual block device path ===')
-        underlying_dev = resolve_devid_to_device(devid)
-        logger.info(f'Block device: {underlying_dev}')
+        logger.info('=== Step 2c: Map array partition → raw rdev ===')
+        underlying_dev = resolve_mount_dev_to_raw_rdev(mount_dev)
+        logger.info(f'Array partition: {mount_dev}  →  raw rdev: {underlying_dev}')
 
         # ───────────────────────────────────────────────────────────────────
         # Step 2d — Locate the stored checksum for the file's target data block
