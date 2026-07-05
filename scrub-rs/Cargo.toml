@@ -1,0 +1,22 @@
+[package]
+name = "scrub-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32c = "0.6"
+
+[lib]
+name = "scrub_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scrub-rs"
+path = "src/main.rs"
+
+[[bin]]
+name = "craft-corrupt"
+path = "src/bin/craft_corrupt.rs"
+
+[profile.release]
+opt-level = 3

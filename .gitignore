@@ -59,3 +59,10 @@ htmlcov/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Rust / Cargo
+target/
+Cargo.lock
+*.o
+*.so
+*.a
