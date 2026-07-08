@@ -19,17 +19,6 @@ use crate::recovery::model::{
     FailureReason, ParityPath, RecoveryInput, RecoveryResult,
 };
 
-/// Options controlling [`recover_block`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RecoverOpts {
-    /// If `true`, log what *would* be written but do not modify any disk.
-    /// Essential for testing — otherwise the corruption disappears and the
-    /// test becomes non-repeatable. The pure engine itself does no writing
-    /// at all; this flag is forwarded by the adapter so callers that *do*
-    /// write can respect it.
-    pub dry_run: bool,
-}
-
 /// Outcome of the Q-path reconstruction attempt (internal helper).
 enum QOutcome {
     /// Reconstructed block the verifier accepted.
@@ -56,7 +45,6 @@ enum QOutcome {
 pub fn recover_block(
     input: &RecoveryInput<'_>,
     block_size: usize,
-    _opts: RecoverOpts,
 ) -> RecoveryResult {
     // 1. Cheap sanity: the failing block already passes the verifier?  Then
     //    the scrub raced with a kernel rewrite — nothing to recover.  This
@@ -72,7 +60,7 @@ pub fn recover_block(
     //    candidate or a BakedIn indicator; only check the verifier if P
     //    actually produced something new.
     let p_reason: Option<FailureReason> = match input.p_block {
-        None => Some(FailureReason::Io("no primary parity (P) disk in array".into())),
+        None => Some(FailureReason::ParityAbsent { via: ParityPath::P }),
         Some(p_block) => {
             assert_eq!(p_block.len(), block_size, "p_block length mismatch");
             // Reject the all-zero XOR-pre-image as baked-in early: when P
@@ -102,7 +90,7 @@ pub fn recover_block(
     // 3. Q-only path (if Q is present).  Same structure as P, but using
     //    GF(2^8) reconstruction.
     let q_reason: Option<FailureReason> = match input.q_block {
-        None => Some(FailureReason::Io("no secondary parity (Q) disk in array".into())),
+        None => Some(FailureReason::ParityAbsent { via: ParityPath::Q }),
         Some(q_block) => {
             assert_eq!(q_block.len(), block_size, "q_block length mismatch");
             match recover_via_q(
@@ -127,10 +115,14 @@ pub fn recover_block(
     //    candidate; the verifier tells us which guess was right.
     let p_singleton = p_reason
         .clone()
-        .unwrap_or_else(|| FailureReason::Io("internal: P path returned no reason".into()));
+        .unwrap_or_else(|| FailureReason::InternalInconsistency(
+            "internal: P path returned no reason".into(),
+        ));
     let q_singleton = q_reason
         .clone()
-        .unwrap_or_else(|| FailureReason::Io("internal: Q path returned no reason".into()));
+        .unwrap_or_else(|| FailureReason::InternalInconsistency(
+            "internal: Q path returned no reason".into(),
+        ));
 
     if let (Some(p_block), Some(q_block)) = (input.p_block, input.q_block) {
         let mut partners_tried: Vec<u64> = Vec::new();
@@ -455,7 +447,7 @@ mod tests {
             verifier: &v,
         };
         expect_recovered(
-            recover_block(&input, BLOCK, RecoverOpts::default()),
+            recover_block(&input, BLOCK),
             ParityPath::P,
             &golden,
         );
@@ -482,7 +474,7 @@ mod tests {
             verifier: &v,
         };
         expect_recovered(
-            recover_block(&input, BLOCK, RecoverOpts::default()),
+            recover_block(&input, BLOCK),
             ParityPath::Q,
             &golden,
         );
@@ -509,7 +501,7 @@ mod tests {
             verifier: &v,
         };
         expect_recovered(
-            recover_block(&input, BLOCK, RecoverOpts::default()),
+            recover_block(&input, BLOCK),
             ParityPath::P,
             &golden,
         );
@@ -564,7 +556,7 @@ mod tests {
             verifier: &v,
         };
         expect_recovered(
-            recover_block(&input, BLOCK, RecoverOpts::default()),
+            recover_block(&input, BLOCK),
             ParityPath::PQ { partner_slot: partner },
             &golden,
         );
@@ -592,7 +584,7 @@ mod tests {
             q_block: Some(&q_baked),
             verifier: &v,
         };
-        match recover_block(&input, BLOCK, RecoverOpts::default()) {
+        match recover_block(&input, BLOCK) {
             RecoveryResult::Failed {
                 reason: FailureReason::AllPathsFailed { pq_partners_tried, .. },
             } => {
@@ -621,7 +613,7 @@ mod tests {
             verifier: &v,
         };
         assert!(matches!(
-            recover_block(&input, BLOCK, RecoverOpts::default()),
+            recover_block(&input, BLOCK),
             RecoveryResult::NotCorrupt
         ));
     }
@@ -648,7 +640,7 @@ mod tests {
             q_block: None,
             verifier: &v,
         };
-        match recover_block(&input, BLOCK, RecoverOpts::default()) {
+        match recover_block(&input, BLOCK) {
             RecoveryResult::Failed {
                 reason: FailureReason::NoQPathAndPFailed { .. },
             } => {}

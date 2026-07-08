@@ -113,13 +113,20 @@ pub enum FailureReason {
     /// because the caller may want to log it differently ("Q is burned,
     /// try the PQ path" vs "we got something different but wrong").
     ParityBakedIn { via: ParityPath },
-    /// I/O failure inside the array layer that assembled
-    /// [`RecoveryInput::other_blocks`] / parity — we surface the message
-    /// here so the caller can log it even though the pure engine itself
-    /// performs no I/O.  In practice this is filled in by the integration
-    /// glue in `main.rs` when its [`crate::array::stripe::gather_stripe`]
-    /// call fails to read a disk.
-    Io(String),
+    /// The array has no parity disk of the requested path (e.g. a
+    /// single-parity array with no Q disk, asked to attempt Q-only
+    /// recovery).  The pure engine itself performs no I/O, so it cannot
+    /// report I/O failures — but it *can* detect the input had no parity
+    /// chunk of a given sort, which is what this variant flags.  Distinct
+    /// from `CsumMismatch` / `ParityBakedIn` because "no parity to use"
+    /// is a *structural* reason, not a *reconstruction* failure.
+    ParityAbsent { via: ParityPath },
+    /// An internal contract assertion failed — e.g. a single-path branch
+    /// should always populate a `reason` but didn't.  This is the engine
+    /// being explicit that something invariant went wrong (a bug it wants
+    /// the caller to surface), rather than papers it with a phantom `Io`
+    /// reason.  Never produced for ordinary user-facing paths.
+    InternalInconsistency(String),
     /// Both single-parity paths (P and Q) failed *and* the PQ 2-disk
     /// solve with every candidate partner failed to verify.  `p_reason` /
     /// `q_reason` carry the single-path diagnostics; `pq_partners_tried`

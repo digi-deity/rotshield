@@ -155,7 +155,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
     // filesystem's checksum algorithm is fully encapsulated inside the
     // `verify` closure — main never imports crc32c and doesn't care what
     // bytes the csum is.
-    let (cfg, opts, scrub_slot) = if recover {
+    let (cfg, dry_run, scrub_slot) = if recover {
         let loaded = match array::config::load() {
             Ok(c) => c,
             Err(e) => {
@@ -174,10 +174,10 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
             return ExitCode::from(1);
         };
         println!("\nscrubbing{}:", if dry_run { " (dry-run recovery)" } else { " (WRITE recovery)" });
-        (Some(loaded), recovery::RecoverOpts { dry_run }, slot)
+        (Some(loaded), dry_run, slot)
     } else {
         println!("\nscrubbing:");
-        (None, recovery::RecoverOpts::default(), 0)
+        (None, true, 0)
     };
 
     // The two contract streams route through a single `ScrubCallbacks`
@@ -189,7 +189,11 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
     // closure); no checksum bytes, no algorithm names ever reach here.
     struct Driver {
         cfg: Option<array::config::ArrayConfig>,
-        opts: recovery::RecoverOpts,
+        /// Dry-run flag: when true, do not write recovered blocks back
+        /// to the failing disk.  Owned entirely by the integration glue —
+        /// the recovery engine is pure and the `RecoverOpts` struct used
+        /// to thread this through it was a dead parameter, now removed.
+        dry_run: bool,
         scrub_slot: u64,
         recovered_count: u64,
         failed_count: u64,
@@ -244,7 +248,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
                 q_block: stripe_chunks.q_block.as_deref(),
                 verifier: verifier.as_ref(),
             };
-            let result = recovery::recover_block(&input, block_size, self.opts);
+            let result = recovery::recover_block(&input, block_size);
             match &result {
                 recovery::RecoveryResult::Recovered { via, block } => {
                     let via_str = match via {
@@ -255,7 +259,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
                         }
                     };
                     let mut written = false;
-                    if !self.opts.dry_run {
+                    if !self.dry_run {
                         match array::stripe::write_block(
                             cfg,
                             failing_dev,
@@ -292,7 +296,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
     }
     let mut driver = Driver {
         cfg,
-        opts,
+        dry_run,
         scrub_slot,
         recovered_count: 0,
         failed_count: 0,
