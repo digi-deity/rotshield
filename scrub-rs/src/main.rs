@@ -133,7 +133,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
         println!("device        : {dev}");
         println!("base offset   : 0x{:x} ({})", base_offset, base_offset);
         println!("magic         : {:?}", sb.magic);
-        println!("fsid          : {}", hex(&sb.fsid));
+        println!("fsid          : {}", btrfs::util::hex(&sb.fsid));
         println!("bytenr        : 0x{:x}", sb.bytenr);
         println!("generation   : {}", sb.generation);
         println!("root          : 0x{:x}", sb.root);
@@ -334,10 +334,6 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
 /// Parse a byte offset from a string.  Accepts decimal, 0x-prefixed hex,

@@ -35,3 +35,20 @@ pub fn le_u64(buf: &[u8], pos: usize) -> u64 {
         buf[pos + 7],
     ])
 }
+
+/// Hex-encode `bytes` lowercase (4-byte btrfs crc32c becomes 8 hex chars;
+/// a 16-byte fsid becomes 32; a future ZFS 32-byte sha256 becomes 64).
+///
+/// Single home for the hex-format helper.  Previously both `main.rs` and
+/// `btrfs/scrub_driver.rs` carried their own copies.  Lives here (and not
+/// in a future `serde/format.rs`) because the only callers in this crate
+/// are formatting btrfs-owned fields (fsids, csum bytes) — the helper is
+/// adjacent to the btrfs byte-reading primitives it already pairs with.
+pub fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    use std::fmt::Write as _;
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}

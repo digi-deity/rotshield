@@ -149,11 +149,11 @@ impl FilesystemScrub for BtrfsScrub {
         let mut emit = |r: &crate::btrfs::scrub::SectorResult| {
             // 1. Log line (btrfs-owned format).
             let stored_tag = match r.stored_csum {
-                None => format!("actual=0x{} (no stored csum)", hex(&r.actual_csum)),
+                None => format!("actual=0x{} (no stored csum)", crate::btrfs::util::hex(&r.actual_csum)),
                 Some(stored) => format!(
                     "stored=0x{} actual=0x{}",
-                    hex(&stored),
-                    hex(&r.actual_csum),
+                    crate::btrfs::util::hex(&stored),
+                    crate::btrfs::util::hex(&r.actual_csum),
                 ),
             };
             let line = format!(
@@ -197,13 +197,3 @@ impl FilesystemScrub for BtrfsScrub {
     }
 }
 
-/// Hex-encode `bytes` lowercase (4-byte btrfs crc32c becomes 8 hex chars;
-/// a future ZFS 32-byte sha256 becomes 64).
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut s, "{b:02x}");
-    }
-    s
-}
