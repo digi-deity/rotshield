@@ -219,9 +219,14 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
                 return;
             };
             // rdevOffset stays internal to the array layer: read_block_or_zeros
-            // resolves it from `cfg` itself.  We only compute `raw_phys` here
-            // for log-line display; the recovery I/O functions take `array_phys`.
-            let raw_phys = ev.array_phys + cfg.raw_offset_for(failing_dev);
+            // / write_block resolve it from `cfg` themselves.  We only need a
+            // raw-rdev address for log-line display, and `cfg.raw_phys` is the
+            // single array-owned chokepoint that produces it — it folds the
+            // data_dev(slot) + raw_offset_for(dev) chain so we never reach
+            // into `rdev_offsets` from here.
+            let raw_phys = cfg.raw_phys(self.scrub_slot, ev.array_phys).expect(
+                "failing_dev was just verified to be a data disk, so raw_phys must resolve",
+            );
             let corrupt_block =
                 match array::stripe::read_block_or_zeros(cfg, failing_dev, ev.array_phys, block_size) {
                     Ok(b) => b,

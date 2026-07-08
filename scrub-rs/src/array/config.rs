@@ -100,6 +100,25 @@ impl ArrayConfig {
             (p_target == target).then_some(*slot)
         })
     }
+
+    /// Combine the two lookups callers previously chained —
+    /// `data_dev(slot)` then `raw_offset_for(dev)` then
+    /// `array_phys + offset` — into one helper.  Returns `None` if `slot`
+    /// isn't a data disk in the config; otherwise returns
+    /// `array_phys + rdevOffset` for that disk's raw rdev.
+    ///
+    /// The chokepoint for any caller that needs a raw-rdev byte offset
+    /// **for logging or other display purposes**.  The recovery I/O
+    /// functions ([`crate::array::stripe::read_block_or_zeros`],
+    /// [`crate::array::stripe::write_block`]) resolve the offset
+    /// internally — call sites that just want to `eprintln!` a raw-rdev
+    /// address go through here so `rdevOffset` never leaks out of the
+    /// array layer (Law of Demeter: don't reach into `rdev_offsets`
+    /// yourself).
+    pub fn raw_phys(&self, slot: u64, array_phys: u64) -> Option<u64> {
+        let dev = self.data_dev(slot)?;
+        Some(array_phys + self.raw_offset_for(dev))
+    }
 }
 
 /// Parse the NonRAID slot number out of a kernel-generated array-partition
