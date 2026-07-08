@@ -341,13 +341,17 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// Parse a byte offset from a string.  Accepts decimal, 0x-prefixed hex,
-/// and a `+`/`-` prefix for sector multiples (e.g. `+64` means 64 sectors
-/// of 512 bytes, matching how rdevOffset is reported in /proc/nmdstat).
+/// and a `+` prefix for sector multiples (e.g. `+64` means 64 sectors of
+/// 512 bytes, matching how rdevOffset is reported in /proc/nmdstat).
+///
+/// A leading `-` is rejected loudly — a negative byte offset makes no
+/// sense for a partition start, and silently turning it into `0` (the
+/// previous behaviour) hid typos instead of failing fast.
 fn parse_offset(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let (sign, rest) = match s.chars().next() {
         Some('+') => (1u64, &s[1..]),
-        Some('-') => (0u64, &s[1..]), // negative makes no sense here
+        Some('-') => return Err(format!("negative byte offsets are not allowed: {s:?}")),
         _ => (1u64, s),
     };
     let raw: u64 = if let Some(h) = rest.strip_prefix("0x") {
@@ -357,9 +361,9 @@ fn parse_offset(s: &str) -> Result<u64, String> {
         rest.parse::<u64>()
             .map_err(|e| format!("invalid decimal: {e}"))?
     };
-    // A leading `+`/`-` indicates the value is in 512-byte sectors
-    // (matching /proc/nmdstat's rdevOffset units).
-    let bytes = if s.starts_with('+') || s.starts_with('-') {
+    // Only a leading `+` indicates 512-byte-sector units (matching
+    // /proc/nmdstat's rdevOffset units); a plain integer is in bytes.
+    let bytes = if s.starts_with('+') {
         raw * 512
     } else {
         raw
