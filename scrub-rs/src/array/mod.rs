@@ -98,5 +98,6 @@
 //! opens the raw rdev directly for the same reason.
 
 pub mod config;
+pub mod parity;
 pub mod resolve;
 pub mod stripe;

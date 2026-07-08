@@ -16,15 +16,13 @@
 //! of this module — exactly the separation we already achieved for
 //! `array/` (chunk gathering) and `recovery/` (parity math).
 
-use std::fs::File;
 use std::io;
 
-use crate::btrfs::chunk::{ChunkMap, ChunkRecord};
+use crate::btrfs::chunk::ChunkMap;
 use crate::btrfs::csum::{build_csum_map, CsumMap};
 use crate::btrfs::extent::FileExtent;
 use crate::btrfs::key;
 use crate::btrfs::reader::FsReader;
-use crate::btrfs::root::RootItem;
 use crate::btrfs::scrub::scrub_extents;
 use crate::btrfs::superblock::{BTRFS_SECTOR_SIZE, Superblock};
 use crate::btrfs::tree::walk_leaves;
@@ -60,79 +58,28 @@ impl BtrfsScrub {
     /// KiB) for a whole-disk raw rdev like `/dev/loop2`.  All btrfs
     /// metadata addressing happens inside this constructor — the caller
     /// never sees a logical address or chunk record.
+    ///
+    /// The chunk-map/root-tree preamble is owned by [`crate::btrfs::open`];
+    /// this constructor takes the resulting [`BtrfsContext`], builds the
+    /// csum map, and collects FS-tree extents.  All three callers in the
+    /// crate (`BtrfsScrub`, `bin/craft_corrupt`, `main::resolve_cmd`) go
+    /// through the same `btrfs::open` so the chunk-map build never drifts.
     pub fn open(dev: &str, base_offset: u64) -> io::Result<Self> {
-        let mut fp = File::open(dev)?;
-
-        let superblock = Superblock::read(&mut fp, base_offset).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("error reading btrfs superblock: {e}"),
-            )
-        })?;
-
-        let sys_chunks = crate::btrfs::chunk::parse_sys_chunks(&superblock.sys_chunks);
-        let mut chunk_map = ChunkMap::default();
-        for rec in &sys_chunks {
-            chunk_map.insert(rec);
-        }
-
-        let mut reader = FsReader {
-            fp: File::open(dev)?,
-            node_size: superblock.node_size as usize,
-            base_offset,
-        };
-
-        // Walk the chunk tree to populate the rest of the chunk map.
-        let mut chunk_records: Vec<ChunkRecord> = Vec::new();
-        walk_leaves(&mut reader, &chunk_map, superblock.chunk_root, |_r, leaf, _logical| {
-            for i in 0..leaf.slots.len() {
-                let slot = leaf.slots[i];
-                if slot.key.ty == key::key_type::CHUNK_ITEM {
-                    let chunk = crate::btrfs::chunk::ChunkItem::parse(leaf.item_data(i));
-                    chunk_records.push(ChunkRecord {
-                        logical: slot.key.offset,
-                        chunk,
-                    });
-                }
-            }
-            Ok(())
-        })?;
-        for rec in &chunk_records {
-            chunk_map.insert(rec);
-        }
-
-        // Walk the root tree to find the FS_TREE and CSUM_TREE roots.
-        let mut fs_root: Option<u64> = None;
-        let mut csum_root: Option<u64> = None;
-        walk_leaves(&mut reader, &chunk_map, superblock.root, |_r, leaf, _logical| {
-            for i in 0..leaf.slots.len() {
-                let slot = leaf.slots[i];
-                if slot.key.ty == key::key_type::ROOT_ITEM {
-                    let ri = RootItem::parse(leaf.item_data(i));
-                    let objid = slot.key.objectid;
-                    if objid == btrfs_fs_tree_objectid() {
-                        fs_root = Some(ri.bytenr);
-                    } else if objid == btrfs_csum_tree_objectid() {
-                        csum_root = Some(ri.bytenr);
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        let fs_root = fs_root.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "FS_TREE root not found in btrfs root tree")
-        })?;
-        let csum_root = csum_root.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "CSUM_TREE root not found in btrfs root tree")
-        })?;
+        let ctx = crate::btrfs::open(dev, base_offset)?;
+        let crate::btrfs::BtrfsContext {
+            mut reader,
+            chunk_map,
+            superblock,
+            roots,
+        } = ctx;
 
         // Build the checksum map from the CSUM tree.
         let mut csum_map = CsumMap::new();
-        build_csum_map(&mut reader, &chunk_map, csum_root, &mut csum_map)?;
+        build_csum_map(&mut reader, &chunk_map, roots.csum_root, &mut csum_map)?;
 
         // Walk the FS tree and collect all REGULAR data extents.
         let mut extents: Vec<FileExtent> = Vec::new();
-        walk_leaves(&mut reader, &chunk_map, fs_root, |_r, leaf, _logical| {
+        walk_leaves(&mut reader, &chunk_map, roots.fs_root, |_r, leaf, _logical| {
             for i in 0..leaf.slots.len() {
                 let slot = leaf.slots[i];
                 if slot.key.ty == key::key_type::EXTENT_DATA {
@@ -175,18 +122,6 @@ impl BtrfsScrub {
     pub fn extent_bytes(&self) -> u64 {
         self.extents.iter().map(|e| e.num_bytes).sum()
     }
-}
-
-/// btrfs's `FS_TREE` objectid (`5`) — wrapped in a fn so we don't bleed a
-/// specific constant name from `btrfs::key` out into this doc; the impl
-/// is the only caller.
-fn btrfs_fs_tree_objectid() -> u64 {
-    key::objectid::FS_TREE
-}
-
-/// btrfs's `CSUM_TREE` objectid (`7`).
-fn btrfs_csum_tree_objectid() -> u64 {
-    key::objectid::CSUM_TREE
 }
 
 impl FilesystemScrub for BtrfsScrub {

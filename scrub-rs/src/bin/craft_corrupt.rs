@@ -48,13 +48,12 @@
 //! to locate the file's extents — no subprocess or Python dependency.
 
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use scrub_rs::array::config;
 use scrub_rs::btrfs;
-use scrub_rs::recovery::gf;
 
 const BLOCK: usize = btrfs::superblock::BTRFS_SECTOR_SIZE as usize;
 
@@ -221,9 +220,13 @@ fn usage() {
 
 // --- btrfs extent lookup ---------------------------------------------------
 
-/// Walk the chunk tree and root tree to build the chunk map and find the
-/// FS_TREE / CSUM_TREE roots.  Mirrors the setup in `main.rs` but factored
-/// out so utility binaries can reuse it.
+/// A btrfs filesystem opened for the corruption-crafting utility, wrapping
+/// the shared [`btrfs::open`] result so the FS-tree walk (`find_file_sector`)
+/// can keep borrowing `reader` and `chunk_map` mutably/immutably.
+///
+/// `csum_root` and `sb` are carried because [`btrfs::open`] locates them
+/// anyway; they're unused by this binary today but cheaper to keep than to
+/// re-open the device a second time.
 struct FsContext {
     reader: btrfs::reader::FsReader,
     chunk_map: btrfs::chunk::ChunkMap,
@@ -235,64 +238,17 @@ struct FsContext {
 }
 
 /// Open `dev` (an array partition or a raw image) and build the chunk map
-/// + locate the FS/CSUM tree roots.  `base_offset` is 0 for an array
-/// partition; pass the rdevOffset for a whole-disk image.
+/// + locate the FS/CSUM tree roots via the shared [`btrfs::open`].  The
+/// chunk-map / root-tree walk is owned there now — this binary no longer
+/// carries its own copy.
 fn open_fs(dev: &str, base_offset: u64) -> io::Result<FsContext> {
-    let mut fp = fs::File::open(dev)?;
-    let sb = btrfs::Superblock::read(&mut fp, base_offset)?;
-    let sys_chunks = btrfs::chunk::parse_sys_chunks(&sb.sys_chunks);
-    let mut chunk_map = btrfs::chunk::ChunkMap::default();
-    for rec in &sys_chunks {
-        chunk_map.insert(rec);
-    }
-    let mut reader = btrfs::reader::FsReader {
-        fp: fs::File::open(dev)?,
-        node_size: sb.node_size as usize,
-        base_offset,
-    };
-    // Walk the chunk tree to populate the rest of the chunk map.
-    let mut chunk_records: Vec<btrfs::chunk::ChunkRecord> = Vec::new();
-    btrfs::tree::walk_leaves(&mut reader, &chunk_map, sb.chunk_root, |_r, leaf, _logical| {
-        for i in 0..leaf.slots.len() {
-            let slot = leaf.slots[i];
-            if slot.key.ty == btrfs::key::key_type::CHUNK_ITEM {
-                let chunk = btrfs::chunk::ChunkItem::parse(leaf.item_data(i));
-                chunk_records.push(btrfs::chunk::ChunkRecord {
-                    logical: slot.key.offset,
-                    chunk,
-                });
-            }
-        }
-        Ok(())
-    })?;
-    for rec in &chunk_records {
-        chunk_map.insert(rec);
-    }
-
-    // Walk the root tree to find FS_TREE and CSUM_TREE roots.
-    let mut fs_root: Option<u64> = None;
-    let mut csum_root: Option<u64> = None;
-    btrfs::tree::walk_leaves(&mut reader, &chunk_map, sb.root, |_r, leaf, _logical| {
-        for i in 0..leaf.slots.len() {
-            let slot = leaf.slots[i];
-            if slot.key.ty == btrfs::key::key_type::ROOT_ITEM {
-                let ri = btrfs::root::RootItem::parse(leaf.item_data(i));
-                match slot.key.objectid {
-                    btrfs::key::objectid::FS_TREE => fs_root = Some(ri.bytenr),
-                    btrfs::key::objectid::CSUM_TREE => csum_root = Some(ri.bytenr),
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    })?;
+    let ctx = btrfs::open(dev, base_offset)?;
     Ok(FsContext {
-        reader,
-        chunk_map,
-        fs_root: fs_root.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "FS_TREE not found"))?,
-        csum_root: csum_root
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "CSUM_TREE not found"))?,
-        sb,
+        reader: ctx.reader,
+        chunk_map: ctx.chunk_map,
+        fs_root: ctx.roots.fs_root,
+        csum_root: ctx.roots.csum_root,
+        sb: ctx.superblock,
     })
 }
 
@@ -351,83 +307,12 @@ fn find_file_sector(ctx: &mut FsContext, sector: usize) -> io::Result<(u64, u64,
 }
 
 // --- raw-rdev I/O ----------------------------------------------------------
-
-fn read_block(dev_path: &Path, array_phys: u64, cfg: &config::ArrayConfig) -> io::Result<Vec<u8>> {
-    let raw_phys = array_phys + cfg.raw_offset_for(dev_path);
-    let mut f = match fs::File::open(dev_path) {
-        Ok(f) => f,
-        Err(e)
-            if e.kind() == io::ErrorKind::NotFound
-                || e.kind() == io::ErrorKind::PermissionDenied =>
-        {
-            return Ok(vec![0u8; BLOCK]);
-        }
-        Err(e) => return Err(e),
-    };
-    if let Err(e) = f.seek(SeekFrom::Start(raw_phys)) {
-        if e.kind() == io::ErrorKind::InvalidInput {
-            return Ok(vec![0u8; BLOCK]);
-        }
-        return Err(e);
-    }
-    let mut buf = vec![0u8; BLOCK];
-    match f.read(&mut buf) {
-        Ok(_) => Ok(buf),
-        Err(e)
-            if e.kind() == io::ErrorKind::UnexpectedEof
-                || e.kind() == io::ErrorKind::InvalidInput =>
-        {
-            Ok(buf)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn write_block(
-    dev_path: &Path,
-    array_phys: u64,
-    cfg: &config::ArrayConfig,
-    data: &[u8],
-) -> io::Result<()> {
-    let raw_phys = array_phys + cfg.raw_offset_for(dev_path);
-    let mut f = fs::OpenOptions::new().read(true).write(true).open(dev_path)?;
-    f.seek(SeekFrom::Start(raw_phys))?;
-    f.write_all(data)?;
-    f.flush()?;
-    f.sync_all()?;
-    Ok(())
-}
-
-fn xor_inplace(a: &mut [u8], b: &[u8]) {
-    debug_assert_eq!(a.len(), b.len());
-    for (x, y) in a.iter_mut().zip(b.iter()) {
-        *x ^= *y;
-    }
-}
-
-/// Compute the Q syndrome for one stripe: Q = XOR_{j} g^(j-1) * D_j.
-fn compute_q(cfg: &config::ArrayConfig, array_phys: u64) -> io::Result<Vec<u8>> {
-    let mut q = vec![0u8; BLOCK];
-    for (slot, path) in &cfg.data_devs {
-        let coef = gf::gf_exp(*slot as i32 - 1);
-        let block = read_block(path, array_phys, cfg)?;
-        let table = &gf::GFMUL[coef as usize];
-        for (q_byte, d_byte) in q.iter_mut().zip(block.iter()) {
-            *q_byte ^= table[*d_byte as usize];
-        }
-    }
-    Ok(q)
-}
-
-/// Compute P = XOR of all data disks at `array_phys`.
-fn compute_p(cfg: &config::ArrayConfig, array_phys: u64) -> io::Result<Vec<u8>> {
-    let mut p = vec![0u8; BLOCK];
-    for (_slot, path) in &cfg.data_devs {
-        let block = read_block(path, array_phys, cfg)?;
-        xor_inplace(&mut p, &block);
-    }
-    Ok(p)
-}
+// Reads/writes go through `array::stripe`; parity syndromes through
+// `array::parity`.  This binary used to carry its own copies of all of
+// these — the shared versions resolve `rdevOffset` from `cfg` internally,
+// so call sites pass `(cfg, path, array_phys)` and stay out of the
+// per-disk header business.  No local parity helpers remain — every XOR
+// lives in `array::parity` now.
 
 fn drop_caches() {
     if let Ok(mut f) = fs::OpenOptions::new()
@@ -472,8 +357,9 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
         dev_path.display()
     );
 
-    // 2. Read the original block and the parity disks.
-    let orig = read_block(&dev_path, array_phys, &cfg)?;
+    // 2. Read the original block and the parity disks (raw-rdev paths
+    //    resolved by the array layer; `block_size` = the btrfs sector size).
+    let orig = scrub_rs::array::stripe::read_block_or_zeros(&cfg, &dev_path, array_phys, BLOCK)?;
     let orig_csum = crc32c::crc32c(&orig);
     let p_path = cfg
         .parity_p
@@ -483,12 +369,12 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
         .parity_q
         .as_ref()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Q disk"))?;
-    let p_before = read_block(p_path, array_phys, &cfg)?;
-    let q_before = read_block(q_path, array_phys, &cfg)?;
+    let p_before = scrub_rs::array::stripe::read_block_or_zeros(&cfg, p_path, array_phys, BLOCK)?;
+    let q_before = scrub_rs::array::stripe::read_block_or_zeros(&cfg, q_path, array_phys, BLOCK)?;
 
     // 3. Sanity: P and Q must currently be consistent with the original data.
-    let p_expected = compute_p(&cfg, array_phys)?;
-    let q_expected = compute_q(&cfg, array_phys)?;
+    let p_expected = scrub_rs::array::parity::compute_p(&cfg, array_phys, BLOCK)?;
+    let q_expected = scrub_rs::array::parity::compute_q(&cfg, array_phys, BLOCK)?;
     if p_before != p_expected {
         eprintln!("warning: P does not match XOR(data) — array P not in sync, test may be meaningless");
     }
@@ -535,7 +421,7 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
             ));
         };
         let p_path = p_path.to_path_buf();
-        let p_orig = read_block(&p_path, array_phys, &cfg)?;
+        let p_orig = scrub_rs::array::stripe::read_block_or_zeros(&cfg, &p_path, array_phys, BLOCK)?;
         // Flip a different byte on the partner so the two corruptions are
         // genuinely independent.
         let mut p_corrupt = p_orig.clone();
@@ -572,60 +458,29 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
             (p_before.clone(), q_before.clone())
         }
         Targets::BakeP => {
-            let mut p = corrupt.clone();
-            for (slot, path) in &cfg.data_devs {
-                if *slot == devid {
-                    continue;
-                }
-                let b = read_block(path, array_phys, &cfg)?;
-                xor_inplace(&mut p, &b);
-            }
+            // P recomputed from the corrupt data block — the array-driver's
+            // "I just saw a write and resynced" perspective.  Recovery's
+            // P-only path then yields the corrupt bytes back (baked in).
+            let p = scrub_rs::array::parity::compute_p_with_override(
+                &cfg, devid, &corrupt, array_phys, BLOCK,
+            )?;
             println!("  targets=bake-p: P recomputed from corrupt data (P-only recovery will FAIL); Q intact");
             (p, q_before.clone())
         }
         Targets::BakeQ => {
-            let mut q = vec![0u8; BLOCK];
-            for (slot, path) in &cfg.data_devs {
-                let block_owned;
-                let block: &[u8] = if *slot == devid {
-                    &corrupt[..]
-                } else {
-                    block_owned = read_block(path, array_phys, &cfg)?;
-                    &block_owned[..]
-                };
-                let coef = gf::gf_exp(*slot as i32 - 1);
-                let table = &gf::GFMUL[coef as usize];
-                for (q_byte, d_byte) in q.iter_mut().zip(block.iter()) {
-                    *q_byte ^= table[*d_byte as usize];
-                }
-            }
+            let q = scrub_rs::array::parity::compute_q_with_override(
+                &cfg, devid, &corrupt, array_phys, BLOCK,
+            )?;
             println!("  targets=bake-q: Q recomputed from corrupt data (Q-only recovery will FAIL); P intact");
             (p_before.clone(), q)
         }
         Targets::BakeBoth => {
-            let mut p = corrupt.clone();
-            for (slot, path) in &cfg.data_devs {
-                if *slot == devid {
-                    continue;
-                }
-                let b = read_block(path, array_phys, &cfg)?;
-                xor_inplace(&mut p, &b);
-            }
-            let mut q = vec![0u8; BLOCK];
-            for (slot, path) in &cfg.data_devs {
-                let block_owned;
-                let block: &[u8] = if *slot == devid {
-                    &corrupt[..]
-                } else {
-                    block_owned = read_block(path, array_phys, &cfg)?;
-                    &block_owned[..]
-                };
-                let coef = gf::gf_exp(*slot as i32 - 1);
-                let table = &gf::GFMUL[coef as usize];
-                for (q_byte, d_byte) in q.iter_mut().zip(block.iter()) {
-                    *q_byte ^= table[*d_byte as usize];
-                }
-            }
+            let p = scrub_rs::array::parity::compute_p_with_override(
+                &cfg, devid, &corrupt, array_phys, BLOCK,
+            )?;
+            let q = scrub_rs::array::parity::compute_q_with_override(
+                &cfg, devid, &corrupt, array_phys, BLOCK,
+            )?;
             println!("  targets=bake-both: P and Q both recomputed from corrupt data (NEITHER single-parity path can recover)");
             (p, q)
         }
@@ -649,15 +504,15 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
 
     // 7. Write corrupt data + (optionally) recomputed P/Q + (two-disk)
     //    the corrupt partner block.
-    write_block(&dev_path, array_phys, &cfg, &corrupt)?;
+    scrub_rs::array::stripe::write_block(&cfg, &dev_path, array_phys, &corrupt)?;
     if new_p != p_before {
-        write_block(p_path, array_phys, &cfg, &new_p)?;
+        scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, &new_p)?;
     }
     if new_q != q_before {
-        write_block(q_path, array_phys, &cfg, &new_q)?;
+        scrub_rs::array::stripe::write_block(&cfg, q_path, array_phys, &new_q)?;
     }
     if let Some((p_slot, p_path, _p_orig, p_corrupt)) = &partner {
-        write_block(p_path, array_phys, &cfg, p_corrupt)?;
+        scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, p_corrupt)?;
         println!("  wrote corrupt block to partner slot {p_slot} ({})", p_path.display());
     }
 
@@ -729,7 +584,7 @@ fn restore_cmd(dev: &str, _file_path: &str, backup: &Path, opts: &Opts) -> ExitC
     // Write original data back, then recompute P and Q from the restored
     // data so the array is fully consistent again.  Also restore the
     // partner block if a partner backup exists (two-disk undo restore).
-    if let Err(e) = write_block(dev_path, array_phys, &cfg, &orig) {
+    if let Err(e) = scrub_rs::array::stripe::write_block(&cfg, dev_path, array_phys, &orig) {
         eprintln!("error writing restored block: {e}");
         return ExitCode::from(1);
     }
@@ -757,12 +612,12 @@ fn restore_cmd(dev: &str, _file_path: &str, backup: &Path, opts: &Opts) -> ExitC
             if *slot == devid {
                 continue;
             }
-            let cur = match read_block(p_path, array_phys, &cfg) {
+            let cur = match scrub_rs::array::stripe::read_block_or_zeros(&cfg, p_path, array_phys, BLOCK) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
             if cur.len() == BLOCK && cur != p_orig {
-                if let Err(e) = write_block(p_path, array_phys, &cfg, &p_orig) {
+                if let Err(e) = scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, &p_orig) {
                     eprintln!("error restoring partner block on slot {slot}: {e}");
                     return ExitCode::from(1);
                 }
@@ -771,14 +626,14 @@ fn restore_cmd(dev: &str, _file_path: &str, backup: &Path, opts: &Opts) -> ExitC
             }
         }
     }
-    let p = match compute_p(&cfg, array_phys) {
+    let p = match scrub_rs::array::parity::compute_p(&cfg, array_phys, BLOCK) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error computing P: {e}");
             return ExitCode::from(1);
         }
     };
-    let q = match compute_q(&cfg, array_phys) {
+    let q = match scrub_rs::array::parity::compute_q(&cfg, array_phys, BLOCK) {
         Ok(q) => q,
         Err(e) => {
             eprintln!("error computing Q: {e}");
@@ -786,13 +641,13 @@ fn restore_cmd(dev: &str, _file_path: &str, backup: &Path, opts: &Opts) -> ExitC
         }
     };
     if let Some(p_path) = cfg.parity_p.as_ref() {
-        if let Err(e) = write_block(p_path, array_phys, &cfg, &p) {
+        if let Err(e) = scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, &p) {
             eprintln!("error writing P: {e}");
             return ExitCode::from(1);
         }
     }
     if let Some(q_path) = cfg.parity_q.as_ref() {
-        if let Err(e) = write_block(q_path, array_phys, &cfg, &q) {
+        if let Err(e) = scrub_rs::array::stripe::write_block(&cfg, q_path, array_phys, &q) {
             eprintln!("error writing Q: {e}");
             return ExitCode::from(1);
         }

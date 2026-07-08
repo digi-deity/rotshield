@@ -15,7 +15,6 @@ use scrub_rs::fs::FilesystemScrub;
 use scrub_rs::recovery;
 
 use std::env;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -395,50 +394,16 @@ fn dump_array() -> ExitCode {
 /// raw-rdev location via the chunk map + array config.  Cross-check against
 /// the Python `find_physical_offset` + `raw_offset_for` reference.
 fn resolve_cmd(device: &str, logical: u64) -> ExitCode {
-    let mut fp = match File::open(device) {
-        Ok(f) => f,
+    // The chunk-map / root-tree preamble is owned by `btrfs::open`; this
+    // debug subcommand reuses it rather than carrying its own copy with
+    // an `expect("reopen")` band-aid.
+    let chunk_map = match btrfs::open(device, 0) {
+        Ok(ctx) => ctx.chunk_map,
         Err(e) => {
-            eprintln!("error opening {device}: {e}");
+            eprintln!("error opening btrfs filesystem on {device}: {e}");
             return ExitCode::from(1);
         }
     };
-    let sb = match btrfs::Superblock::read(&mut fp, 0) {
-        Ok(sb) => sb,
-        Err(e) => {
-            eprintln!("error reading superblock: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let sys_chunks = btrfs::chunk::parse_sys_chunks(&sb.sys_chunks);
-    let mut chunk_map = btrfs::chunk::ChunkMap::default();
-    for rec in &sys_chunks {
-        chunk_map.insert(rec);
-    }
-    let mut reader = btrfs::reader::FsReader {
-        fp: File::open(device).expect("reopen"),
-        node_size: sb.node_size as usize,
-        base_offset: 0,
-    };
-    let mut chunk_records: Vec<btrfs::chunk::ChunkRecord> = Vec::new();
-    if let Err(e) = btrfs::tree::walk_leaves(&mut reader, &chunk_map, sb.chunk_root, |_r, leaf, _logical| {
-        for i in 0..leaf.slots.len() {
-            let slot = leaf.slots[i];
-            if slot.key.ty == btrfs::key::key_type::CHUNK_ITEM {
-                let chunk = btrfs::chunk::ChunkItem::parse(leaf.item_data(i));
-                chunk_records.push(btrfs::chunk::ChunkRecord {
-                    logical: slot.key.offset,
-                    chunk,
-                });
-            }
-        }
-        Ok(())
-    }) {
-        eprintln!("error walking chunk tree: {e}");
-        return ExitCode::from(1);
-    }
-    for rec in &chunk_records {
-        chunk_map.insert(rec);
-    }
 
     let cfg = match array::config::load() {
         Ok(c) => c,
@@ -448,7 +413,6 @@ fn resolve_cmd(device: &str, logical: u64) -> ExitCode {
         }
     };
 
-    // resolve_cmd: translate a btrfs logical address to a raw-rdev location.
     // The btrfs chunk map does logical→(devid, array_phys); the array config
     // does (devid, array_phys)→(raw_rdev_path, raw_phys).  Two clean steps.
     let (devid, array_phys) = match chunk_map.lookup(logical) {
