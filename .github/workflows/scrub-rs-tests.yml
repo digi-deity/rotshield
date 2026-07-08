@@ -54,6 +54,8 @@ jobs:
           ./target/release/scrub-rs --dump-array || true
           # Add both scrub-rs and craft-corrupt to PATH so tests can call them directly
           echo "$PWD/target/release" >> "$GITHUB_PATH"
+          # Also export the full path so sudo invocations can use the absolute path
+          echo "SCRUB_RS_DIR=$PWD/target/release" >> "$GITHUB_ENV"
           cd ..
 
       - name: Create asymmetric test disk images
@@ -174,15 +176,15 @@ jobs:
         run: |
           sudo dd if=/dev/urandom of=/mnt/disk1/testA bs=4096 count=32 conv=fdatasync
           sync
-          sudo craft-corrupt /dev/nmd1p1 /testA --targets data --backup /tmp/backupA.bin
+          sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd1p1 /testA --targets data --backup /tmp/backupA.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo scrub-rs /dev/loop2 --offset +64 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover --write 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via P" || { echo "::error::expected RECOVERED via P"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo scrub-rs /dev/loop2 --offset +64 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk1 still has mismatches after recovery"; exit 1; }
 
@@ -195,15 +197,15 @@ jobs:
         run: |
           sudo dd if=/dev/urandom of=/mnt/disk2/testB bs=4096 count=32 conv=fdatasync
           sync
-          sudo craft-corrupt /dev/nmd2p1 /testB --targets bake-p --backup /tmp/backupB.bin
+          sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd2p1 /testB --targets bake-p --backup /tmp/backupB.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo scrub-rs /dev/loop3 --offset +65536 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop3 --offset +65536 --recover --write 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via Q" || { echo "::error::expected RECOVERED via Q"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo scrub-rs /dev/loop3 --offset +65536 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop3 --offset +65536 --recover 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk2 still has mismatches after recovery"; exit 1; }
 
@@ -211,7 +213,7 @@ jobs:
           # the disk itself — resync P+Q from clean data before the next
           # test so it doesn't inherit a stale P. See session notes:
           # recover_sector deliberately never rewrites parity.
-          sudo craft-corrupt --restore /tmp/backupB.bin /dev/nmd2p1 /testB
+          sudo "$SCRUB_RS_DIR/craft-corrupt" --restore /tmp/backupB.bin /dev/nmd2p1 /testB
           sudo rm -f /mnt/disk2/testB
 
       # ---------------------------------------------------------------
@@ -221,21 +223,21 @@ jobs:
         run: |
           sudo dd if=/dev/urandom of=/mnt/disk3/testC bs=4096 count=32 conv=fdatasync
           sync
-          sudo craft-corrupt /dev/nmd3p1 /testC --targets bake-q --backup /tmp/backupC.bin
+          sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd3p1 /testC --targets bake-q --backup /tmp/backupC.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo scrub-rs /dev/loop4 --offset +131072 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop4 --offset +131072 --recover --write 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via P" || { echo "::error::expected RECOVERED via P"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo scrub-rs /dev/loop4 --offset +131072 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop4 --offset +131072 --recover 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk3 still has mismatches after recovery"; exit 1; }
 
           # bake-q leaves Q stale after P fixes the disk — resync before
           # the next test (see Test B's comment).
-          sudo craft-corrupt --restore /tmp/backupC.bin /dev/nmd3p1 /testC
+          sudo "$SCRUB_RS_DIR/craft-corrupt" --restore /tmp/backupC.bin /dev/nmd3p1 /testC
           sudo rm -f /mnt/disk3/testC
 
       # ---------------------------------------------------------------
@@ -251,15 +253,15 @@ jobs:
         run: |
           sudo dd if=/dev/urandom of=/mnt/disk4/testD bs=4096 count=32 conv=fdatasync
           sync
-          sudo craft-corrupt /dev/nmd4p1 /testD --targets bake-both --backup /tmp/backupD.bin
+          sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd4p1 /testD --targets bake-both --backup /tmp/backupD.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo scrub-rs /dev/loop5 --offset +196608 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop5 --offset +196608 --recover --write 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "AllPathsFailed" || { echo "::error::expected AllPathsFailed (this is the known-unverified case — see repo memory)"; exit 1; }
 
           # Nothing should have been written (recovery declined to guess).
-          sudo craft-corrupt --restore /tmp/backupD.bin /dev/nmd4p1 /testD
+          sudo "$SCRUB_RS_DIR/craft-corrupt" --restore /tmp/backupD.bin /dev/nmd4p1 /testD
           sudo rm -f /mnt/disk4/testD
 
       # ---------------------------------------------------------------
@@ -278,20 +280,20 @@ jobs:
         run: |
           sudo dd if=/dev/urandom of=/mnt/disk1/testE bs=4096 count=32 conv=fdatasync
           sync
-          sudo craft-corrupt /dev/nmd1p1 /testE --targets two-disk --partner 2 --backup /tmp/backupE.bin
+          sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd1p1 /testE --targets two-disk --partner 2 --backup /tmp/backupE.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo scrub-rs /dev/loop2 --offset +64 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover --write 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via PQ(partner=slot 2)" || { echo "::error::expected RECOVERED via PQ(partner=slot 2) (known-unverified case)"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo scrub-rs /dev/loop2 --offset +64 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk1 still has mismatches after PQ recovery"; exit 1; }
 
           # Restores BOTH disk1 and its partner (disk2) and resyncs P+Q.
-          sudo craft-corrupt --restore /tmp/backupE.bin /dev/nmd1p1 /testE
+          sudo "$SCRUB_RS_DIR/craft-corrupt" --restore /tmp/backupE.bin /dev/nmd1p1 /testE
           sudo rm -f /mnt/disk1/testE
 
       # ---------------------------------------------------------------
@@ -314,19 +316,19 @@ jobs:
           # sector = 250MB / 4096, comfortably past disk4's usable size and
           # inside the 260MB file.
           SECTOR=$((250*1024*1024/4096))
-          sudo craft-corrupt /dev/nmd1p1 /testF --sector "$SECTOR" --targets bake-p --backup /tmp/backupF.bin
+          sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd1p1 /testF --sector "$SECTOR" --targets bake-p --backup /tmp/backupF.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo scrub-rs /dev/loop2 --offset +64 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover --write 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via Q" || { echo "::error::expected RECOVERED via Q (known-unverified zero-pad case)"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo scrub-rs /dev/loop2 --offset +64 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk1 still has mismatches after zero-pad recovery"; exit 1; }
 
-          sudo craft-corrupt --restore /tmp/backupF.bin /dev/nmd1p1 /testF
+          sudo "$SCRUB_RS_DIR/craft-corrupt" --restore /tmp/backupF.bin /dev/nmd1p1 /testF
           sudo rm -f /mnt/disk1/testF
 
       - name: Cleanup
