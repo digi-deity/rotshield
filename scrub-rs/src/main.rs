@@ -10,6 +10,9 @@
 
 use scrub_rs::array;
 use scrub_rs::btrfs;
+use scrub_rs::fs;
+use scrub_rs::fs::FilesystemScrub;
+use scrub_rs::recovery;
 
 use std::env;
 use std::fs::File;
@@ -116,283 +119,212 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
         }
     }
 
-    let mut fp = match File::open(&dev) {
-        Ok(f) => f,
+    // `BtrfsScrub::open` opens the device itself; we don't need a separate
+    // File handle here anymore (the old code peeked the superblock first).
+    let mut scrub = match btrfs::BtrfsScrub::open(&dev, base_offset) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("error opening {dev}: {e}");
+            eprintln!("error opening btrfs filesystem: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let sb = scrub.superblock();
+
+    {
+        println!("device        : {dev}");
+        println!("base offset   : 0x{:x} ({})", base_offset, base_offset);
+        println!("magic         : {:?}", sb.magic);
+        println!("fsid          : {}", hex(&sb.fsid));
+        println!("bytenr        : 0x{:x}", sb.bytenr);
+        println!("generation   : {}", sb.generation);
+        println!("root          : 0x{:x}", sb.root);
+        println!("chunk_root    : 0x{:x}", sb.chunk_root);
+        println!("total_bytes   : {}", sb.total_bytes);
+        println!("bytes_used    : {}", sb.bytes_used);
+        println!("num_devices   : {}", sb.num_devices);
+        println!("sector_size   : {}", sb.sector_size);
+        println!("node_size     : {}", sb.node_size);
+        println!("stripesize    : {}", sb.stripesize);
+        println!("csum_type     : {}", sb.csum_type);
+        println!("fs extents : {} ({} bytes)", scrub.num_extents(), scrub.extent_bytes());
+    }
+
+    // Recovery glue: the contract routes two streams through one
+    // `ScrubCallbacks` impl below — `on_log` for free-form diagnostic
+    // text owned by the filesystem scrub, `on_event` for the narrow
+    // recovery payload (array_phys + block_size + verify closure).  The
+    // filesystem's checksum algorithm is fully encapsulated inside the
+    // `verify` closure — main never imports crc32c and doesn't care what
+    // bytes the csum is.
+    let (cfg, opts, scrub_slot) = if recover {
+        let loaded = match array::config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error loading array config for recovery: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let slot = array::config::slot_from_array_partition(&dev)
+            .or_else(|| loaded.slot_for_raw_dev(Path::new(&dev)));
+        let Some(slot) = slot else {
+            eprintln!(
+                "error: --recover requires a device this array config recognizes as a \
+                 data disk (got {dev:?}); expected an array-partition path like \
+                 /dev/nmd2p1 or a raw rdev path listed in /proc/nmdstat"
+            );
+            return ExitCode::from(1);
+        };
+        println!("\nscrubbing{}:", if dry_run { " (dry-run recovery)" } else { " (WRITE recovery)" });
+        (Some(loaded), recovery::RecoverOpts { dry_run }, slot)
+    } else {
+        println!("\nscrubbing:");
+        (None, recovery::RecoverOpts::default(), 0)
+    };
+
+    // The two contract streams route through a single `ScrubCallbacks`
+    // impl.  `on_log` just `eprintln!`s whatever the filesystem scrub
+    // formatted — `main` has no log fields to decode, so a future ZFS
+    // implementation can use a completely different diagnostic vocabulary
+    // without changing this call site.  `on_event` does the recovery glue
+    // using the narrow `ScrubEvent` (array_phys + block_size + verify
+    // closure); no checksum bytes, no algorithm names ever reach here.
+    struct Driver {
+        cfg: Option<array::config::ArrayConfig>,
+        opts: recovery::RecoverOpts,
+        scrub_slot: u64,
+        recovered_count: u64,
+        failed_count: u64,
+    }
+    impl fs::ScrubCallbacks for Driver {
+        fn on_log(&mut self, line: &str) {
+            eprintln!("{line}");
+        }
+
+        fn on_event(&mut self, ev: &fs::ScrubEvent) {
+            let Some(cfg) = self.cfg.as_ref() else { return };
+            let Some(verifier) = ev.verify.as_ref() else {
+                // No stored csum → nothing to verify against; the scrub
+                // implementation already logged the mismatch in its own
+                // format via on_log, so we just skip recovery.
+                return;
+            };
+
+            let block_size = ev.block_size;
+            let Some(failing_dev) = cfg.data_dev(self.scrub_slot) else {
+                eprintln!("  [slot {}] not a data disk in array config", self.scrub_slot);
+                self.failed_count += 1;
+                return;
+            };
+            // rdevOffset stays internal to the array layer: read_block_or_zeros
+            // resolves it from `cfg` itself.  We only compute `raw_phys` here
+            // for log-line display; the recovery I/O functions take `array_phys`.
+            let raw_phys = ev.array_phys + cfg.raw_offset_for(failing_dev);
+            let corrupt_block =
+                match array::stripe::read_block_or_zeros(cfg, failing_dev, ev.array_phys, block_size) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("  [0x{raw_phys:x}] read failing disk: {e}");
+                        self.failed_count += 1;
+                        return;
+                    }
+                };
+            let stripe_chunks =
+                match array::stripe::gather_stripe(cfg, self.scrub_slot, ev.array_phys, block_size) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("  [0x{raw_phys:x}] gather stripe failed: {e}");
+                        self.failed_count += 1;
+                        return;
+                    }
+                };
+            let input = recovery::RecoveryInput {
+                failing_slot: self.scrub_slot,
+                corrupt_block: &corrupt_block,
+                other_blocks: &stripe_chunks.other_data,
+                p_block: stripe_chunks.p_block.as_deref(),
+                q_block: stripe_chunks.q_block.as_deref(),
+                verifier: verifier.as_ref(),
+            };
+            let result = recovery::recover_block(&input, block_size, self.opts);
+            match &result {
+                recovery::RecoveryResult::Recovered { via, block } => {
+                    let via_str = match via {
+                        recovery::ParityPath::P => "P".to_string(),
+                        recovery::ParityPath::Q => "Q".to_string(),
+                        recovery::ParityPath::PQ { partner_slot } => {
+                            format!("PQ(partner=slot {partner_slot})")
+                        }
+                    };
+                    let mut written = false;
+                    if !self.opts.dry_run {
+                        match array::stripe::write_block(
+                            cfg,
+                            failing_dev,
+                            ev.array_phys,
+                            block,
+                        ) {
+                            Ok(()) => written = true,
+                            Err(e) => {
+                                eprintln!("  [0x{raw_phys:x}] write back failed: {e}");
+                                self.failed_count += 1;
+                                return;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "  [0x{raw_phys:x}] RECOVERED via {via_str} {} dev={}",
+                        if written { "(written)" } else { "(dry-run)" },
+                        failing_dev.display(),
+                    );
+                    self.recovered_count += 1;
+                }
+                recovery::RecoveryResult::NotCorrupt => {
+                    eprintln!("  [0x{raw_phys:x}] not corrupt (matches stored csum)");
+                }
+                recovery::RecoveryResult::Failed { reason } => {
+                    eprintln!(
+                        "  [0x{raw_phys:x}] FAILED: {reason:?} dev={}",
+                        failing_dev.display(),
+                    );
+                    self.failed_count += 1;
+                }
+            }
+        }
+    }
+    let mut driver = Driver {
+        cfg,
+        opts,
+        scrub_slot,
+        recovered_count: 0,
+        failed_count: 0,
+    };
+
+    let stats = match scrub.run(&mut driver) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error running scrub: {e}");
             return ExitCode::from(1);
         }
     };
 
-    match btrfs::Superblock::read(&mut fp, base_offset) {
-        Ok(sb) => {
-            println!("device        : {dev}");
-            println!("base offset   : 0x{:x} ({})", base_offset, base_offset);
-            println!("magic         : {:?}", sb.magic);
-            println!("fsid          : {}", hex(&sb.fsid));
-            println!("bytenr        : 0x{:x}", sb.bytenr);
-            println!("generation   : {}", sb.generation);
-            println!("root          : 0x{:x}", sb.root);
-            println!("chunk_root    : 0x{:x}", sb.chunk_root);
-            println!("total_bytes   : {}", sb.total_bytes);
-            println!("bytes_used    : {}", sb.bytes_used);
-            println!("num_devices   : {}", sb.num_devices);
-            println!("sector_size   : {}", sb.sector_size);
-            println!("node_size     : {}", sb.node_size);
-            println!("stripesize    : {}", sb.stripesize);
-            println!("sys_chunk_arr : {} bytes", sb.sys_chunk_array_size);
-            println!("csum_type     : {}", sb.csum_type);
+    println!("\nscrub complete:");
+    println!("  sectors checked    : {}", stats.sectors_checked);
+    println!("  sectors ok         : {}", stats.sectors_ok);
+    println!("  sectors mismatch   : {}", stats.sectors_mismatch);
+    println!("  sectors no csum    : {}", stats.sectors_no_csum);
+    println!("  sectors read error : {}", stats.sectors_read_error);
+    println!("  bytes checked      : {}", stats.bytes_checked);
 
-            let sys_chunks = btrfs::chunk::parse_sys_chunks(&sb.sys_chunks);
-            println!("sys chunks    : {}", sys_chunks.len());
-            let mut chunk_map = btrfs::chunk::ChunkMap::default();
-            for rec in &sys_chunks {
-                chunk_map.insert(rec);
-            }
+    if recover {
+        println!("\nrecovery summary:");
+        println!("  recovered : {}", driver.recovered_count);
+        println!("  failed    : {}", driver.failed_count);
+    }
 
-            let mut reader = btrfs::reader::FsReader {
-                fp: std::fs::File::open(&dev).expect("reopen"),
-                node_size: sb.node_size as usize,
-                base_offset,
-            };
-            // Collect chunk records by walking the chunk tree, then insert
-            // them into the (separately-owned) chunk map.  The map is
-            // immutable after this and shared by reference everywhere.
-            let mut chunk_records: Vec<btrfs::chunk::ChunkRecord> = Vec::new();
-            if let Err(e) = btrfs::tree::walk_leaves(&mut reader, &chunk_map, sb.chunk_root, |_r, leaf, _logical| {
-                for i in 0..leaf.slots.len() {
-                    let slot = leaf.slots[i];
-                    if slot.key.ty == btrfs::key::key_type::CHUNK_ITEM {
-                        let chunk = btrfs::chunk::ChunkItem::parse(leaf.item_data(i));
-                        chunk_records.push(btrfs::chunk::ChunkRecord {
-                            logical: slot.key.offset,
-                            chunk,
-                        });
-                    }
-                }
-                Ok(())
-            }) {
-                eprintln!("error walking chunk tree: {e}");
-                return ExitCode::from(1);
-            }
-            for rec in &chunk_records {
-                chunk_map.insert(rec);
-            }
-
-            println!("chunk map ({} entries):", chunk_map.len());
-            chunk_map.dump();
-
-            // Walk the root tree to find the FS_TREE and CSUM_TREE roots.
-            let mut fs_root: Option<u64> = None;
-            let mut csum_root: Option<u64> = None;
-            if let Err(e) = btrfs::tree::walk_leaves(&mut reader, &chunk_map, sb.root, |_r, leaf, _logical| {
-                for i in 0..leaf.slots.len() {
-                    let slot = leaf.slots[i];
-                    if slot.key.ty == btrfs::key::key_type::ROOT_ITEM {
-                        let ri = btrfs::root::RootItem::parse(leaf.item_data(i));
-                        match slot.key.objectid {
-                            btrfs::key::objectid::FS_TREE => fs_root = Some(ri.bytenr),
-                            btrfs::key::objectid::CSUM_TREE => csum_root = Some(ri.bytenr),
-                            _ => {}
-                        }
-                    }
-                }
-                Ok(())
-            }) {
-                eprintln!("error walking root tree: {e}");
-                return ExitCode::from(1);
-            }
-            println!("fs_root   : 0x{:x}", fs_root.unwrap_or(0));
-            println!("csum_root : 0x{:x}", csum_root.unwrap_or(0));
-
-            // Build the checksum map from the CSUM tree.
-            let mut csum_map = btrfs::csum::CsumMap::new();
-            if let Some(csum_root) = csum_root {
-                match btrfs::csum::build_csum_map(&mut reader, &chunk_map, csum_root, &mut csum_map) {
-                    Ok(n) => println!("csum entries: {n}"),
-                    Err(e) => {
-                        eprintln!("error walking csum tree: {e}");
-                        return ExitCode::from(1);
-                    }
-                }
-            }
-
-            // Walk the FS tree and collect all REGULAR data extents.
-            let mut extents: Vec<btrfs::extent::FileExtent> = Vec::new();
-            if let Some(fs_root) = fs_root {
-                if let Err(e) = btrfs::tree::walk_leaves(&mut reader, &chunk_map, fs_root, |_r, leaf, _logical| {
-                    for i in 0..leaf.slots.len() {
-                        let slot = leaf.slots[i];
-                        if slot.key.ty == btrfs::key::key_type::EXTENT_DATA {
-                            if let Some(ext) = btrfs::extent::FileExtent::parse(
-                                leaf.item_data(i),
-                                slot.key.objectid,
-                                slot.key.offset,
-                            ) {
-                                extents.push(ext);
-                            }
-                        }
-                    }
-                    Ok(())
-                }) {
-                    eprintln!("error walking fs tree: {e}");
-                    return ExitCode::from(1);
-                }
-            }
-            let total_bytes: u64 = extents.iter().map(|e| e.num_bytes).sum();
-            println!("fs extents : {} ({} bytes)", extents.len(), total_bytes);
-
-            // Scrub: read every data sector and verify its CRC32C.
-            //
-            // When --recover is set, recovery happens inline — the scrub
-            // callback gets a filesystem-agnostic (devid, phys) physical
-            // location in each SectorResult and attempts parity XOR
-            // reconstruction immediately, rather than buffering all
-            // mismatches first.  This keeps memory bounded even on a disk
-            // with a huge number of errors.  The array module never imports
-            // from btrfs; it only sees (devid, phys, block_size).
-            let mut recovered_count: u64 = 0;
-            let mut failed_count: u64 = 0;
-
-            // Every NonRAID data disk hosts its own independent
-            // single-device filesystem, so the filesystem's own devid
-            // (always 1) is *not* the NonRAID slot number in general — it
-            // only happens to match for the disk in slot 1.  Recovery
-            // needs the real slot to know which raw rdev paths in the
-            // array config are "other data disks" vs. "the failing disk",
-            // so resolve it once up front from the device path we were
-            // given: try the array-partition naming convention first
-            // (`/dev/nmd2p1` → slot 2), then fall back to matching the
-            // raw-rdev path against the parsed array config (for the
-            // recommended raw-rdev invocation, e.g. `/dev/loop3`).
-            let (cfg, opts, scrub_slot) = if recover {
-                let cfg = match array::config::load() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("error loading array config for recovery: {e}");
-                        return ExitCode::from(1);
-                    }
-                };
-                let slot = array::config::slot_from_array_partition(&dev)
-                    .or_else(|| cfg.slot_for_raw_dev(Path::new(&dev)));
-                let Some(slot) = slot else {
-                    eprintln!(
-                        "error: --recover requires a device this array config recognizes as a \
-                         data disk (got {dev:?}); expected an array-partition path like \
-                         /dev/nmd2p1 or a raw rdev path listed in /proc/nmdstat"
-                    );
-                    return ExitCode::from(1);
-                };
-                let opts = array::recover::RecoverOpts { dry_run };
-                println!("\nscrubbing{}:", if dry_run { " (dry-run recovery)" } else { " (WRITE recovery)" });
-                (Some(cfg), opts, slot)
-            } else {
-                println!("\nscrubbing:");
-                (None, array::recover::RecoverOpts::default(), 0)
-            };
-
-            let stats = btrfs::scrub::scrub_extents(&mut reader, &chunk_map, &csum_map, &extents, |r| {
-                match r.stored_csum {
-                    Some(stored) => {
-                        eprintln!(
-                            "  MISMATCH logical=0x{:x} devid={} array_phys=0x{:x} ino={} off=0x{:x} \
-                             stored=0x{:08x} actual=0x{:08x}",
-                            r.logical, r.devid, r.array_phys, r.inode, r.file_offset, stored, r.actual_csum
-                        );
-                    }
-                    None => {
-                        eprintln!(
-                            "  NO_CSUM  logical=0x{:x} devid={} array_phys=0x{:x} ino={} off=0x{:x} \
-                             actual=0x{:08x}",
-                            r.logical, r.devid, r.array_phys, r.inode, r.file_offset, r.actual_csum
-                        );
-                    }
-                }
-
-                // Inline recovery: only when --recover is set and the sector
-                // has a stored csum to verify against.  Uses only the
-                // filesystem-agnostic (devid, array_phys) — no btrfs imports.
-                // resolve() adds rdevOffset to reach raw-rdev space.
-                let Some(cfg) = cfg.as_ref() else { return };
-                let Some(expected_csum) = r.stored_csum else {
-                    eprintln!("  [0x{:x}] no stored csum — nothing to verify against", r.array_phys);
-                    return;
-                };
-
-                let location = match array::resolve::resolve(cfg, scrub_slot, r.array_phys) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!("  [slot {} array_phys=0x{:x}] resolve failed: {e}", scrub_slot, r.array_phys);
-                        failed_count += 1;
-                        return;
-                    }
-                };
-                let result = array::recover::recover_sector(
-                    cfg,
-                    &location,
-                    expected_csum,
-                    btrfs::superblock::BTRFS_SECTOR_SIZE,
-                    opts,
-                );
-                match &result {
-                    array::recover::RecoveryResult::Recovered { location, via, recovered_csum, written, .. } => {
-                        let via_str = match via {
-                            array::recover::ParityPath::P => "P".to_string(),
-                            array::recover::ParityPath::Q => "Q".to_string(),
-                            array::recover::ParityPath::PQ { partner_slot } => {
-                                format!("PQ(partner=slot {partner_slot})")
-                            }
-                        };
-                        eprintln!(
-                            "  [0x{:x}] RECOVERED via {} {} csum=0x{:08x} dev={}",
-                            location.raw_phys,
-                            via_str,
-                            if *written { "(written)" } else { "(dry-run)" },
-                            recovered_csum,
-                            location.dev_path.display(),
-                        );
-                        recovered_count += 1;
-                    }
-                    array::recover::RecoveryResult::NotCorrupt { location, on_disk_csum, expected_csum } => {
-                        eprintln!(
-                            "  [0x{:x}] not corrupt (on-disk 0x{:08x} == metadata 0x{:08x})",
-                            location.raw_phys, on_disk_csum, expected_csum,
-                        );
-                    }
-                    array::recover::RecoveryResult::Failed { location, reason } => {
-                        eprintln!(
-                            "  [0x{:x}] FAILED: {:?} dev={}",
-                            location.raw_phys, reason, location.dev_path.display(),
-                        );
-                        failed_count += 1;
-                    }
-                }
-            });
-
-            println!("\nscrub complete:");
-            println!("  sectors checked    : {}", stats.sectors_checked);
-            println!("  sectors ok         : {}", stats.sectors_ok);
-            println!("  sectors mismatch   : {}", stats.sectors_mismatch);
-            println!("  sectors no csum    : {}", stats.sectors_no_csum);
-            println!("  sectors read error : {}", stats.sectors_read_error);
-            println!("  bytes checked      : {}", stats.bytes_checked);
-
-            if recover {
-                println!("\nrecovery summary:");
-                println!("  recovered : {}", recovered_count);
-                println!("  failed    : {}", failed_count);
-            }
-
-            if stats.sectors_mismatch > 0 || stats.sectors_read_error > 0 {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            }
-        }
-        Err(e) => {
-            eprintln!("error reading superblock: {e}");
-            ExitCode::from(1)
-        }
+    if stats.sectors_mismatch > 0 || stats.sectors_read_error > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

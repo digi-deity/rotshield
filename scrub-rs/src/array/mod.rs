@@ -61,8 +61,9 @@
 //!
 //! # Why recovery writes to raw-rdev space
 //!
-//! `recover_sector` reads and writes exclusively in raw-rdev space.
-//! Writing the recovered data through the array partition would make the
+//! The recovery write-back (see [`stripe::write_block`]) reads and writes
+//! exclusively in raw-rdev space.  Writing the recovered data through the
+//! array partition would make the
 //! array driver recompute parity from the new data — making parity
 //! consistent with the (possibly wrong) recovered data and destroying
 //! the original parity relationship.  If the recovery turned out wrong
@@ -73,8 +74,29 @@
 //! (data changed, parity didn't), giving a second chance to detect and
 //! fix a botched recovery.  This mirrors the Python `recover.py`, which
 //! opens the raw rdev directly for the same reason.
+//!
+//! # Separation of duties
+//!
+//! `array/` is the **array data management** duty: it parses
+//! `/proc/nmdstat` into [`config::ArrayConfig`], translates
+//! `(slot, array_phys)` to a raw-rdev path + offset via
+//! [`resolve::resolve`], and gathers the aligned chunks of one stripe
+//! (data disks + parity, with zero-substitution past a smaller disk's
+//! end) via [`stripe::gather_stripe`].  It imports nothing from
+//! `btrfs/` or `recovery/` — the only knowledge it has of either side is
+//! the slice shapes handed across [`stripe::StripeChunks`].  The GF(2^8)
+//! parity math lives in [`crate::recovery::gf`]; there is no `array::gf`
+//! shim, so any caller (e.g. `bin/craft_corrupt.rs`) that needs the
+//! tables imports [`crate::recovery::gf`] directly.  `btrfs/` is the
+//! **filesystem duty**: it scrubs and produces `(array_phys,
+//! expected_csum)` for the engine to verify candidates against.
+//!
+//! Writing to the raw rdev leaves parity holding the *original*
+//! relationship.  A subsequent parity check will flag the inconsistency
+//! (data changed, parity didn't), giving a second chance to detect and
+//! fix a botched recovery.  This mirrors the Python `recover.py`, which
+//! opens the raw rdev directly for the same reason.
 
 pub mod config;
-pub mod gf;
-pub mod recover;
 pub mod resolve;
+pub mod stripe;

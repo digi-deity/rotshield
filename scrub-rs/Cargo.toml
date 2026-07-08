@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 crc32c = "0.6"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lib]
 name = "scrub_rs"
 path = "src/lib.rs"

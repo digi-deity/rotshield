@@ -8,8 +8,10 @@ pub mod node;
 pub mod reader;
 pub mod root;
 pub mod scrub;
+pub mod scrub_driver;
 pub mod superblock;
 pub mod tree;
 pub mod util;
 
+pub use scrub_driver::BtrfsScrub;
 pub use superblock::Superblock;

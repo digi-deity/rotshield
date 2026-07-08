@@ -20,6 +20,13 @@ use crate::btrfs::csum::CsumMap;
 ///
 /// `logical`, `inode`, and `file_offset` are kept for logging and for
 /// filesystem-specific callers but are not needed by recovery.
+///
+/// Checksums are carried as raw little-endian `u32` bytes here (btrfs's
+/// on-disk layout) so the [`crate::btrfs::BtrfsScrub`] adapter can pack
+/// them into `Box<dyn Fn(&[u8]) -> bool>` closures without re-deriving
+/// the algorithm at the boundary.  `stored_csum` is `None` for sectors
+/// with no CSUM-tree entry; `actual_csum` is always populated (it's just
+/// `crc32c(data)`).
 #[derive(Debug)]
 pub struct SectorResult {
     pub logical: u64,
@@ -31,8 +38,11 @@ pub struct SectorResult {
     pub array_phys: u64,
     pub inode: u64,
     pub file_offset: u64,
-    pub stored_csum: Option<u32>,
-    pub actual_csum: u32,
+    /// Stored checksum from the CSUM tree, as raw little-endian bytes.
+    /// `None` if no CSUM entry covers this sector.
+    pub stored_csum: Option<[u8; 4]>,
+    /// `crc32c(data)` for the on-disk data, as raw little-endian bytes.
+    pub actual_csum: [u8; 4],
     pub ok: bool,
 }
 
@@ -93,6 +103,7 @@ where
                 match reader.read_logical(chunk_map, sector_logical, sector_size as usize) {
                     Ok(data) => {
                         let actual = crc32c::crc32c(&data);
+                        let actual_bytes = actual.to_le_bytes();
                         // Resolve to array-partition space once, here, so
                         // the callback gets a filesystem-agnostic
                         // (devid, array_phys) without needing the chunk map.
@@ -102,7 +113,8 @@ where
                             .unwrap_or((0, 0));
                         match csum_map.get(&sector_logical) {
                             Some(&stored) => {
-                                if actual == stored {
+                                let stored_bytes = stored.to_le_bytes();
+                                if actual_bytes == stored_bytes {
                                     stats.sectors_ok += 1;
                                 } else {
                                     stats.sectors_mismatch += 1;
@@ -112,8 +124,8 @@ where
                                         array_phys,
                                         inode: ext.inode,
                                         file_offset: file_off,
-                                        stored_csum: Some(stored),
-                                        actual_csum: actual,
+                                        stored_csum: Some(stored_bytes),
+                                        actual_csum: actual_bytes,
                                         ok: false,
                                     });
                                 }
@@ -127,7 +139,7 @@ where
                                     inode: ext.inode,
                                     file_offset: file_off,
                                     stored_csum: None,
-                                    actual_csum: actual,
+                                    actual_csum: actual_bytes,
                                     ok: false,
                                 });
                             }

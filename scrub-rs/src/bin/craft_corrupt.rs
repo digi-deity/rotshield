@@ -53,8 +53,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use scrub_rs::array::config;
-use scrub_rs::array::gf;
 use scrub_rs::btrfs;
+use scrub_rs::recovery::gf;
 
 const BLOCK: usize = btrfs::superblock::BTRFS_SECTOR_SIZE as usize;
 

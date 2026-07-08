@@ -7,3 +7,5 @@
 
 pub mod array;
 pub mod btrfs;
+pub mod fs;
+pub mod recovery;
