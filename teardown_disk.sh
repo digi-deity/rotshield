@@ -5,6 +5,7 @@
 SUPERBLOCK_FILE="/nonraid.dat"   # change if you used -s with a custom path
 BYID_PREFIX="virtdisk-"
 MOUNT_PREFIX="/mnt/disk"
+IMAGE_FILES="d_p d_q d_d1 d_d2 d_d3 d_d4"
 
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root (sudo)"
@@ -41,11 +42,12 @@ for link in /dev/disk/by-id/${BYID_PREFIX}*; do
     rm -f "$link" && echo "    Removed symlink $link."
 done
 
-echo "=== 6. Sweeping any leftover loop devices backed by d[0-9]* image files ==="
+echo "=== 6. Sweeping any leftover loop devices backed by d_* image files ==="
 losetup -l --noheadings -O BACK-FILE,NAME 2>/dev/null | while read -r backing dev; do
     [ -z "$dev" ] && continue
-    case "$(basename "$backing")" in
-        d[0-9]*)
+    basename_backing=$(basename "$backing")
+    case "$basename_backing" in
+        d_*|d[0-9]*)
             echo "  Detaching leftover $dev (backed by $backing)..."
             losetup -d "$dev" 2>/dev/null || echo "    Failed to detach $dev."
             ;;
@@ -66,13 +68,11 @@ for partdev in /dev/loop*p1; do
 done
 
 echo "=== 7. Removing disk image files ==="
-IMAGE_DIR="/root/nonraid-test"
-for img in "$IMAGE_DIR"/d[0-9]*; do
-    [ -e "$img" ] || continue
-    rm -f "$img" && echo "  Removed $img."
+for img in $IMAGE_FILES; do
+    if [ -e "$img" ]; then
+        rm -f "$img" && echo "  Removed $img."
+    fi
 done
-# Remove the directory if empty now
-rmdir "$IMAGE_DIR" 2>/dev/null && echo "  Removed empty $IMAGE_DIR." || echo "  $IMAGE_DIR not empty/removable, skipping."
 
 echo "=== 8. Removing empty nmdctl mountpoint directories ==="
 for d in ${MOUNT_PREFIX}*; do
