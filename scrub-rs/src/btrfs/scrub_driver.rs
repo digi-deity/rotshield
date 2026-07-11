@@ -54,6 +54,11 @@ pub struct BtrfsScrub {
     csum_map: CsumMap,
     strategy: CsumStrategy,
     superblock: Superblock,
+    /// Metadata nodes whose *all* mirror copies failed header-checksum
+    /// verification, counted during the chunk/root-tree walks in `open.rs`.
+    /// Folded into the scrub stats so a DUP metadata node with no good copy
+    /// surfaces as a hard error rather than a silent skip.
+    metadata_header_errors: u64,
 }
 
 impl BtrfsScrub {
@@ -78,14 +83,16 @@ impl BtrfsScrub {
             chunk_map,
             superblock,
             roots,
+            strategy,
+            metadata_header_errors,
         } = ctx;
 
         // Build the checksum map from the CSUM tree.  The strategy (csum
-        // algorithm + sector size) comes from the superblock so the scrub
+        // algorithm + sector size) comes from the superblock (built once in
+        // `btrfs::open` and threaded through `BtrfsContext`) so the scrub
         // honours what the filesystem actually uses.  The csum map is the
         // scrub's source of truth: it enumerates every checksummed data
         // sector exactly once, across all subvolumes/snapshots.
-        let strategy = CsumStrategy::from_superblock(&superblock)?;
         let mut csum_map = CsumMap::new();
         build_csum_map(&mut reader, &chunk_map, roots.csum_root, &strategy, &mut csum_map)?;
 
@@ -95,6 +102,7 @@ impl BtrfsScrub {
             csum_map,
             strategy,
             superblock,
+            metadata_header_errors,
         })
     }
 
@@ -192,6 +200,13 @@ impl FilesystemScrub for BtrfsScrub {
         // logs read-errors inline and folds them into the stats — so we
         // return Ok here.  A future failure that should abort the scrub
         // can be propagated via the explicit `io::Result` return.
+        //
+        // `metadata_header_errors` comes from the chunk/root-tree walks in
+        // `open.rs` (DUP metadata nodes with no good copy).  It is a
+        // distinct failure class from data-sector mismatches: a non-zero
+        // value means the scrub could not trust metadata it needed to
+        // traverse, so some data may have been silently skipped.  main.rs
+        // treats it as a hard error (non-zero → non-zero exit).
         Ok(ScrubStats {
             sectors_checked: local.sectors_checked,
             sectors_ok: local.sectors_ok,
@@ -199,6 +214,7 @@ impl FilesystemScrub for BtrfsScrub {
             sectors_no_csum: local.sectors_no_csum,
             sectors_read_error: local.sectors_read_error,
             bytes_checked: local.bytes_checked,
+            metadata_header_errors: self.metadata_header_errors,
         })
     }
 }

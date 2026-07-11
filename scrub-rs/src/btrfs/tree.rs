@@ -19,19 +19,57 @@ use super::reader::FsReader;
 /// Stops early if `f` returns `Err`.  The closure receives the parsed leaf
 /// and its logical address (handy for computing absolute item-data offsets
 /// when the leaf's `buf` is sliced relative to the node start).
-pub fn walk_leaves<F>(
+///
+/// `on_metadata_error` is invoked once for every node whose *all* mirror
+/// copies failed header-checksum verification (a mirrored/DUP node with no
+/// good copy).  This lets the caller count unrecoverable metadata-header
+/// corruption (e.g. fold it into [`crate::fs::ScrubStats::metadata_header_errors`])
+/// instead of letting it pass silently.  It is only called when the node
+/// could not be recovered via the DUP cross-check; a single corrupt copy
+/// that has a good sibling is transparently skipped and never reported.
+///
+/// **Abort-on-unverifiable-node (per branch):** when a node's header
+/// checksum cannot be verified against *any* mirror copy, that **branch**
+/// of the tree is aborted — the node is skipped entirely (we do not descend
+/// into its children, nor hand its items to the caller) — but the walk
+/// **continues** with the rest of the queue.  We cannot trust a node whose
+/// checksum we cannot verify: a corrupt internal node would otherwise
+/// silently drop a whole subtree, and a corrupt leaf would feed garbage
+/// items to the caller.  The DUP/RAID1 cross-check in
+/// [`super::reader::FsReader::read_node`] already prefers a good copy when
+/// one exists, so this skip is reached only when *no* good copy is
+/// available.  The error is reported via `on_metadata_error` (so it
+/// surfaces in the log / stats) and the other, still-trustworthy branches
+/// of the tree are scrubbed normally.
+pub fn walk_leaves<F, E>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
     mut f: F,
+    mut on_metadata_error: E,
 ) -> std::io::Result<()>
 where
     F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
+    E: FnMut(u64),
 {
     // BFS queue of (logical) addresses to visit.  We use a Vec as a deque.
     let mut queue: Vec<u64> = vec![root_logical];
     while let Some(logical) = queue.pop() {
-        let node = reader.read_node(chunk_map, logical)?;
+        let res = reader.read_node(chunk_map, logical)?;
+        if res.all_mirrors_failed {
+            // We cannot verify this node's header against any mirror copy,
+            // so we cannot trust it.  Skip this branch: do NOT descend into
+            // its children (an internal node would otherwise silently drop a
+            // subtree) and do NOT hand its items to the caller (a leaf would
+            // feed garbage).  The DUP cross-check already preferred a good
+            // copy if one existed, so reaching here means this branch is
+            // untrustworthy.  Report the error and continue with the rest of
+            // the queue so the other, still-reachable branches are still
+            // scrubbed.
+            on_metadata_error(logical);
+            continue;
+        }
+        let node = res.node;
         match node {
             Node::Leaf(leaf) => f(reader, &leaf, logical)?,
             Node::Internal(internal) => {

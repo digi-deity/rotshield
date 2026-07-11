@@ -14,6 +14,7 @@ use std::fs::File;
 use std::io;
 
 use super::chunk::{ChunkItem, ChunkMap, ChunkRecord};
+use super::csum_strategy::CsumStrategy;
 use super::key;
 use super::reader::FsReader;
 use super::root::RootItem;
@@ -43,6 +44,19 @@ pub struct BtrfsContext {
     pub chunk_map: ChunkMap,
     pub superblock: Superblock,
     pub roots: TreeRoots,
+    /// The checksum strategy (algorithm + sector size) derived from the
+    /// superblock.  Threaded into [`FsReader`] so every metadata node/leaf
+    /// header is verified on read, and into the scrub so data csums use the
+    /// right algorithm.  Exposed here so callers (e.g. `BtrfsScrub`) don't
+    /// rebuild it themselves.
+    pub strategy: CsumStrategy,
+    /// Number of metadata nodes whose *all* mirror copies failed
+    /// header-checksum verification during the chunk-tree and root-tree
+    /// walks (i.e. DUP/RAID1 metadata with no good copy).  A single corrupt
+    /// copy that has a good sibling is transparently recovered and not
+    /// counted here.  Surfaced so the scrub can report it as a
+    /// `metadata_header_errors` stat rather than letting it pass silently.
+    pub metadata_header_errors: u64,
 }
 
 /// Open `dev` (a block device or image file) at `base_offset`, populate the
@@ -65,6 +79,12 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         )
     })?;
 
+    // The checksum strategy (algorithm + sector size) is derived from the
+    // superblock and threaded into the reader so every metadata node/leaf
+    // header is verified on read.  Fail loudly on an unsupported csum type
+    // rather than silently producing false mismatches downstream.
+    let strategy = CsumStrategy::from_superblock(&superblock)?;
+
     // Bootstrap the chunk map from the sys-chunk array, then walk the chunk
     // tree itself to populate the rest.  Two-pass because the chunk tree's
     // own logical addresses must resolve while we're still walking it.
@@ -77,22 +97,33 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         File::open(dev)?,
         superblock.node_size as usize,
         base_offset,
+        Some(strategy),
     );
 
     let mut chunk_records: Vec<ChunkRecord> = Vec::new();
-    walk_leaves(&mut reader, &chunk_map, superblock.chunk_root, |_r, leaf, _logical| {
-        for i in 0..leaf.slots.len() {
-            let slot = leaf.slots[i];
-            if slot.key.ty == key::key_type::CHUNK_ITEM {
-                let chunk = ChunkItem::parse(leaf.item_data(i));
-                chunk_records.push(ChunkRecord {
-                    logical: slot.key.offset,
-                    chunk,
-                });
+    let mut metadata_header_errors: u64 = 0;
+    walk_leaves(
+        &mut reader,
+        &chunk_map,
+        superblock.chunk_root,
+        |_r, leaf, _logical| {
+            for i in 0..leaf.slots.len() {
+                let slot = leaf.slots[i];
+                if slot.key.ty == key::key_type::CHUNK_ITEM {
+                    let chunk = ChunkItem::parse(leaf.item_data(i));
+                    chunk_records.push(ChunkRecord {
+                        logical: slot.key.offset,
+                        chunk,
+                    });
+                }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+        |_logical| {
+            // A mirrored (DUP) chunk-tree node with no good copy — count it.
+            metadata_header_errors += 1;
+        },
+    )?;
     for rec in &chunk_records {
         chunk_map.insert(rec);
     }
@@ -100,20 +131,29 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
     // Walk the root tree to locate FS_TREE and CSUM_TREE.
     let mut fs_root: Option<u64> = None;
     let mut csum_root: Option<u64> = None;
-    walk_leaves(&mut reader, &chunk_map, superblock.root, |_r, leaf, _logical| {
-        for i in 0..leaf.slots.len() {
-            let slot = leaf.slots[i];
-            if slot.key.ty == key::key_type::ROOT_ITEM {
-                let ri = RootItem::parse(leaf.item_data(i));
-                match slot.key.objectid {
-                    key::objectid::FS_TREE => fs_root = Some(ri.bytenr),
-                    key::objectid::CSUM_TREE => csum_root = Some(ri.bytenr),
-                    _ => {}
+    walk_leaves(
+        &mut reader,
+        &chunk_map,
+        superblock.root,
+        |_r, leaf, _logical| {
+            for i in 0..leaf.slots.len() {
+                let slot = leaf.slots[i];
+                if slot.key.ty == key::key_type::ROOT_ITEM {
+                    let ri = RootItem::parse(leaf.item_data(i));
+                    match slot.key.objectid {
+                        key::objectid::FS_TREE => fs_root = Some(ri.bytenr),
+                        key::objectid::CSUM_TREE => csum_root = Some(ri.bytenr),
+                        _ => {}
+                    }
                 }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+        |_logical| {
+            // A mirrored (DUP) root-tree node with no good copy — count it.
+            metadata_header_errors += 1;
+        },
+    )?;
     let roots = TreeRoots {
         fs_root: fs_root.ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "FS_TREE root not found in btrfs root tree")
@@ -128,5 +168,7 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         chunk_map,
         superblock,
         roots,
+        strategy,
+        metadata_header_errors,
     })
 }

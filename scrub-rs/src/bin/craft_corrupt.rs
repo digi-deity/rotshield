@@ -261,21 +261,29 @@ fn open_fs(dev: &str, base_offset: u64) -> io::Result<FsContext> {
 /// order, summing `num_bytes` until we reach the target sector.
 fn find_file_sector(ctx: &mut FsContext, sector: usize) -> io::Result<(u64, u64, u64, u64)> {
     let mut extents: Vec<btrfs::extent::FileExtent> = Vec::new();
-    btrfs::tree::walk_leaves(&mut ctx.reader, &ctx.chunk_map, ctx.fs_root, |_r, leaf, _logical| {
-        for i in 0..leaf.slots.len() {
-            let slot = leaf.slots[i];
-            if slot.key.ty == btrfs::key::key_type::EXTENT_DATA {
-                if let Some(ext) = btrfs::extent::FileExtent::parse(
-                    leaf.item_data(i),
-                    slot.key.objectid,
-                    slot.key.offset,
-                ) {
-                    extents.push(ext);
+    btrfs::tree::walk_leaves(
+        &mut ctx.reader,
+        &ctx.chunk_map,
+        ctx.fs_root,
+        |_r, leaf, _logical| {
+            for i in 0..leaf.slots.len() {
+                let slot = leaf.slots[i];
+                if slot.key.ty == btrfs::key::key_type::EXTENT_DATA {
+                    if let Some(ext) = btrfs::extent::FileExtent::parse(
+                        leaf.item_data(i),
+                        slot.key.objectid,
+                        slot.key.offset,
+                    ) {
+                        extents.push(ext);
+                    }
                 }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+        // craft-corrupt only needs the file's extents; it doesn't count
+        // metadata-header errors.
+        |_logical| {},
+    )?;
     if extents.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,

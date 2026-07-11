@@ -140,6 +140,34 @@ impl ChunkMap {
         Some((s.devid, s.offset + log_offset))
     }
 
+    /// Resolve `logical` to *all* stripes of the chunk it falls in, as a
+    /// vector of `(devid, physical)` pairs.  For mirrored profiles (DUP /
+    /// RAID1 / RAID1C3 / RAID1C4) every entry is a full copy of the same
+    /// logical range — this is what lets the scrub cross-check the copies
+    /// (e.g. prefer the good DUP metadata copy when one header is corrupt).
+    /// For single-stripe chunks the vector has exactly one entry (identical
+    /// to [`ChunkMap::lookup`]'s result).  Returns `None` if `logical` is
+    /// not covered by any chunk.
+    pub fn lookup_stripes(&self, logical: u64) -> Option<Vec<(u64, u64)>> {
+        let idx = self.entries.binary_search_by(|e| {
+            if logical < e.begin {
+                std::cmp::Ordering::Greater
+            } else if logical >= e.end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }).ok()?;
+        let e = &self.entries[idx];
+        let log_offset = logical - e.begin;
+        Some(
+            e.stripes
+                .iter()
+                .map(|s| (s.devid, s.offset + log_offset))
+                .collect(),
+        )
+    }
+
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
 

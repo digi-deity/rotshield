@@ -40,7 +40,11 @@ pub fn build_csum_map(
     let hash_len = strategy.hash_len;
     let sector_size = strategy.sector_size;
     let mut count = 0usize;
-    walk_leaves(reader, chunk_map, csum_root, |_r, leaf, _logical| {
+    walk_leaves(
+        reader,
+        chunk_map,
+        csum_root,
+        |_r, leaf, _logical| {
         for i in 0..leaf.slots.len() {
             let slot = leaf.slots[i];
             if slot.key.ty != key_type::EXTENT_CSUM {
@@ -59,6 +63,10 @@ pub fn build_csum_map(
             }
         }
         Ok(())
-    })?;
+    },
+        // The csum tree walk only needs the csum entries; metadata-header
+        // errors are surfaced by the scrub's own tree walks, not here.
+        |_logical| {},
+    )?;
     Ok(count)
 }

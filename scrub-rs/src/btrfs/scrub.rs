@@ -70,6 +70,12 @@ pub struct ScrubStats {
     pub sectors_no_csum: u64,
     pub sectors_read_error: u64,
     pub bytes_checked: u64,
+    /// Metadata nodes whose *all* mirror copies failed header-checksum
+    /// verification (DUP/RAID1 metadata with no good copy).  The data-scrub
+    /// loops themselves don't traverse metadata, so this is folded in from
+    /// the chunk/root-tree walks in `open.rs` by the driver — see
+    /// [`crate::fs::ScrubStats::metadata_header_errors`].
+    pub metadata_header_errors: u64,
 }
 
 /// Scrub all sectors of all REGULAR extents.

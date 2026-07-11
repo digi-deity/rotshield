@@ -119,4 +119,31 @@ impl CsumStrategy {
     pub fn matches(&self, stored: &[u8], data: &[u8]) -> bool {
         stored == self.compute(data).as_slice()
     }
+
+    /// Verify a btrfs metadata node/leaf header checksum.
+    ///
+    /// btrfs stores a 32-byte checksum field (`btrfs_header::csum[32]`) at
+    /// the start of every tree node, but only the first `hash_len` bytes are
+    /// the actual checksum — the remainder of the 32-byte field is padding.
+    /// The checksum covers the *rest* of the node — everything after the
+    /// 32-byte csum prefix — up to `node_size` bytes.  This is the same
+    /// algorithm as the data csum (selected by `csum_type`), just applied to
+    /// the metadata block instead of a data sector.
+    ///
+    /// Returns `true` iff the stored header csum matches the computed one.
+    /// `node_buf` must be exactly `node_size` bytes (the full on-disk node).
+    pub fn verify_node_header(&self, node_buf: &[u8]) -> bool {
+        const CSUM_PREFIX: usize = 32; // btrfs_header.csum[32]
+        if node_buf.len() <= CSUM_PREFIX {
+            return false;
+        }
+        // Only the first `hash_len` bytes of the 32-byte csum field are the
+        // real checksum; the rest is padding.  Comparing the full 32-byte
+        // prefix against `compute` (which returns `hash_len` bytes) would
+        // always mismatch for crc32c/xxhash (hash_len < 32) and falsely
+        // fail every clean node.
+        let stored = &node_buf[..self.hash_len];
+        let body = &node_buf[CSUM_PREFIX..];
+        stored == self.compute(body).as_slice()
+    }
 }

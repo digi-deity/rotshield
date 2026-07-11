@@ -111,6 +111,15 @@ pub struct ScrubStats {
     pub sectors_no_csum: u64,
     pub sectors_read_error: u64,
     pub bytes_checked: u64,
+    /// Metadata nodes whose *all* mirror copies failed header-checksum
+    /// verification (DUP/RAID1 metadata with no good copy).  A single
+    /// corrupt copy that has a good sibling is transparently recovered by
+    /// the DUP cross-check and is *not* counted here.  This is a distinct
+    /// failure class from data-sector mismatches: it means the scrub could
+    /// not trust the metadata it needed to traverse, so some data may have
+    /// been silently skipped.  Surfaced as a hard error (non-zero → non-zero
+    /// exit) so it can't be mistaken for a clean scrub.
+    pub metadata_header_errors: u64,
 }
 
 /// Sink for the two streams a scrub produces (see module docs).

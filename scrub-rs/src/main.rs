@@ -321,6 +321,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
     println!("  sectors mismatch   : {}", stats.sectors_mismatch);
     println!("  sectors no csum    : {}", stats.sectors_no_csum);
     println!("  sectors read error : {}", stats.sectors_read_error);
+    println!("  metadata hdr errs  : {}", stats.metadata_header_errors);
     println!("  bytes checked      : {}", stats.bytes_checked);
 
     if recover {
@@ -329,7 +330,10 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
         println!("  failed    : {}", driver.failed_count);
     }
 
-    if stats.sectors_mismatch > 0 || stats.sectors_read_error > 0 {
+    if stats.sectors_mismatch > 0
+        || stats.sectors_read_error > 0
+        || stats.metadata_header_errors > 0
+    {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
