@@ -66,3 +66,16 @@ Cargo.lock
 *.o
 *.so
 *.a
+
+# Virtual disk images (loop-device backing stores, multi-GB build artifacts)
+d_d1
+d_d2
+d_d3
+d_d4
+d_p
+d_q
+
+# Sibling source trees (tracked separately / not part of this repo's scope)
+szfs/
+zfs/
+grub-zfs/

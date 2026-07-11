@@ -3,10 +3,10 @@
 //! checksum from the CSUM tree.
 
 use crate::btrfs::chunk::ChunkMap;
+use crate::btrfs::csum::CsumMap;
+use crate::btrfs::csum_strategy::CsumStrategy;
 use crate::btrfs::extent::FileExtent;
 use crate::btrfs::reader::FsReader;
-use crate::btrfs::superblock::BTRFS_SECTOR_SIZE;
-use crate::btrfs::csum::CsumMap;
 
 /// Result of scrubbing a single sector.
 ///
@@ -21,12 +21,12 @@ use crate::btrfs::csum::CsumMap;
 /// `logical`, `inode`, and `file_offset` are kept for logging and for
 /// filesystem-specific callers but are not needed by recovery.
 ///
-/// Checksums are carried as raw little-endian `u32` bytes here (btrfs's
-/// on-disk layout) so the [`crate::btrfs::BtrfsScrub`] adapter can pack
-/// them into `Box<dyn Fn(&[u8]) -> bool>` closures without re-deriving
-/// the algorithm at the boundary.  `stored_csum` is `None` for sectors
-/// with no CSUM-tree entry; `actual_csum` is always populated (it's just
-/// `crc32c(data)`).
+/// Checksums are carried as raw bytes here (btrfs's on-disk layout — 4
+/// bytes for CRC32C, 8 for XXHASH, 32 for SHA256/BLAKE2) so the
+/// [`crate::btrfs::BtrfsScrub`] adapter can pack them into
+/// `Box<dyn Fn(&[u8]) -> bool>` closures without re-deriving the algorithm
+/// at the boundary.  `stored_csum` is `None` for sectors with no CSUM-tree
+/// entry; `actual_csum` is always populated (the freshly computed hash).
 #[derive(Debug)]
 pub struct SectorResult {
     pub logical: u64,
@@ -38,11 +38,11 @@ pub struct SectorResult {
     pub array_phys: u64,
     pub inode: u64,
     pub file_offset: u64,
-    /// Stored checksum from the CSUM tree, as raw little-endian bytes.
-    /// `None` if no CSUM entry covers this sector.
-    pub stored_csum: Option<[u8; 4]>,
-    /// `crc32c(data)` for the on-disk data, as raw little-endian bytes.
-    pub actual_csum: [u8; 4],
+    /// Stored checksum from the CSUM tree, as raw bytes (length ==
+    /// `strategy.hash_len`).  `None` if no CSUM entry covers this sector.
+    pub stored_csum: Option<Vec<u8>>,
+    /// The freshly computed checksum of the on-disk data, as raw bytes.
+    pub actual_csum: Vec<u8>,
     pub ok: bool,
 }
 
@@ -66,18 +66,23 @@ pub struct ScrubStats {
 /// so callers that want to act on a mismatch (e.g. parity recovery) get a
 /// filesystem-agnostic physical address without needing to borrow the
 /// chunk map themselves.
+///
+/// `strategy` carries the checksum algorithm and the data sector size, both
+/// taken from the superblock — the scrub no longer assumes CRC32C over
+/// fixed 4096-byte sectors.
 pub fn scrub_extents<F>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     csum_map: &CsumMap,
     extents: &[FileExtent],
+    strategy: &CsumStrategy,
     mut on_sector: F,
 ) -> ScrubStats
 where
     F: FnMut(&SectorResult),
 {
     let mut stats = ScrubStats::default();
-    let sector_size = BTRFS_SECTOR_SIZE as u64;
+    let sector_size = strategy.sector_size;
 
     for ext in extents {
         // Sparse extents (disk_bytenr == 0) have no on-disk data to verify.
@@ -102,8 +107,7 @@ where
 
                 match reader.read_logical(chunk_map, sector_logical, sector_size as usize) {
                     Ok(data) => {
-                        let actual = crc32c::crc32c(&data);
-                        let actual_bytes = actual.to_le_bytes();
+                        let actual = strategy.compute(&data);
                         // Resolve to array-partition space once, here, so
                         // the callback gets a filesystem-agnostic
                         // (devid, array_phys) without needing the chunk map.
@@ -112,9 +116,8 @@ where
                             .lookup(sector_logical)
                             .unwrap_or((0, 0));
                         match csum_map.get(&sector_logical) {
-                            Some(&stored) => {
-                                let stored_bytes = stored.to_le_bytes();
-                                if actual_bytes == stored_bytes {
+                            Some(stored) => {
+                                if actual == *stored {
                                     stats.sectors_ok += 1;
                                 } else {
                                     stats.sectors_mismatch += 1;
@@ -124,8 +127,8 @@ where
                                         array_phys,
                                         inode: ext.inode,
                                         file_offset: file_off,
-                                        stored_csum: Some(stored_bytes),
-                                        actual_csum: actual_bytes,
+                                        stored_csum: Some(stored.clone()),
+                                        actual_csum: actual,
                                         ok: false,
                                     });
                                 }
@@ -139,7 +142,7 @@ where
                                     inode: ext.inode,
                                     file_offset: file_off,
                                     stored_csum: None,
-                                    actual_csum: actual_bytes,
+                                    actual_csum: actual,
                                     ok: false,
                                 });
                             }

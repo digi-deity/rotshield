@@ -20,11 +20,12 @@ use std::io;
 
 use crate::btrfs::chunk::ChunkMap;
 use crate::btrfs::csum::{build_csum_map, CsumMap};
+use crate::btrfs::csum_strategy::CsumStrategy;
 use crate::btrfs::extent::FileExtent;
 use crate::btrfs::key;
 use crate::btrfs::reader::FsReader;
 use crate::btrfs::scrub::scrub_extents;
-use crate::btrfs::superblock::{BTRFS_SECTOR_SIZE, Superblock};
+use crate::btrfs::superblock::Superblock;
 use crate::btrfs::tree::walk_leaves;
 use crate::fs::{FilesystemScrub, ScrubEvent, ScrubStats};
 
@@ -37,6 +38,9 @@ use crate::fs::{FilesystemScrub, ScrubEvent, ScrubStats};
 /// - the parsed superblock;
 /// - the populated chunk map (logical → physical stripe);
 /// - the CSUM tree materialised as a `CsumMap`;
+/// - the checksum strategy (algorithm + sector size) taken from the
+///   superblock — the scrub no longer assumes CRC32C over 4096-byte
+///   sectors;
 /// - the collected list of REGULAR data extents to walk.
 ///
 /// Construct via [`BtrfsScrub::open`] and drive via the
@@ -45,6 +49,7 @@ pub struct BtrfsScrub {
     reader: FsReader,
     chunk_map: ChunkMap,
     csum_map: CsumMap,
+    strategy: CsumStrategy,
     extents: Vec<FileExtent>,
     superblock: Superblock,
 }
@@ -73,9 +78,12 @@ impl BtrfsScrub {
             roots,
         } = ctx;
 
-        // Build the checksum map from the CSUM tree.
+        // Build the checksum map from the CSUM tree.  The strategy (csum
+        // algorithm + sector size) comes from the superblock so the scrub
+        // honours what the filesystem actually uses.
+        let strategy = CsumStrategy::from_superblock(&superblock)?;
         let mut csum_map = CsumMap::new();
-        build_csum_map(&mut reader, &chunk_map, roots.csum_root, &mut csum_map)?;
+        build_csum_map(&mut reader, &chunk_map, roots.csum_root, &strategy, &mut csum_map)?;
 
         // Walk the FS tree and collect all REGULAR data extents.
         let mut extents: Vec<FileExtent> = Vec::new();
@@ -99,6 +107,7 @@ impl BtrfsScrub {
             reader,
             chunk_map,
             csum_map,
+            strategy,
             extents,
             superblock,
         })
@@ -115,6 +124,12 @@ impl BtrfsScrub {
     /// the caller's progress log.
     pub fn num_extents(&self) -> usize {
         self.extents.len()
+    }
+
+    /// Human-readable name of the filesystem's checksum algorithm (e.g.
+    /// "crc32c", "xxhash", "sha256", "blake2"), taken from the superblock.
+    pub fn csum_name(&self) -> &'static str {
+        self.strategy.name
     }
 
     /// Total bytes of REGULAR data extents — useful for the caller's
@@ -145,14 +160,14 @@ impl FilesystemScrub for BtrfsScrub {
         // the caller via the event.  Recovery never learns which
         // checksum btrfs used — exactly the seam we want for a future
         // ZFS sha256/blake3 impl, which would build its own closure here.
-        let block_size = BTRFS_SECTOR_SIZE as usize;
+        let block_size = self.strategy.sector_size as usize;
         let mut emit = |r: &crate::btrfs::scrub::SectorResult| {
             // 1. Log line (btrfs-owned format).
-            let stored_tag = match r.stored_csum {
+            let stored_tag = match &r.stored_csum {
                 None => format!("actual=0x{} (no stored csum)", crate::btrfs::util::hex(&r.actual_csum)),
                 Some(stored) => format!(
                     "stored=0x{} actual=0x{}",
-                    crate::btrfs::util::hex(&stored),
+                    crate::btrfs::util::hex(stored),
                     crate::btrfs::util::hex(&r.actual_csum),
                 ),
             };
@@ -162,9 +177,14 @@ impl FilesystemScrub for BtrfsScrub {
             );
             callbacks.on_log(&line);
 
-            // 2. Recovery-only event.
-            let verify = r.stored_csum.map(|stored| {
-                Box::new(move |b: &[u8]| crc32c::crc32c(b).to_le_bytes() == stored)
+            // 2. Recovery-only event.  The verifier is built from the
+            //    filesystem's csum strategy (algorithm + hash length) bound
+            //    together with the stored bytes — recovery never learns
+            //    which checksum btrfs used.
+            let verify = r.stored_csum.as_ref().map(|stored| {
+                let stored = stored.clone();
+                let strategy = self.strategy;
+                Box::new(move |b: &[u8]| strategy.compute(b) == stored)
                     as Box<dyn Fn(&[u8]) -> bool + Send + Sync>
             });
             callbacks.on_event(&ScrubEvent {
@@ -179,6 +199,7 @@ impl FilesystemScrub for BtrfsScrub {
             &self.chunk_map,
             &self.csum_map,
             &self.extents,
+            &self.strategy,
             &mut emit,
         );
 

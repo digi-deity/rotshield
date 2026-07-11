@@ -144,7 +144,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
         println!("sector_size   : {}", sb.sector_size);
         println!("node_size     : {}", sb.node_size);
         println!("stripesize    : {}", sb.stripesize);
-        println!("csum_type     : {}", sb.csum_type);
+        println!("csum_type     : {} ({})", sb.csum_type, scrub.csum_name());
         println!("fs extents : {} ({} bytes)", scrub.num_extents(), scrub.extent_bytes());
     }
 

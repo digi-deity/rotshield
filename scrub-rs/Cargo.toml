@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+sha2 = "0.10"
+blake2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
