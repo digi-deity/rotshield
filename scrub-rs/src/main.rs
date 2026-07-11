@@ -145,7 +145,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, mut args: I) -> ExitCode {
         println!("node_size     : {}", sb.node_size);
         println!("stripesize    : {}", sb.stripesize);
         println!("csum_type     : {} ({})", sb.csum_type, scrub.csum_name());
-        println!("fs extents : {} ({} bytes)", scrub.num_extents(), scrub.extent_bytes());
+        println!("csum sectors  : {} ({} bytes)", scrub.num_sectors(), scrub.csum_bytes());
     }
 
     // Recovery glue: the contract routes two streams through one

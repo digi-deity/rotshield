@@ -4,9 +4,15 @@
 //! This encapsulates all the btrfs-specific metadata setup that used to
 //! live loose in `main.rs`: read the superblock, walk the chunk tree to
 //! populate the chunk map, walk the root tree to find the FS_TREE and
-//! CSUM_TREE roots, build the CSUM map, walk the FS tree to collect
-//! REGULAR data extents, then run the per-sector scrub loop and emit
-//! [`crate::fs::ScrubEvent`]s.
+//! CSUM_TREE roots, build the CSUM map, then run the per-sector scrub loop
+//! and emit [`crate::fs::ScrubEvent`]s.
+//!
+//! The data scrub is driven directly off the **global CSUM tree** (see
+//! [`crate::btrfs::scrub::scrub_csum_tree`]): the csum tree enumerates
+//! every checksummed data sector exactly once, keyed by logical address,
+//! so the scrub is both exhaustive across all subvolumes/snapshots and
+//! automatically deduplicated for shared (COW / reflink) extents — no
+//! per-subvolume FS-tree walk required.
 //!
 //! `main.rs` is left doing only what's filesystem-agnostic: it
 //! instantiates a scrub implementation (chosen via a `--fstype` flag in
@@ -21,12 +27,9 @@ use std::io;
 use crate::btrfs::chunk::ChunkMap;
 use crate::btrfs::csum::{build_csum_map, CsumMap};
 use crate::btrfs::csum_strategy::CsumStrategy;
-use crate::btrfs::extent::FileExtent;
-use crate::btrfs::key;
 use crate::btrfs::reader::FsReader;
-use crate::btrfs::scrub::scrub_extents;
+use crate::btrfs::scrub::scrub_csum_tree;
 use crate::btrfs::superblock::Superblock;
-use crate::btrfs::tree::walk_leaves;
 use crate::fs::{FilesystemScrub, ScrubEvent, ScrubStats};
 
 /// A btrfs filesystem scrub.
@@ -37,11 +40,11 @@ use crate::fs::{FilesystemScrub, ScrubEvent, ScrubStats};
 ///   own `File` handle, so we keep both);
 /// - the parsed superblock;
 /// - the populated chunk map (logical → physical stripe);
-/// - the CSUM tree materialised as a `CsumMap`;
+/// - the CSUM tree materialised as a `CsumMap` — this is the scrub source
+///   of truth (see module docs);
 /// - the checksum strategy (algorithm + sector size) taken from the
 ///   superblock — the scrub no longer assumes CRC32C over 4096-byte
-///   sectors;
-/// - the collected list of REGULAR data extents to walk.
+///   sectors.
 ///
 /// Construct via [`BtrfsScrub::open`] and drive via the
 /// [`FilesystemScrub::run`] impl.
@@ -50,7 +53,6 @@ pub struct BtrfsScrub {
     chunk_map: ChunkMap,
     csum_map: CsumMap,
     strategy: CsumStrategy,
-    extents: Vec<FileExtent>,
     superblock: Superblock,
 }
 
@@ -65,10 +67,10 @@ impl BtrfsScrub {
     /// never sees a logical address or chunk record.
     ///
     /// The chunk-map/root-tree preamble is owned by [`crate::btrfs::open`];
-    /// this constructor takes the resulting [`BtrfsContext`], builds the
-    /// csum map, and collects FS-tree extents.  All three callers in the
-    /// crate (`BtrfsScrub`, `bin/craft_corrupt`, `main::resolve_cmd`) go
-    /// through the same `btrfs::open` so the chunk-map build never drifts.
+    /// this constructor takes the resulting [`BtrfsContext`] and builds the
+    /// csum map.  All three callers in the crate (`BtrfsScrub`,
+    /// `bin/craft_corrupt`, `main::resolve_cmd`) go through the same
+    /// `btrfs::open` so the chunk-map build never drifts.
     pub fn open(dev: &str, base_offset: u64) -> io::Result<Self> {
         let ctx = crate::btrfs::open(dev, base_offset)?;
         let crate::btrfs::BtrfsContext {
@@ -80,35 +82,18 @@ impl BtrfsScrub {
 
         // Build the checksum map from the CSUM tree.  The strategy (csum
         // algorithm + sector size) comes from the superblock so the scrub
-        // honours what the filesystem actually uses.
+        // honours what the filesystem actually uses.  The csum map is the
+        // scrub's source of truth: it enumerates every checksummed data
+        // sector exactly once, across all subvolumes/snapshots.
         let strategy = CsumStrategy::from_superblock(&superblock)?;
         let mut csum_map = CsumMap::new();
         build_csum_map(&mut reader, &chunk_map, roots.csum_root, &strategy, &mut csum_map)?;
-
-        // Walk the FS tree and collect all REGULAR data extents.
-        let mut extents: Vec<FileExtent> = Vec::new();
-        walk_leaves(&mut reader, &chunk_map, roots.fs_root, |_r, leaf, _logical| {
-            for i in 0..leaf.slots.len() {
-                let slot = leaf.slots[i];
-                if slot.key.ty == key::key_type::EXTENT_DATA {
-                    if let Some(ext) = FileExtent::parse(
-                        leaf.item_data(i),
-                        slot.key.objectid,
-                        slot.key.offset,
-                    ) {
-                        extents.push(ext);
-                    }
-                }
-            }
-            Ok(())
-        })?;
 
         Ok(Self {
             reader,
             chunk_map,
             csum_map,
             strategy,
-            extents,
             superblock,
         })
     }
@@ -120,10 +105,11 @@ impl BtrfsScrub {
         &self.superblock
     }
 
-    /// Number of REGULAR data extents the FS tree advertised — useful for
-    /// the caller's progress log.
-    pub fn num_extents(&self) -> usize {
-        self.extents.len()
+    /// Number of checksummed data sectors the CSUM tree advertised — useful
+    /// for the caller's progress log.  This is the deduplicated, exhaustive
+    /// scrub set (covers all subvolumes/snapshots).
+    pub fn num_sectors(&self) -> usize {
+        self.csum_map.len()
     }
 
     /// Human-readable name of the filesystem's checksum algorithm (e.g.
@@ -132,10 +118,10 @@ impl BtrfsScrub {
         self.strategy.name
     }
 
-    /// Total bytes of REGULAR data extents — useful for the caller's
+    /// Total bytes of checksummed data sectors — useful for the caller's
     /// progress log.
-    pub fn extent_bytes(&self) -> u64 {
-        self.extents.iter().map(|e| e.num_bytes).sum()
+    pub fn csum_bytes(&self) -> u64 {
+        self.csum_map.len() as u64 * self.strategy.sector_size
     }
 }
 
@@ -194,16 +180,15 @@ impl FilesystemScrub for BtrfsScrub {
             });
         };
 
-        let local = scrub_extents(
+        let local = scrub_csum_tree(
             &mut self.reader,
             &self.chunk_map,
             &self.csum_map,
-            &self.extents,
             &self.strategy,
             &mut emit,
         );
 
-        // btrfs's `scrub_extents` doesn't surface an io::Error today — it
+        // btrfs's `scrub_csum_tree` doesn't surface an io::Error today — it
         // logs read-errors inline and folds them into the stats — so we
         // return Ok here.  A future failure that should abort the scrub
         // can be propagated via the explicit `io::Result` return.

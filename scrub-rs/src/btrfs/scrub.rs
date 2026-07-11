@@ -1,6 +1,21 @@
-//! The scrub loop — for every REGULAR data extent, read each 4096-byte
-//! sector from disk, compute its CRC32C, and compare against the stored
-//! checksum from the CSUM tree.
+//! The scrub loop.
+//!
+//! Two strategies are provided:
+//!
+//! * [`scrub_extents`] — walk the FS tree's `EXTENT_DATA` items and verify
+//!   each sector.  This is the classic per-inode walk; it only sees the
+//!   trees you enumerate (today just the default subvolume), so it can
+//!   miss subvolumes/snapshots and re-verifies shared (COW/reflink)
+//!   extents redundantly.
+//! * [`scrub_csum_tree`] — iterate the **global CSUM tree** directly.  The
+//!   csum tree is keyed by logical sector and covers *every* checksummed
+//!   data sector regardless of which subvolume/snapshot references it, and
+//!   each sector appears exactly once.  Driving the scrub off it is
+//!   therefore both exhaustive (no subvolume walk needed) and
+//!   automatically deduplicated (no redundant re-reads of shared extents).
+//!   This is the preferred path; the only thing it loses is the
+//!   per-inode / per-file_offset association, which the recovery layer
+//!   does not need.
 
 use crate::btrfs::chunk::ChunkMap;
 use crate::btrfs::csum::CsumMap;
@@ -161,6 +176,80 @@ where
             remaining -= len;
             logical += len;
             file_off += len;
+        }
+    }
+
+    stats
+}
+
+/// Scrub every sector enumerated by the global CSUM tree.
+///
+/// Unlike [`scrub_extents`], this does not walk any FS tree.  The CSUM tree
+/// already lists every checksummed data sector exactly once, keyed by its
+/// logical address, so iterating it is the exhaustive *and* deduplicated
+/// data-scrub set: it covers all subvolumes and snapshots (their data is
+/// checksummed in the same global tree) and never re-reads a shared
+/// (COW / reflink / snapshot) extent.
+///
+/// `inode` / `file_offset` are set to `0` because the csum tree carries no
+/// per-inode association — the recovery layer only needs the on-disk
+/// physical location, which is still resolved via `chunk_map.lookup`.
+///
+/// Caveats (see `SCRUB_EXHAUSTIVENESS_ANALYSIS.md`):
+/// * The csum tree covers **data** sectors only; metadata node-header
+///   checksums and INLINE extents are not represented here.
+/// * A csum entry can outlive the extent it covered (freed / orphaned
+///   ranges), pointing at an unallocated logical address. `read_logical`
+///   then fails — we fold that into `sectors_read_error` rather than a
+///   mismatch, so stale entries don't look like corruption.
+pub fn scrub_csum_tree<F>(
+    reader: &mut FsReader,
+    chunk_map: &ChunkMap,
+    csum_map: &CsumMap,
+    strategy: &CsumStrategy,
+    mut on_sector: F,
+) -> ScrubStats
+where
+    F: FnMut(&SectorResult),
+{
+    let mut stats = ScrubStats::default();
+    let sector_size = strategy.sector_size;
+
+    // Each key is a sector-aligned logical address; the map is already
+    // deduplicated by logical sector across all subvolumes/snapshots.
+    for (&sector_logical, stored) in csum_map.iter() {
+        stats.sectors_checked += 1;
+        stats.bytes_checked += sector_size;
+
+        match reader.read_logical(chunk_map, sector_logical, sector_size as usize) {
+            Ok(data) => {
+                let actual = strategy.compute(&data);
+                let (devid, array_phys) = chunk_map
+                    .lookup(sector_logical)
+                    .unwrap_or((0, 0));
+                if actual == *stored {
+                    stats.sectors_ok += 1;
+                } else {
+                    stats.sectors_mismatch += 1;
+                    on_sector(&SectorResult {
+                        logical: sector_logical,
+                        devid,
+                        array_phys,
+                        inode: 0,
+                        file_offset: 0,
+                        stored_csum: Some(stored.clone()),
+                        actual_csum: actual,
+                        ok: false,
+                    });
+                }
+            }
+            Err(e) => {
+                stats.sectors_read_error += 1;
+                eprintln!(
+                    "read error at logical 0x{:x}: {}",
+                    sector_logical, e
+                );
+            }
         }
     }
 
