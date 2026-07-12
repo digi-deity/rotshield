@@ -52,6 +52,17 @@ pub struct ReadNodeResult {
     pub node: Node,
     pub all_mirrors_failed: bool,
     pub generation_mismatch: bool,
+    /// `true` iff the node lives in a mirrored (DUP/RAID1/…) chunk and at
+    /// least one mirror copy is header-checksum valid (so the block is
+    /// still readable / self-healable) but *not every* copy is valid — i.e.
+    /// one or more mirrors are corrupt.  This is the self-heal-recoverable
+    /// counterpart to `all_mirrors_failed`: the filesystem can read the good
+    /// copy, but a correct scrub should *report* the divergence (as the
+    /// kernel's `btrfs scrub` does) rather than healing it silently.  Only
+    /// meaningful for mirrored chunks; `false` for single-stripe chunks
+    /// (where there is nothing to cross-check against).  Callers surface
+    /// this as a `metadata_mirror_mismatches` counter.
+    pub mirror_mismatch: bool,
 }
 
 /// A logical-address reader for a single-device btrfs filesystem.
@@ -162,6 +173,14 @@ impl FsReader {
         self.base_offset
     }
 
+    /// The filesystem node size (the size of every metadata tree node on
+    /// disk).  Exposed so callers that read raw metadata blocks directly
+    /// (e.g. the DUP-mirror cross-check in [`crate::btrfs::open`]) know how
+    /// many bytes to request per node.
+    pub fn node_size(&self) -> usize {
+        self.node_size
+    }
+
     /// Read `n` bytes starting at logical address `logical`, using
     /// `chunk_map` for the logical→physical translation.
     ///
@@ -219,6 +238,26 @@ impl FsReader {
             }
         }
         read_at(&mut self.fp, self.base_offset + phys, n)
+    }
+
+    /// Read `n` raw bytes at physical offset `phys` (relative to the
+    /// device's start, before `base_offset`), applying `base_offset` but
+    /// **without** the devid guard that [`FsReader::read_physical`] enforces.
+    ///
+    /// Used by the DUP-mirror cross-check ([`crate::btrfs::open`]), which
+    /// reads every mirror copy of a metadata node by its absolute physical
+    /// stripe offset — the devid is always the opened device, so the guard
+    /// would only add noise.  The bytes returned are the raw on-disk node
+    /// (callers verify the header checksum themselves).
+    pub fn read_physical_raw(&mut self, phys: u64, n: usize) -> std::io::Result<Vec<u8>> {
+        read_at(&mut self.fp, self.base_offset + phys, n)
+    }
+
+    /// Borrow the checksum strategy (algorithm + sector size) this reader
+    /// uses to verify metadata node headers.  `None` if the reader was
+    /// constructed without a strategy (verification disabled).
+    pub fn strategy(&self) -> Option<&CsumStrategy> {
+        self.strategy.as_ref()
     }
 
     /// Result of [`FsReader::read_node`]: the parsed node plus a flag
@@ -280,6 +319,7 @@ impl FsReader {
                     node: super::node::Node::parse(buf),
                     all_mirrors_failed: false,
                     generation_mismatch: false,
+                    mirror_mismatch: false,
                 });
             }
         };
@@ -298,6 +338,15 @@ impl FsReader {
         let mut good: Option<Vec<u8>> = None;
         let mut stale: Option<Vec<u8>> = None;
         let mut corrupt: Option<Vec<u8>> = None;
+        // Count how many stripes passed header-csum verification.  Used to
+        // detect a diverged mirror (≥1 valid but not all valid) — the
+        // self-heal-recoverable case we must *report*, not silently heal.
+        // IMPORTANT: we must inspect *every* stripe before deciding, not
+        // `break` after the first good copy — otherwise `valid_count` would
+        // only ever reach 1 on a clean DUP node and we'd falsely report a
+        // mirror mismatch on every block.  So we walk all stripes, counting
+        // valid copies and recording the best buffer, without early exit.
+        let mut valid_count: usize = 0;
         for (_devid, phys) in &stripes {
             let buf = match read_at(&mut self.fp, self.base_offset + phys, self.node_size) {
                 Ok(b) => b,
@@ -310,6 +359,7 @@ impl FsReader {
                 }
                 continue;
             }
+            valid_count += 1;
             // csum valid — now check the header fields (bytenr/fsid/level/
             // owner/generation).  A copy that fails these is treated like a
             // corrupt copy: it is not the block the parent expected.
@@ -326,10 +376,19 @@ impl FsReader {
                 }
                 continue;
             }
-            good = Some(buf);
-            break;
+            // A good copy: prefer the first one we find (deterministic), but
+            // keep scanning the remaining stripes so `valid_count` reflects
+            // the whole mirror set.
+            if good.is_none() {
+                good = Some(buf);
+            }
         }
         let generation_mismatch = good.is_none() && stale.is_some();
+        // A mirrored node whose copies disagree: at least one stripe is
+        // header-valid (so the block is readable) but not *every* stripe
+        // validated.  Single-stripe chunks (stripes.len() == 1) can never
+        // diverge, so this is only meaningful for mirrored chunks.
+        let mirror_mismatch = stripes.len() > 1 && valid_count > 0 && valid_count < stripes.len();
         let buf = match good.or(stale).or(corrupt) {
             Some(b) => b,
             None => {
@@ -360,6 +419,7 @@ impl FsReader {
             node: super::node::Node::parse(buf),
             all_mirrors_failed,
             generation_mismatch,
+            mirror_mismatch,
         })
     }
 

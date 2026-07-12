@@ -72,6 +72,8 @@ pub fn build_csum_map(
         // The csum tree walk only needs the csum entries; metadata-header
         // errors are surfaced by the scrub's own tree walks, not here.
         |_logical| {},
+        // Mirror-divergence reporting is not needed for csum-map building.
+        |_logical| {},
     )?;
     Ok(count)
 }

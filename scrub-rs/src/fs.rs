@@ -149,6 +149,18 @@ pub struct ScrubStats {
     /// been silently skipped.  Surfaced as a hard error (non-zero → non-zero
     /// exit) so it can't be mistaken for a clean scrub.
     pub metadata_header_errors: u64,
+    /// Metadata nodes in a *mirrored* (DUP/RAID1/…) chunk whose copies
+    /// DISAGREE with each other: at least one copy is header-checksum
+    /// valid, but the copies are not byte-identical.  This is the
+    /// self-heal-recoverable counterpart to `metadata_header_errors` — the
+    /// filesystem can still read the good copy (so traversal succeeds), but
+    /// a correct scrub should *report* the divergence the way the kernel's
+    /// `btrfs scrub` does, rather than healing it silently.  Counted
+    /// separately so an operator can see how many mirrored metadata blocks
+    /// are out of sync without conflating them with unrecoverable header
+    /// errors.  Does not affect the exit code on its own (the good copy
+    /// means the data is intact), but is surfaced for visibility.
+    pub metadata_mirror_mismatches: u64,
 }
 
 /// Sink for the two streams a scrub produces (see module docs).

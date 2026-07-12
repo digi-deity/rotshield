@@ -64,8 +64,12 @@ RESULTS="${RESULTS:-$IMG_ROOT/matrix_results.tsv}"
 # Output parsing -- adjust these three to match your tool's actual output.
 # ---------------------------------------------------------------------------
 parse_data_mismatches() { awk '/sectors mismatch/{print $NF; exit}' <<<"$1"; }
-parse_meta_mismatches() { awk '/metadata hdr errs/{print $NF; exit}' <<<"$1"; }
-parse_self_heal()       { awk '/self heal/{print $NF; exit}' <<<"$1"; }
+# scrub-rs reports recoverable DUP-mirror divergence as "metadata mirror : N"
+# and unrecoverable (no good copy) as "metadata hdr errs : N".  Both are
+# metadata mismatches for the purpose of the >= expect_min check; the
+# self-heal parser below isolates the recoverable signal.
+parse_meta_mismatches() { awk '/metadata (hdr errs|mirror)/{s+=$NF} END{print s+0}' <<<"$1"; }
+parse_self_heal()       { awk '/metadata mirror/{print $NF; exit}' <<<"$1"; }
 
 # ---------------------------------------------------------------------------
 # Load expectations into associative arrays keyed by absolute image path

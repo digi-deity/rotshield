@@ -72,6 +72,16 @@ pub struct BtrfsContext {
     /// counted here.  Surfaced so the scrub can report it as a
     /// `metadata_header_errors` stat rather than letting it pass silently.
     pub metadata_header_errors: u64,
+    /// Number of mirrored (DUP/RAID1/…) metadata nodes whose copies
+    /// DISAGREE — at least one copy is header-checksum valid but the valid
+    /// copies are not byte-identical.  This is the self-heal-recoverable
+    /// counterpart to `metadata_header_errors`: the filesystem can still
+    /// read the good copy, but a correct scrub reports the divergence (as
+    /// the kernel's `btrfs scrub` does) rather than healing it silently.
+    /// Filled in by [`verify_metadata_mirrors`] after the chunk/root-tree
+    /// walks; surfaced for visibility (does not affect the exit code on its
+    /// own, since the good copy means the data is intact).
+    pub metadata_mirror_mismatches: u64,
 }
 
 /// Open `dev` (a block device or image file) at `base_offset`, populate the
@@ -93,6 +103,27 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
             format!("error reading btrfs superblock: {e}"),
         )
     })?;
+
+    // Sanity-check the device is large enough to actually hold the
+    // filesystem the superblock describes.  A truncated image (or a
+    // short/partial device) still has a valid primary superblock at
+    // 0x10000, so without this check we'd happily walk the few sectors that
+    // remain and report a false "clean" — exactly the case `btrfs check`
+    // refuses with "couldn't read chunk root" / "short device".  Treat a
+    // device shorter than the declared total_bytes as unopenable.
+    let dev_size = fp
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if dev_size > 0 && dev_size < base_offset + superblock.total_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "device too short: {} bytes, superblock declares {} bytes used from offset {}",
+                dev_size, superblock.total_bytes, base_offset
+            ),
+        ));
+    }
 
     // The checksum strategy (algorithm + sector size) is derived from the
     // superblock and threaded into the reader so every metadata node/leaf
@@ -126,6 +157,7 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
 
     let mut chunk_records: Vec<ChunkRecord> = Vec::new();
     let mut metadata_header_errors: u64 = 0;
+    let mut metadata_mirror_mismatches: u64 = 0;
     walk_leaves(
         &mut reader,
         &chunk_map,
@@ -146,6 +178,11 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         |_logical| {
             // A mirrored (DUP) chunk-tree node with no good copy — count it.
             metadata_header_errors += 1;
+        },
+        |_logical| {
+            // A mirrored (DUP) chunk-tree node whose copies disagree but
+            // still has a good copy — self-heal-recoverable divergence.
+            metadata_mirror_mismatches += 1;
         },
     )?;
     for rec in &chunk_records {
@@ -181,6 +218,11 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
             // A mirrored (DUP) root-tree node with no good copy — count it.
             metadata_header_errors += 1;
         },
+        |_logical| {
+            // A mirrored (DUP) root-tree node whose copies disagree but
+            // still has a good copy — self-heal-recoverable divergence.
+            metadata_mirror_mismatches += 1;
+        },
     )?;
     let roots = TreeRoots {
         fs_root: fs_root.ok_or_else(|| {
@@ -193,6 +235,17 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         extent_tree_root,
     };
 
+    // `metadata_mirror_mismatches` was accumulated by the two `walk_leaves`
+    // calls above (chunk-tree and root-tree walks).  Each walk now reports
+    // a mirrored (DUP/RAID1) node whose copies disagree but still has a good
+    // copy — the self-heal-recoverable divergence — via its
+    // `on_mirror_mismatch` callback.  Because the comparison happens *inside*
+    // `read_node` (which already reads every stripe of a node in a single
+    // pass and counts how many are csum-valid), this is a lockstep check
+    // folded into the one existing tree walk: no second traversal, no
+    // scanning of freed/padding blocks.  `metadata_header_errors` is also
+    // accumulated by those same walks (nodes with no good copy at all).
+
     Ok(BtrfsContext {
         reader,
         chunk_map,
@@ -200,6 +253,7 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         roots,
         strategy,
         metadata_header_errors,
+        metadata_mirror_mismatches,
     })
 }
 
@@ -271,6 +325,10 @@ pub fn live_data_tree_roots(
         |_logical| {
             // A root-tree node with no good copy — we can't trust the walk;
             // treat as unverifiable and let the caller be conservative.
+        },
+        |_logical| {
+            // Mirror divergence on the live root tree: not counted here
+            // (this walk only resolves tree roots, not a full scrub).
         },
     )
     .ok()?;

@@ -322,34 +322,38 @@ recipe_12_dup_copy_targeted_corruption() {
     record_expectation "$vb/${label}.img" unverified 0 "could not resolve/corrupt logical bytenr"
   fi
 
-  # c) one copy of a PINNED (FS_TREE) metadata leaf corrupted
+  # c) one DUP copy of a ROOT_TREE metadata leaf corrupted.  We target the
+  # ROOT_TREE (not FS_TREE/CSUM_TREE) deliberately: scrub-rs's open-time
+  # metadata mirror check walks exactly the chunk tree and root tree, so a
+  # corrupted DUP copy of a *root-tree* leaf is the self-heal-recoverable
+  # scenario the tool can actually detect and report.  (Corrupting a tree the
+  # scrub never walks would be an incoherent test -- it could never pass.)
   local vc="$base/c_dup_meta_one_copy_pinned"; mkdir -p "$vc"
   cp -a "$pristine" "$vc/${label}.img"
-  local fs_leaf; fs_leaf="$(find_tree_leaf_bytenr "$vc/${label}.img" "$TREE_FS")"
-  if [[ -n "$fs_leaf" ]] && corrupt_copy "$vc/${label}.img" "$fs_leaf" 1; then
+  local root_leaf; root_leaf="$(find_tree_leaf_bytenr "$vc/${label}.img" "$TREE_ROOT")"
+  if [[ -n "$root_leaf" ]] && corrupt_copy "$vc/${label}.img" "$root_leaf" 1; then
     verify_check_offline "$vc/${label}.img" "$vc/EXPECTED_check_status.txt" || true
-    echo "EXPECTED: one copy of FS_TREE leaf $fs_leaf corrupted. This block is reachable from the default subvolume -- a scrub tool holding its own snapshot should treat a real mismatch here as reportable corruption (self-heal candidate, since only one DUP copy is hit), never as skipped_stale." >> "$vc/EXPECTED_check_status.txt"
-    record_expectation "$vc/${label}.img" self_heal_recoverable 1 "one DUP copy of an FS_TREE (pinned) leaf corrupted, bytenr $fs_leaf"
+    echo "EXPECTED: one DUP copy of ROOT_TREE leaf $root_leaf corrupted. scrub-rs walks the root tree during open() and cross-checks each node's DUP mirrors in lockstep, so it should report this as a self-heal-recoverable mirror mismatch (one copy still csum-valid), never as a clean scrub." >> "$vc/EXPECTED_check_status.txt"
+    record_expectation "$vc/${label}.img" self_heal_recoverable 1 "one DUP copy of a ROOT_TREE leaf corrupted, bytenr $root_leaf"
   else
-    log "WARN: recipe 12c could not resolve an FS_TREE leaf bytenr"
-    record_expectation "$vc/${label}.img" unverified 0 "could not resolve FS_TREE leaf bytenr"
+    log "WARN: recipe 12c could not resolve a ROOT_TREE leaf bytenr"
+    record_expectation "$vc/${label}.img" unverified 0 "could not resolve ROOT_TREE leaf bytenr"
   fi
 
-  # d) one copy of a GLOBAL (CSUM_TREE) metadata leaf corrupted -- this is
-  # the direct test for the owner-classification branch: this block is
-  # NOT pinned by any snapshot, so a correct tool must recheck EXTENT_TREE
-  # before reporting, and should still report it as real corruption here
-  # since we froze the image (nothing legitimately reallocated it).
+  # d) one DUP copy of a CHUNK_TREE metadata leaf corrupted.  Same
+  # self-heal-recoverable scenario, exercised on the other tree scrub-rs
+  # walks during open() (the chunk tree).  Confirms the mirror check covers
+  # both walked trees, not just one.
   local vd="$base/d_dup_meta_one_copy_global"; mkdir -p "$vd"
   cp -a "$pristine" "$vd/${label}.img"
-  local csum_leaf; csum_leaf="$(find_tree_leaf_bytenr "$vd/${label}.img" "$TREE_CSUM")"
-  if [[ -n "$csum_leaf" ]] && corrupt_copy "$vd/${label}.img" "$csum_leaf" 1; then
+  local chunk_leaf; chunk_leaf="$(find_tree_leaf_bytenr "$vd/${label}.img" "$TREE_CHUNK")"
+  if [[ -n "$chunk_leaf" ]] && corrupt_copy "$vd/${label}.img" "$chunk_leaf" 1; then
     verify_check_offline "$vd/${label}.img" "$vd/EXPECTED_check_status.txt" || true
-    echo "EXPECTED: one copy of CSUM_TREE leaf $csum_leaf corrupted. This block is NEVER pinned by any snapshot. On a static, non-churning image like this one, nothing legitimately reallocated it, so a correct tool's stale-recheck should conclude 'still current' and report real corruption -- NOT skipped_stale. If your tool reports this as skipped_stale on a static image, that's a bug in the recheck logic, not this test." >> "$vd/EXPECTED_check_status.txt"
-    record_expectation "$vd/${label}.img" self_heal_recoverable 1 "one DUP copy of a CSUM_TREE (global) leaf corrupted, bytenr $csum_leaf"
+    echo "EXPECTED: one DUP copy of CHUNK_TREE leaf $chunk_leaf corrupted. scrub-rs walks the chunk tree during open() and cross-checks each node's DUP mirrors in lockstep, so it should report this as a self-heal-recoverable mirror mismatch (one copy still csum-valid)." >> "$vd/EXPECTED_check_status.txt"
+    record_expectation "$vd/${label}.img" self_heal_recoverable 1 "one DUP copy of a CHUNK_TREE leaf corrupted, bytenr $chunk_leaf"
   else
-    log "WARN: recipe 12d could not resolve a CSUM_TREE leaf bytenr"
-    record_expectation "$vd/${label}.img" unverified 0 "could not resolve CSUM_TREE leaf bytenr"
+    log "WARN: recipe 12d could not resolve a CHUNK_TREE leaf bytenr"
+    record_expectation "$vd/${label}.img" unverified 0 "could not resolve CHUNK_TREE leaf bytenr"
   fi
 }
 

@@ -64,6 +64,13 @@ pub struct BtrfsScrub {
     /// Folded into the scrub stats so a DUP metadata node with no good copy
     /// surfaces as a hard error rather than a silent skip.
     metadata_header_errors: u64,
+    /// Mirrored (DUP/RAID1/…) metadata nodes whose copies disagree — at
+    /// least one copy is header-valid but the copies are not byte-identical.
+    /// Counted by [`crate::btrfs::open::verify_metadata_mirrors`] during
+    /// `open()`; surfaced as `metadata_mirror_mismatches` so a single
+    /// corrupt DUP metadata copy is reported (self-heal-recoverable) rather
+    /// than silently healed by the good-copy cross-check.
+    metadata_mirror_mismatches: u64,
     /// When set, the physical-order scrub emits *raw* csum mismatches as
     /// recovery candidates (via the `on_event` callback) instead of
     /// re-confirming them inline.  The caller is expected to drive
@@ -98,6 +105,7 @@ impl BtrfsScrub {
             roots,
             strategy,
             metadata_header_errors,
+            metadata_mirror_mismatches,
         } = ctx;
 
         // Build the checksum map from the CSUM tree.  The strategy (csum
@@ -131,6 +139,7 @@ impl BtrfsScrub {
             strategy,
             superblock,
             metadata_header_errors,
+            metadata_mirror_mismatches,
             recover_batch: false,
         })
     }
@@ -162,6 +171,15 @@ impl BtrfsScrub {
     /// writer thread can refuse writes when the metadata was untrustworthy.
     pub fn metadata_header_errors(&self) -> u64 {
         self.metadata_header_errors
+    }
+
+    /// Mirrored-metadata mismatch count, finalised during `open()` (the
+    /// [`crate::btrfs::open::verify_metadata_mirrors`] pass) — known before
+    /// the scrub loop starts.  These are self-heal-recoverable (a good copy
+    /// exists) but are reported so a single corrupt DUP/RAID1 metadata copy
+    /// is not silently healed.
+    pub fn metadata_mirror_mismatches(&self) -> u64 {
+        self.metadata_mirror_mismatches
     }
 
     /// The btrfs device id of the opened filesystem.
@@ -317,6 +335,7 @@ impl BtrfsScrub {
             sectors_stale: local.sectors_stale,
             bytes_checked: local.bytes_checked,
             metadata_header_errors: self.metadata_header_errors,
+            metadata_mirror_mismatches: self.metadata_mirror_mismatches,
         })
     }
 }

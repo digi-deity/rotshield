@@ -103,6 +103,9 @@ pub fn build_dev_extents(
             // A mirrored (DUP) dev-tree node with no good copy — the walk
             // already skips that branch; nothing to count here.
         },
+        |_logical| {
+            // Mirror divergence on the dev tree is not counted here.
+        },
     )?;
     Ok(out)
 }

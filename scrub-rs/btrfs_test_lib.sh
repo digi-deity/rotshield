@@ -50,6 +50,7 @@ SB_SIZE=4096
 # the convenience name aliases).
 TREE_ROOT=1
 TREE_EXTENT=2
+TREE_ROOT=1
 TREE_CHUNK=3
 TREE_DEV=4
 TREE_FS=5
@@ -293,17 +294,85 @@ find_file_extent_logical_bytenr() {
 }
 
 # corrupt_copy <img> <logical> <copy>
-# copy=1 or 2 targets exactly that mirror (DUP/RAID1-family only -- meaningless
-# and should not be used on SINGLE profile chunks). copy=0 targets ALL
-# mirrors found for that logical address.
+# Genuinely corrupts EXACTLY ONE mirror (DUP/RAID1-family only -- meaningless
+# and should not be used on SINGLE profile chunks).  copy=1 targets the first
+# stripe, copy=2 the second; copy=0 targets ALL mirrors.
+#
+# NOTE: we do NOT use `btrfs-corrupt-block -c <copy>` for this.  In the
+# btrfs-progs build available here, `-c` zeroes the *entire* block across
+# every mirror (it does not isolate a single copy), which would make the
+# corruption unrecoverable and defeat the "one good mirror remains" scenario
+# the matrix is trying to exercise.  Instead we resolve the logical address
+# to its physical stripe offsets via `dump-tree`, then flip a few bytes in
+# ONLY the requested physical copy -- leaving the other copy byte-identical
+# and csum-valid, so the block is genuinely self-heal-recoverable.
 corrupt_copy() {
   local img="$1" logical="$2" copy="$3"
-  have_corrupt_block || { log "SKIP: btrfs-corrupt-block not installed"; return 1; }
-  if [[ "$copy" -eq 0 ]]; then
-    btrfs-corrupt-block -l "$logical" "$img" >>"$LOGFILE" 2>&1
-  else
-    btrfs-corrupt-block -l "$logical" -c "$copy" "$img" >>"$LOGFILE" 2>&1
+  [[ -n "$logical" ]] || { log "corrupt_copy: empty logical"; return 1; }
+  # Resolve every (stripe_index, physical_offset) for this logical address.
+  # `dump-tree` prints, per chunk item, `stripe N devid M offset O`; we pair
+  # each stripe's offset with the chunk's logical start + length to find the
+  # chunk that contains <logical>, then compute phys = stripe_offset + (logical - chunk_start).
+  # NOTE: we capture dump-tree to a temp file and open it from python, because
+  # piping into `python3 - arg <<'PY'` would make the heredoc (the script)
+  # consume stdin and the pipe data would be lost.
+  local dt map
+  dt="$(mktemp)"
+  sudo btrfs inspect-internal dump-tree "$img" >"$dt" 2>/dev/null
+  map="$(python3 - "$logical" "$dt" <<'PY'
+import sys, re
+logical = int(sys.argv[1])
+src = sys.argv[2]
+out = []  # (stripe_index, physical_offset_within_stripe)
+cur = None  # current chunk: (start, length, [stripe_offsets])
+with open(src) as fh:
+    for line in fh:
+        m = re.search(r'item \d+ key \(FIRST_CHUNK_TREE CHUNK_ITEM (\d+)\)', line)
+        if m:
+            if cur: out.append(cur)
+            cur = {'start': int(m.group(1)), 'len': 0, 'stripes': []}
+            continue
+        if cur is None:
+            continue
+        lm = re.search(r'length (\d+)', line)
+        if lm: cur['len'] = int(lm.group(1))
+        sm = re.search(r'stripe (\d+) devid \d+ offset (\d+)', line)
+        if sm: cur['stripes'].append((int(sm.group(1)), int(sm.group(2))))
+if cur: out.append(cur)
+for c in out:
+    if c['start'] <= logical < c['start'] + c['len']:
+        for idx, off in c['stripes']:
+            print(f"{idx} {off + (logical - c['start'])}")
+        break
+PY
+)"
+  rm -f "$dt"
+  [[ -n "$map" ]] || { log "corrupt_copy: could not resolve logical $logical to a stripe"; return 1; }
+  # Flip a few bytes in the requested copy/copies.  The <copy> argument is
+  # 1-based (1 = first stripe, 2 = second), but the resolver's stripe indices
+  # are 0-based, so map copy -> (copy-1) for the awk filter.
+  local targets="$map"
+  if [[ "$copy" -ne 0 ]]; then
+    targets="$(echo "$map" | awk -v c="$((copy-1))" '$1 == c {print}')"
+    [[ -n "$targets" ]] || { log "corrupt_copy: copy $copy not found for logical $logical"; return 1; }
   fi
+  echo "$targets" | while read -r _idx phys; do
+    sudo python3 - "$img" "$phys" <<'PY'
+import sys
+img, phys = sys.argv[1], int(sys.argv[2])
+with open(img, 'r+b') as f:
+    f.seek(phys)
+    buf = bytearray(f.read(64))
+    # Flip a few bytes in the middle of the node body (past the 32-byte csum
+    # prefix and the header) so the header csum no longer validates but the
+    # block stays structurally plausible.
+    for o in (40, 48, 56):
+        buf[o] ^= 0xFF
+    f.seek(phys)
+    f.write(buf)
+PY
+  done
+  return 0
 }
 
 # corrupt_metadata_field <img> <bytenr> <field>

@@ -28,6 +28,18 @@ use super::reader::FsReader;
 /// could not be recovered via the DUP cross-check; a single corrupt copy
 /// that has a good sibling is transparently skipped and never reported.
 ///
+/// `on_mirror_mismatch` is invoked for every *mirrored* (DUP/RAID1/…) node
+/// whose copies **disagree** — at least one mirror is header-valid (so the
+/// block is still readable / self-healable) but not *every* mirror validated
+/// (a copy is corrupt).  This is the self-heal-recoverable counterpart to
+/// `on_metadata_error`: the filesystem can read the good copy, but a correct
+/// scrub should *report* the divergence (as the kernel's `btrfs scrub`
+/// does) rather than healing it silently.  It fires only for nodes that are
+/// otherwise trustworthy (the walk descends into them normally); the
+/// divergence is surfaced via this callback so the caller can count it as a
+/// [`crate::fs::ScrubStats::metadata_mirror_mismatches`] without disturbing
+/// traversal.
+///
 /// **Abort-on-unverifiable-node (per branch):** when a node's header
 /// checksum cannot be verified against *any* mirror copy, that **branch**
 /// of the tree is aborted — the node is skipped entirely (we do not descend
@@ -59,16 +71,18 @@ struct NodeRef {
     exp_owner: Option<u64>,
 }
 
-pub fn walk_leaves<F, E>(
+pub fn walk_leaves<F, E, M>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
     mut f: F,
     mut on_metadata_error: E,
+    mut on_mirror_mismatch: M,
 ) -> std::io::Result<()>
 where
     F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
     E: FnMut(u64),
+    M: FnMut(u64),
 {
     // BFS queue of (logical, expectation) pairs to visit.  We use a Vec as
     // a deque.  The root has no parent, so its expectations are unknown.
@@ -103,6 +117,14 @@ where
             // branches are still scrubbed.
             on_metadata_error(logical);
             continue;
+        }
+        // The node is trustworthy (a good copy exists).  If its mirror
+        // copies disagree (≥1 valid but not all valid), report the
+        // divergence as a self-heal-recoverable mirror mismatch — the
+        // filesystem can still read the good copy, but the divergence should
+        // surface rather than be silently healed by the DUP cross-check.
+        if res.mirror_mismatch {
+            on_mirror_mismatch(logical);
         }
         let node = res.node;
         match node {

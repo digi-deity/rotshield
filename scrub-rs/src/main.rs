@@ -415,6 +415,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     println!("  sectors stale      : {}", stats.sectors_stale + batch_stats.stale);
     println!("  sectors read error : {}", stats.sectors_read_error);
     println!("  metadata hdr errs  : {}", stats.metadata_header_errors);
+    println!("  metadata mirror   : {}", stats.metadata_mirror_mismatches);
     println!("  bytes checked      : {}", stats.bytes_checked);
 
     if recover {
