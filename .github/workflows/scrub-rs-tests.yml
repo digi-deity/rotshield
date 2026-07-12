@@ -344,3 +344,96 @@ jobs:
           sudo rm -f d_p d_q d_d1 d_d2 d_d3 d_d4 || true
 
           echo "Cleanup completed"
+
+  # ===========================================================================
+  # btrfs matrix + live-simulation tests (no NonRAID array required).
+  #
+  # Two independent stages, both driven entirely by loop-backed single-device
+  # btrfs images:
+  #   1. btrfs-matrix   — generate the image matrix (test_matrix.sh) and run
+  #      scrub-rs over every image, comparing against the btrfs-captured
+  #      ground truth (run_matrix.sh). 16/16 expected.
+  #   2. btrfs-live-sim — mount a fresh image, drive concurrent write/delete/
+  #      snapshot churn, and run scrub-rs alongside it (false-positive and
+  #      true-positive scenarios via btrfs_live_scrub_test.sh).
+  #
+  # btrfs-corrupt-block is needed by test_matrix.sh's recipe 11 (extent-tree
+  # corruption) and is only built with btrfs-progs' --enable-experimental, so
+  # we build it from source here. Everything else degrades gracefully if it
+  # is absent.
+  # ===========================================================================
+  btrfs-matrix-tests:
+    runs-on: ubuntu-latest
+    name: scrub-rs btrfs matrix + live simulation
+    timeout-minutes: 30
+    needs: []   # standalone — does not depend on the array job
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install btrfs + build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y btrfs-progs gdisk python3
+          # Build deps for compiling btrfs-corrupt-block from source.
+          sudo apt install -y build-essential libext2fs-dev libz-dev \
+            libblkid-dev uuid-dev zlib1g-dev liblzo2-dev
+          modprobe btrfs 2>/dev/null || true
+
+      - name: Build btrfs-corrupt-block from source
+        run: |
+          sudo apt build-dep -y btrfs-progs
+          cd /tmp
+          rm -rf btrfs-progs-src
+          apt source btrfs-progs
+          cd btrfs-progs-*
+          make btrfs-corrupt-block
+          sudo install -m 0755 btrfs-corrupt-block /usr/local/bin/btrfs-corrupt-block
+          command -v btrfs-corrupt-block && echo "btrfs-corrupt-block ready" || echo "WARN: btrfs-corrupt-block not built"
+
+      - name: Build scrub-rs
+        run: |
+          cd scrub-rs
+          cargo build --release
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+          echo "SCRUB_RS_DIR=$PWD/target/release" >> "$GITHUB_ENV"
+
+      - name: btrfs matrix — generate images + run scrub-rs
+        run: |
+          cd scrub-rs
+          # Generate the image matrix (loop-backed, single-device btrfs).
+          sudo ./test_matrix.sh ./btrfs_test_images 2>&1 | tail -20
+          # Run scrub-rs over every image and compare to ground truth.
+          sudo -E ./run_matrix.sh ./btrfs_test_images 2>&1 | tail -30
+          echo "--- matrix summary ---"
+          tail -1 matrix_results.txt
+          grep -qE '^TOTAL=[0-9]+ PASS=[0-9]+ FAIL=0$' matrix_results.txt \
+            || { echo "::error::btrfs matrix had failures"; exit 1; }
+
+      - name: btrfs live simulation — concurrent churn + scrub
+        run: |
+          cd scrub-rs
+          sudo ./btrfs_live_scrub_test.sh \
+            --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE} --recover" \
+            --mode both --duration 60 --warmup 10 --intensity med
+          echo "--- live-sim summaries ---"
+          for s in /root/btrfs_live_scrub_test_*/false-positive/SUMMARY.txt \
+                   /root/btrfs_live_scrub_test_*/true-positive/SUMMARY.txt; do
+            [[ -f "$s" ]] && { echo "### $s"; cat "$s"; }
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Detach any loop devices the matrix/live-sim scripts may have left.
+          for ld in $(losetup -a 2>/dev/null | awk -F: '{print $1}'); do
+            sudo losetup -d "$ld" 2>/dev/null || true
+          done
+          sudo rm -rf /root/btrfs_live_scrub_test_* || true
+          sudo rm -rf scrub-rs/btrfs_test_images || true
+          echo "Cleanup completed"
