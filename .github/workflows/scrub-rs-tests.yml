@@ -24,6 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     name: scrub-rs Integration Tests
     timeout-minutes: 20
+    # The btrfs matrix + live-simulation job is more fundamental (no array
+    # needed) and must pass first; the array tests build on top of it.
+    needs: [btrfs-matrix-tests]
 
     steps:
       - uses: actions/checkout@v4
