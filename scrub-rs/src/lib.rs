@@ -6,8 +6,11 @@
 //! about btrfs.  Utility binaries can pull in either side independently.
 
 pub mod array;
+pub mod batch_recover;
 pub mod btrfs;
+pub mod btrfs2;
 pub mod fs;
+pub mod freeze;
 pub mod recovery;
 
 pub use btrfs::csum_strategy::CsumStrategy;

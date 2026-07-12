@@ -31,6 +31,21 @@ use super::tree::walk_leaves;
 pub struct TreeRoots {
     pub fs_root: u64,
     pub csum_root: u64,
+    /// Logical address of the DEV_TREE root.  Present on every btrfs
+    /// filesystem (objectid 4); the physical-order scrub
+    /// ([`crate::btrfs::scrub::scrub_dev_tree`]) walks it to enumerate
+    /// dev-extents in ascending physical order.  `None` only if the root
+    /// tree somehow lacks a DEV_TREE ROOT_ITEM — which should never happen
+    /// on a real filesystem, so callers may `expect` it.
+    pub dev_tree_root: Option<u64>,
+    /// Logical address of the EXTENT_TREE root (objectid 2).  Used by the
+    /// data-scrub mismatch filter ([`crate::btrfs::extent::extent_covers`])
+    /// to confirm a mismatching sector is still owned by a live data extent
+    /// (vs. an orphaned/freed csum entry left behind by churn) before it is
+    /// reported as corruption.  `None` only if the root tree lacks an
+    /// EXTENT_TREE ROOT_ITEM — which should never happen on a real
+    /// filesystem, so callers may `expect` it.
+    pub extent_tree_root: Option<u64>,
 }
 
 /// A btrfs filesystem opened for reading, after the chunk map is populated
@@ -98,7 +113,16 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         superblock.node_size as usize,
         base_offset,
         Some(strategy),
-    );
+    )
+    // Each NonRAID slot is a single-device filesystem, so the reader's
+    // backing store is exactly one device.  Register its devid so the
+    // physical-order scrub's `read_physical` calls are guarded against
+    // ever targeting the wrong disk.
+    .with_devid(superblock.devid)
+    // Register the filesystem UUID so `read_node` can reject a metadata
+    // block whose `fsid` does not match (a misdirected read or a block
+    // from a different filesystem).
+    .with_fsid(superblock.fsid);
 
     let mut chunk_records: Vec<ChunkRecord> = Vec::new();
     let mut metadata_header_errors: u64 = 0;
@@ -131,6 +155,8 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
     // Walk the root tree to locate FS_TREE and CSUM_TREE.
     let mut fs_root: Option<u64> = None;
     let mut csum_root: Option<u64> = None;
+    let mut dev_tree_root: Option<u64> = None;
+    let mut extent_tree_root: Option<u64> = None;
     walk_leaves(
         &mut reader,
         &chunk_map,
@@ -143,6 +169,8 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
                     match slot.key.objectid {
                         key::objectid::FS_TREE => fs_root = Some(ri.bytenr),
                         key::objectid::CSUM_TREE => csum_root = Some(ri.bytenr),
+                        key::objectid::DEV_TREE => dev_tree_root = Some(ri.bytenr),
+                        key::objectid::EXTENT_TREE => extent_tree_root = Some(ri.bytenr),
                         _ => {}
                     }
                 }
@@ -161,6 +189,8 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         csum_root: csum_root.ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "CSUM_TREE root not found in btrfs root tree")
         })?,
+        dev_tree_root,
+        extent_tree_root,
     };
 
     Ok(BtrfsContext {
@@ -171,4 +201,78 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         strategy,
         metadata_header_errors,
     })
+}
+
+/// Re-read the **current** data-tree roots (EXTENT_TREE *and* CSUM_TREE)
+/// from the live on-disk superblock, rather than the ones captured at
+/// `open()` time.
+///
+/// Why this matters: the scrub walks a *frozen snapshot* of the metadata it
+/// loaded at `open()` (csum map, chunk map, tree roots). On a live mounted
+/// filesystem that snapshot goes stale the moment a new transaction commits
+/// — the root tree, and with it the EXTENT_TREE and CSUM_TREE root bytenrs,
+/// move to newer locations. A reconfirmation that consulted the *open-time*
+/// trees could therefore mis-classify a freshly-freed or rewritten extent,
+/// producing a false positive (or, worse, reading a freed/reused block).
+///
+/// So the mismatch filter calls this *only when a csum mismatch is found*,
+/// to obtain the absolute latest EXTENT_TREE and CSUM_TREE roots and
+/// reconfirm against the most recent committed trees. This is deliberately
+/// NOT done up front: it would force the whole scrub onto the live trees
+/// and defeat the point of the frozen snapshot (stable, reproducible walk
+/// order, no mid-scrub tree mutation). The main scrub path keeps using the
+/// in-memory snapshot; only the rare mismatch takes the cost of a few extra
+/// tree descents (superblock read + root-tree walk + two point lookups) to
+/// get current truth.
+///
+/// Both trees are returned because a faithful reconfirmation needs both:
+/// * the **EXTENT_TREE** answers "is this logical sector still owned by a
+///   live data extent?" (liveness / stale / `nodatasum`);
+/// * the **CSUM_TREE** answers "what csum does the *current* filesystem
+///   expect here?" — if churn rewrote the extent, the live csum differs
+///   from what we read, which is benign churn rather than corruption.
+///
+/// Returns `None` if the live superblock or root tree cannot be read — the
+/// caller should then be conservative and treat the sector as a real
+/// mismatch (never hide corruption just because we couldn't re-verify).
+pub fn live_data_tree_roots(
+    reader: &mut FsReader,
+    chunk_map: &ChunkMap,
+    base_offset: u64,
+) -> Option<(u64, u64)> {
+    // The reader owns the File handle; dup it and read the primary superblock.
+    let mut fp = reader.reopen().ok()?;
+    let sb = Superblock::read(&mut fp, base_offset).ok()?;
+    let root_tree = sb.root;
+
+    // Walk the *current* root tree to find the EXTENT_TREE and CSUM_TREE
+    // ROOT_ITEMs.
+    let mut extent_root: Option<u64> = None;
+    let mut csum_root: Option<u64> = None;
+    walk_leaves(
+        reader,
+        chunk_map,
+        root_tree,
+        |_r, leaf, _logical| {
+            for i in 0..leaf.slots.len() {
+                let slot = leaf.slots[i];
+                if slot.key.ty != key::key_type::ROOT_ITEM {
+                    continue;
+                }
+                let ri = RootItem::parse(leaf.item_data(i));
+                match slot.key.objectid {
+                    key::objectid::EXTENT_TREE => extent_root = Some(ri.bytenr),
+                    key::objectid::CSUM_TREE => csum_root = Some(ri.bytenr),
+                    _ => {}
+                }
+            }
+            Ok(())
+        },
+        |_logical| {
+            // A root-tree node with no good copy — we can't trust the walk;
+            // treat as unverifiable and let the caller be conservative.
+        },
+    )
+    .ok()?;
+    Some((extent_root?, csum_root?))
 }

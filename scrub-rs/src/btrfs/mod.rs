@@ -2,6 +2,7 @@
 
 pub mod chunk;
 pub mod csum;
+pub mod dev_extent;
 pub mod csum_strategy;
 pub mod extent;
 pub mod key;

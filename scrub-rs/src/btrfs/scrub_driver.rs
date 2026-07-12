@@ -27,10 +27,11 @@ use std::io;
 use crate::btrfs::chunk::ChunkMap;
 use crate::btrfs::csum::{build_csum_map, CsumMap};
 use crate::btrfs::csum_strategy::CsumStrategy;
+use crate::btrfs::dev_extent::build_dev_extents;
 use crate::btrfs::reader::FsReader;
-use crate::btrfs::scrub::scrub_csum_tree;
+use crate::btrfs::scrub::scrub_dev_tree;
 use crate::btrfs::superblock::Superblock;
-use crate::fs::{FilesystemScrub, ScrubEvent, ScrubStats};
+use crate::fs::{ScrubEvent, ScrubStats};
 
 /// A btrfs filesystem scrub.
 ///
@@ -52,6 +53,10 @@ pub struct BtrfsScrub {
     reader: FsReader,
     chunk_map: ChunkMap,
     csum_map: CsumMap,
+    /// Dev-extents enumerated from the DEV_TREE, in ascending physical order.
+    /// The drive set for the physical-order scrub ([`scrub_dev_tree`]); built
+    /// once in [`BtrfsScrub::open`] so the caller can pick either scrub path.
+    dev_extents: Vec<crate::btrfs::dev_extent::DevExtent>,
     strategy: CsumStrategy,
     superblock: Superblock,
     /// Metadata nodes whose *all* mirror copies failed header-checksum
@@ -59,6 +64,14 @@ pub struct BtrfsScrub {
     /// Folded into the scrub stats so a DUP metadata node with no good copy
     /// surfaces as a hard error rather than a silent skip.
     metadata_header_errors: u64,
+    /// When set, the physical-order scrub emits *raw* csum mismatches as
+    /// recovery candidates (via the `on_event` callback) instead of
+    /// re-confirming them inline.  The caller is expected to drive
+    /// batched reconfirmation + recovery (typically on a separate writer
+    /// thread that owns the live-filesystem freeze).  Used only in
+    /// `--recover --write` mode; plain scrubs keep the inline reconfirm so
+    /// their mismatch/stale accounting is unchanged.
+    recover_batch: bool,
 }
 
 impl BtrfsScrub {
@@ -96,14 +109,79 @@ impl BtrfsScrub {
         let mut csum_map = CsumMap::new();
         build_csum_map(&mut reader, &chunk_map, roots.csum_root, &strategy, &mut csum_map)?;
 
+        // Enumerate the device's dev-extents from the DEV_TREE, in ascending
+        // physical order.  This is the drive set for the physical-order
+        // scrub ([`scrub_dev_tree`]); it is built eagerly here (cheap — a
+        // single tree walk) so the caller can choose either scrub path
+        // without re-opening the device.  `dev_tree_root` is always present
+        // on a real filesystem; `expect` keeps the contract tight.
+        let dev_tree_root = roots.dev_tree_root.expect("DEV_TREE root missing from btrfs root tree");
+        let dev_extents = build_dev_extents(
+            &mut reader,
+            &chunk_map,
+            dev_tree_root,
+            superblock.devid,
+        )?;
+
         Ok(Self {
             reader,
             chunk_map,
             csum_map,
+            dev_extents,
             strategy,
             superblock,
             metadata_header_errors,
+            recover_batch: false,
         })
+    }
+
+    /// Enable batched recovery mode: the physical-order scrub emits raw
+    /// csum mismatches as candidates (via `on_event`) instead of
+    /// re-confirming inline.  The caller drives batched reconfirm +
+    /// recovery (typically a writer thread owning the freeze).  Must be
+    /// set before [`FilesystemScrub::run`].
+    pub fn set_recover_batch(&mut self, on: bool) {
+        self.recover_batch = on;
+    }
+
+    /// The checksum strategy (algorithm + sector size), copied out for a
+    /// writer thread that needs to re-confirm candidates against the live
+    /// trees.
+    pub fn strategy(&self) -> CsumStrategy {
+        self.strategy
+    }
+
+    /// A clone of the populated chunk map, for a writer thread that needs
+    /// to resolve logical→physical during re-confirmation.
+    pub fn chunk_map_clone(&self) -> ChunkMap {
+        self.chunk_map.clone()
+    }
+
+    /// Metadata-header error count, finalised during `open()` (the
+    /// chunk/root-tree walks) — known before the scrub loop starts, so a
+    /// writer thread can refuse writes when the metadata was untrustworthy.
+    pub fn metadata_header_errors(&self) -> u64 {
+        self.metadata_header_errors
+    }
+
+    /// The btrfs device id of the opened filesystem.
+    pub fn devid(&self) -> u64 {
+        self.superblock.devid
+    }
+
+    /// The filesystem node size (for constructing a re-confirm reader).
+    pub fn node_size(&self) -> usize {
+        self.superblock.node_size as usize
+    }
+
+    /// The filesystem UUID (for constructing a re-confirm reader).
+    pub fn fsid(&self) -> [u8; 16] {
+        self.superblock.fsid
+    }
+
+    /// The partition byte offset this filesystem was opened at.
+    pub fn base_offset(&self) -> u64 {
+        self.reader.base_offset()
     }
 
     /// Borrow the parsed superblock — exposed for diagnostic / `--dump`
@@ -131,10 +209,26 @@ impl BtrfsScrub {
     pub fn csum_bytes(&self) -> u64 {
         self.csum_map.len() as u64 * self.strategy.sector_size
     }
-}
 
-impl FilesystemScrub for BtrfsScrub {
-    fn run(&mut self, callbacks: &mut dyn crate::fs::ScrubCallbacks) -> io::Result<ScrubStats> {
+    /// Number of dev-extents the DEV_TREE walk enumerated — useful for the
+    /// caller's progress log when driving the physical-order scrub.
+    pub fn num_dev_extents(&self) -> usize {
+        self.dev_extents.len()
+    }
+
+    /// Run the scrub: drive reads off the DEV_TREE (ascending physical
+    /// order) for a single front-to-back pass over the disk, while still
+    /// consulting the CSUM tree (via `csum_map`) for the per-sector
+    /// expected checksum.  This is the sole scrub path — the earlier
+    /// per-inode (`scrub_extents`) and logical-order CSUM-tree
+    /// (`scrub_csum_tree`) variants were removed.  See
+    /// [`crate::btrfs::scrub::scrub_dev_tree`] for the `ScrubStats`
+    /// semantics (notably `sectors_no_csum` stays 0 here).
+    pub fn run(
+        &mut self,
+        callbacks: &mut dyn crate::fs::ScrubCallbacks,
+        freeze: Option<&mut crate::freeze::FreezeController>,
+    ) -> io::Result<ScrubStats> {
         // Adapt btrfs's per-sector `SectorResult` callback into the two
         // contract streams:
         //
@@ -174,32 +268,39 @@ impl FilesystemScrub for BtrfsScrub {
             // 2. Recovery-only event.  The verifier is built from the
             //    filesystem's csum strategy (algorithm + hash length) bound
             //    together with the stored bytes — recovery never learns
-            //    which checksum btrfs used.
+            //    which checksum btrfs used.  `Arc` so a batched writer
+            //    thread can clone it onto its channel.
             let verify = r.stored_csum.as_ref().map(|stored| {
                 let stored = stored.clone();
                 let strategy = self.strategy;
-                Box::new(move |b: &[u8]| strategy.compute(b) == stored)
-                    as Box<dyn Fn(&[u8]) -> bool + Send + Sync>
+                std::sync::Arc::new(move |b: &[u8]| strategy.compute(b) == stored)
+                    as std::sync::Arc<dyn Fn(&[u8]) -> bool + Send + Sync>
             });
             callbacks.on_event(&ScrubEvent {
                 array_phys: r.array_phys,
                 block_size,
                 verify,
+                logical: r.logical,
+                devid: r.devid,
+                stored_csum: r.stored_csum.clone(),
             });
         };
 
-        let local = scrub_csum_tree(
+        let local = scrub_dev_tree(
             &mut self.reader,
             &self.chunk_map,
             &self.csum_map,
+            &self.dev_extents,
             &self.strategy,
+            self.recover_batch,
+            freeze,
             &mut emit,
         );
 
-        // btrfs's `scrub_csum_tree` doesn't surface an io::Error today — it
-        // logs read-errors inline and folds them into the stats — so we
-        // return Ok here.  A future failure that should abort the scrub
-        // can be propagated via the explicit `io::Result` return.
+        // `scrub_dev_tree` doesn't surface an io::Error today — it logs
+        // read-errors inline and folds them into the stats — so we return
+        // Ok here.  A future failure that should abort the scrub can be
+        // propagated via the explicit `io::Result` return.
         //
         // `metadata_header_errors` comes from the chunk/root-tree walks in
         // `open.rs` (DUP metadata nodes with no good copy).  It is a
@@ -213,6 +314,7 @@ impl FilesystemScrub for BtrfsScrub {
             sectors_mismatch: local.sectors_mismatch,
             sectors_no_csum: local.sectors_no_csum,
             sectors_read_error: local.sectors_read_error,
+            sectors_stale: local.sectors_stale,
             bytes_checked: local.bytes_checked,
             metadata_header_errors: self.metadata_header_errors,
         })

@@ -12,6 +12,9 @@ pub mod objectid {
     pub const CSUM_TREE: u64 = 7;
     pub const UUID_TREE: u64 = 9;
     pub const FREE_SPACE_TREE: u64 = 10;
+    /// EXTENT_CSUM_OBJECTID (-10) — the objectid of every CSUM_TREE item.
+    /// Stored as the u64 two's-complement of -10.
+    pub const EXTENT_CSUM_OBJECTID: u64 = 0xFFFF_FFFF_FFFF_FFF6;
 }
 
 /// btrfs key type byte — discriminates the payload of a leaf item / the
@@ -26,6 +29,7 @@ pub mod key_type {
     pub const ROOT_ITEM: u8 = 132;
     pub const EXTENT_ITEM: u8 = 168;
     pub const METADATA_ITEM: u8 = 169;
+    pub const DEV_EXTENT_KEY: u8 = 204;
     pub const DEV_ITEM: u8 = 216;
     pub const CHUNK_ITEM: u8 = 228;
 }
@@ -35,14 +39,25 @@ pub mod bg_flag {
     pub const DATA: u64 = 1 << 0;
     pub const SYSTEM: u64 = 1 << 1;
     pub const METADATA: u64 = 1 << 2;
+    pub const RAID0: u64 = 1 << 3;
     pub const RAID1: u64 = 1 << 4;
     pub const DUP: u64 = 1 << 5;
+    pub const RAID10: u64 = 1 << 6;
+    pub const RAID5: u64 = 1 << 7;
+    pub const RAID6: u64 = 1 << 8;
     pub const RAID1C3: u64 = 1 << 9;
     pub const RAID1C4: u64 = 1 << 10;
 
     /// Any flag that means each stripe is a full mirror copy.
     pub const MIRROR_MASK: u64 =
         RAID1 | DUP | RAID1C3 | RAID1C4;
+
+    /// Profiles the physical-order scrub explicitly rejects: striped layouts
+    /// whose mapping math the simple linear resolver cannot handle.  A
+    /// dev-extent in any of these chunks is not a contiguous sub-range of the
+    /// chunk's logical space, so `phys - dev_extent.phys_start` does not map
+    /// linearly to a logical offset.
+    pub const STRIPED_MASK: u64 = RAID0 | RAID10 | RAID5 | RAID6;
 }
 
 /// A btrfs disk key: (objectid, type, offset).
@@ -54,6 +69,11 @@ pub struct Key {
 }
 
 impl Key {
+    /// Construct a key directly.
+    pub fn new(objectid: u64, ty: u8, offset: u64) -> Self {
+        Self { objectid, ty, offset }
+    }
+
     /// Parse a 17-byte key from `buf` at `pos`.
     pub fn parse(buf: &[u8], pos: usize) -> Self {
         let objectid = u64::from_le_bytes([

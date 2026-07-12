@@ -88,7 +88,7 @@ pub fn parse_sys_chunks(buf: &[u8]) -> Vec<ChunkRecord> {
 /// Immutable after the chunk-tree walk.  Held by reference (`&ChunkMap`) and
 /// shared between the reader, the scrub loop, and the recovery callback —
 /// no cloning needed.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ChunkMap {
     entries: Vec<MapEntry>,
 }
@@ -99,7 +99,26 @@ struct MapEntry {
     end: u64,
     stripe_len: u64,
     mirrored: bool,
+    /// The chunk's `btrfs_chunk.type` field — packs both the block-group
+    /// class (DATA/METADATA/SYSTEM) and the profile bits
+    /// (SINGLE/DUP/RAID*).  Exposed via [`ChunkMap::info`] so callers can
+    /// filter by class (skip non-DATA chunks) and guard against striped
+    /// profiles (which the physical-order scrub cannot map linearly).
+    ty: u64,
     stripes: Vec<Stripe>,
+}
+
+/// Resolved chunk information for a dev extent, keyed by the chunk's logical
+/// start (`chunk_offset`).
+///
+/// Mirrors the `ChunkInfo` in `btrfs2/devtree.rs` so the physical-order
+/// scrub can answer "what type/profile is the chunk starting at this logical
+/// offset?" without re-walking the chunk tree.  `flags` is the raw
+/// `btrfs_chunk.type` field; test it against [`super::key::bg_flag`].
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkInfo {
+    pub length: u64,
+    pub flags: u64,
 }
 
 impl ChunkMap {
@@ -111,10 +130,29 @@ impl ChunkMap {
             end,
             stripe_len: rec.chunk.stripe_len,
             mirrored,
+            ty: rec.chunk.ty,
             stripes: rec.chunk.stripes.clone(),
         });
         // Keep sorted by begin for binary search.
         self.entries.sort_by_key(|e| e.begin);
+    }
+
+    /// Resolve the chunk starting at logical address `chunk_offset`, if one
+    /// is recorded.  Returns its `length` and raw `flags` (the
+    /// `btrfs_chunk.type` field) so callers can filter by block-group class
+    /// and guard against striped profiles.
+    pub fn info(&self, chunk_offset: u64) -> Option<ChunkInfo> {
+        let idx = self.entries.binary_search_by(|e| {
+            if chunk_offset < e.begin {
+                std::cmp::Ordering::Greater
+            } else if chunk_offset >= e.end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }).ok()?;
+        let e = &self.entries[idx];
+        Some(ChunkInfo { length: e.end - e.begin, flags: e.ty })
     }
 
     /// Resolve `logical` to a (devid, physical) on the first available stripe.

@@ -45,7 +45,7 @@ const STAT_PATHS: &[&str] = &["/proc/nmdstat", "/proc/mdstat"];
 /// rdev directly.  For array partitions (e.g. `/dev/nmd1p1`) this is 0
 /// because the array driver already strips the per-disk header; for raw
 /// rdevs (e.g. `/dev/loop2` named by `rdevName.N`) it is `rdevOffset.N * 512`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ArrayConfig {
     /// Slot number → raw rdev path (`/dev/loop2`, ...).
     pub data_devs: BTreeMap<u64, PathBuf>,

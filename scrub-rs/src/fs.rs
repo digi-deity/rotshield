@@ -81,6 +81,8 @@
 /// can be moved across threads if the caller ever wants a parallel
 /// scrub — btrfs's `crc32c` and ZFS's sha256 closures are both trivially
 /// thread-safe since they only read their captured bytes.
+use std::sync::Arc;
+
 pub struct ScrubEvent {
     /// Byte offset on the failing disk's **array partition**
     /// (`/dev/nmd1p1`-space).  The array layer adds `rdevOffset` to reach
@@ -98,7 +100,24 @@ pub struct ScrubEvent {
     /// stored value and bound it together with the right algorithm into
     /// this closure; the caller passes it straight into
     /// [`crate::recovery::RecoveryInput::verifier`].
-    pub verify: Option<Box<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    ///
+    /// Stored as `Arc` (not `Box`) so a recovery sink can clone it onto a
+    /// channel for a batched writer thread without re-deriving the
+    /// algorithm.
+    pub verify: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    /// Logical address of the sector (btrfs-internal).  Carried so a
+    /// filesystem-specific recovery sink can re-confirm the mismatch
+    /// against the live EXTENT_TREE/CSUM_TREE at write time (the
+    /// reconfirmation is deferred to the recovery batch, not done inline
+    /// in the scrub loop).  `0` for filesystems that don't expose it.
+    pub logical: u64,
+    /// btrfs device id of the failing disk (== NonRAID slot for our
+    /// arrays).  Carried alongside `logical` for re-confirmation.
+    pub devid: u64,
+    /// The stored (expected) checksum bytes from the CSUM tree, needed by
+    /// the re-confirmation step to compare against the *live* expected
+    /// csum.  `None` when the sector has no stored checksum.
+    pub stored_csum: Option<Vec<u8>>,
 }
 
 /// Rollup result returned by [`FilesystemScrub::run`] when scrubbing is
@@ -110,6 +129,16 @@ pub struct ScrubStats {
     pub sectors_mismatch: u64,
     pub sectors_no_csum: u64,
     pub sectors_read_error: u64,
+    /// Sectors whose stored csum did NOT match the on-disk data, but which
+    /// the EXTENT_TREE shows are no longer owned by a live data extent (the
+    /// csum entry is orphaned/freed, or the extent was written `nodatasum`).
+    /// These are benign churn artifacts, NOT corruption, so they are NOT
+    /// counted in `sectors_mismatch` and do NOT trigger recovery.  Surfaced
+    /// as a distinct counter so a mismatch tally stays honest and an
+    /// operator can see how much stale noise was filtered out.  Does not
+    /// affect the exit code (only mismatch / read-error / metadata-header
+    /// errors do).
+    pub sectors_stale: u64,
     pub bytes_checked: u64,
     /// Metadata nodes whose *all* mirror copies failed header-checksum
     /// verification (DUP/RAID1 metadata with no good copy).  A single
@@ -174,5 +203,17 @@ pub trait FilesystemScrub {
     /// progress / informational log lines through `on_log` outside the
     /// per-sector loop (e.g. "walking chunk tree: 24 leaves") — the
     /// contract doesn't police log volume.
-    fn run(&mut self, callbacks: &mut dyn ScrubCallbacks) -> std::io::Result<ScrubStats>;
+    ///
+    /// `freeze` is an optional live-filesystem freeze controller.  When
+    /// `Some`, the implementation acquires a scoped freeze around each
+    /// reconfirmation+recovery-write so a live mounted filesystem cannot
+    /// race the write with its own (now-stale) data.  Pass `None` when
+    /// scrubbing an offline/unmounted image, or when recovery writes are
+    /// disabled (dry-run).  The freeze is held only for the per-sector
+    /// reconfirm+write window — never for the whole scrub run.
+    fn run(
+        &mut self,
+        callbacks: &mut dyn ScrubCallbacks,
+        freeze: Option<&mut crate::freeze::FreezeController>,
+    ) -> std::io::Result<ScrubStats>;
 }

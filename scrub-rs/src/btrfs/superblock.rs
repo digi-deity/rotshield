@@ -38,6 +38,12 @@ pub struct Superblock {
     pub sys_chunk_array_size: u32,
     pub chunk_root_generation: u64,
     pub csum_type: u16,
+    /// This device's id, taken from `dev_item.devid` in the superblock.
+    /// Each NonRAID slot is its own single-device filesystem, so there is
+    /// exactly one device; the physical-order scrub uses this to drive its
+    /// DEV_TREE walk (keyed by devid) and to guard `FsReader::read_physical`
+    /// against reading the wrong disk.
+    pub devid: u64,
     /// Raw bytes of the system-chunk bootstrap array, exactly as stored
     /// on disk — caller is responsible for parsing it.
     pub sys_chunks: Vec<u8>,
@@ -87,6 +93,10 @@ const OFF_STRIPESIZE: usize = 156;
 const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
 const OFF_CHUNK_ROOT_GENERATION: usize = 164;
 const OFF_CSUM_TYPE: usize = 196;
+// dev_item.devid sits at the start of the 98-byte dev_item structure, which
+// begins right after the 3 *_level bytes that follow csum_type.  Verified
+// against a real mkfs.btrfs image (matches btrfs2/superblock.rs).
+const OFF_DEVID: usize = 198 + 3;
 
 // The system chunk array follows the fixed-size portion of the superblock.
 // Everything between csum_type (end @198) and sys_chunks is fixed: 3 bytes of
@@ -145,6 +155,7 @@ impl Superblock {
             sys_chunk_array_size: le_u32(&buf, OFF_SYS_CHUNK_ARRAY_SIZE),
             chunk_root_generation: le_u64(&buf, OFF_CHUNK_ROOT_GENERATION),
             csum_type: le_u16(&buf, OFF_CSUM_TYPE),
+            devid: le_u64(&buf, OFF_DEVID),
             sys_chunks,
         })
     }

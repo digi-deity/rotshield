@@ -10,7 +10,7 @@
 //!                  strategy (see `csum_strategy.rs`) — btrfs is not limited
 //!                  to 4-byte CRC32C over 4096-byte sectors.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::chunk::ChunkMap;
 use super::csum_strategy::CsumStrategy;
@@ -23,7 +23,12 @@ use super::tree::walk_leaves;
 /// The value is the raw on-disk checksum (length == `strategy.hash_len`):
 /// 4 bytes for CRC32C, 8 for XXHASH, 32 for SHA256/BLAKE2.  Carrying the
 /// bytes (rather than a fixed `u32`) lets every btrfs csum profile fit.
-pub type CsumMap = HashMap<u64, Vec<u8>>;
+///
+/// Backed by a `BTreeMap` (not a `HashMap`) so the physical-order scrub can
+/// issue ordered **range** queries (`CsumMap::range(lo..hi)`) over a chunk's
+/// logical span — the csum entries are already sorted by logical address,
+/// which is exactly the ordering the dev-tree-driven walk needs.
+pub type CsumMap = BTreeMap<u64, Vec<u8>>;
 
 /// Walk the CSUM tree rooted at `csum_root` and populate `map`.
 ///
