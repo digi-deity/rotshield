@@ -8,7 +8,6 @@
 pub mod array;
 pub mod batch_recover;
 pub mod btrfs;
-pub mod btrfs2;
 pub mod fs;
 pub mod freeze;
 pub mod recovery;
