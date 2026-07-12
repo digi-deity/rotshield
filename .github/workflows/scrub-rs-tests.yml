@@ -390,6 +390,10 @@ jobs:
 
       - name: Build btrfs-corrupt-block from source
         run: |
+          # GitHub's Ubuntu runners ship only binary (deb) sources, not
+          # deb-src, so apt build-dep / apt source fail until we enable them.
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt update
           sudo apt build-dep -y btrfs-progs
           cd /tmp
           rm -rf btrfs-progs-src
