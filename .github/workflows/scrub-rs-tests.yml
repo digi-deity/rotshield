@@ -399,6 +399,9 @@ jobs:
           rm -rf btrfs-progs-src
           apt source btrfs-progs
           cd btrfs-progs-*
+          # btrfs-progs uses autotools; configure generates Makefile.inc
+          # (the raw Makefile refuses to build without it).
+          ./configure --disable-documentation
           make btrfs-corrupt-block
           sudo install -m 0755 btrfs-corrupt-block /usr/local/bin/btrfs-corrupt-block
           command -v btrfs-corrupt-block && echo "btrfs-corrupt-block ready" || echo "WARN: btrfs-corrupt-block not built"
