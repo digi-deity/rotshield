@@ -1,94 +1,154 @@
 #!/usr/bin/env bash
 #
-# run_matrix.sh — drive scrub-rs (the btrfs module) over every image
-# produced by test_matrix.sh and compare against the ground-truth
-# `btrfs check --check-data-csum` result captured alongside each image.
+# run_matrix.sh
 #
-# For each image we record:
-#   - scrub-rs exit code and sectors_mismatch / metadata_header_errors
-#   - whether the ground-truth btrfs check reported a data-csum error
-#   - PASS/FAIL: scrub-rs must agree with ground truth
-#       * clean image  -> scrub-rs exit 0, 0 mismatches
-#       * corrupted    -> scrub-rs exit != 0 (mismatch or meta hdr err)
+# Drives a scrub tool over every image produced by btrfs_test_matrix.sh and
+# compares its findings against expectations.tsv -- the machine-readable
+# ground truth btrfs_test_matrix.sh records at build time (NOT re-derived
+# by grepping btrfs check's text output here, which was the old approach
+# and is fragile across btrfs-progs versions/locales).
+#
+# Harmonized with btrfs_live_scrub_test.sh: same --scrub-cmd templating
+# style ({DEVICE}/{OUTFILE} placeholders), so both scripts can point at the
+# same tool invocation.
 #
 # Usage:
-#   ./run_matrix.sh [btrfs_test_images_dir]
+#   ./run_matrix.sh --scrub-cmd "TEMPLATE" [options] [images_dir]
+#
+# Options:
+#   --scrub-cmd=TEMPLATE   required. {DEVICE} -> image path, {OUTFILE} ->
+#                          path this script picks for the tool's report.
+#                          e.g.: --scrub-cmd "./target/release/scrub-rs {DEVICE} --report {OUTFILE}"
+#   --results=PATH         default: <images_dir>/matrix_results.tsv
+#
+# Output parsing: scrub tool output is parsed via three small functions
+# below (parse_data_mismatches / parse_meta_mismatches / parse_self_heal)
+# using the tokens this project's scrub-rs binary is known to print
+# ("sectors mismatch", "metadata hdr errs", "self heal"). If your tool's
+# output differs, edit those three functions -- everything else in this
+# script (the expectation-comparison logic, the unverified/self-heal
+# handling) is independent of the exact wording.
 #
 set -uo pipefail
 
+SCRUB_CMD=""
+IMG_ROOT=""
+RESULTS=""
+
+usage() { grep '^#' "$0" | sed -n '2,30p'; exit 1; }
+
+i=1
+while [[ $i -le $# ]]; do
+  arg="${!i}"
+  case "$arg" in
+    --scrub-cmd=*) SCRUB_CMD="${arg#*=}" ;;
+    --scrub-cmd) i=$((i+1)); SCRUB_CMD="${!i}" ;;
+    --results=*) RESULTS="${arg#*=}" ;;
+    --results) i=$((i+1)); RESULTS="${!i}" ;;
+    -h|--help) usage ;;
+    --*) echo "unknown option: $arg"; usage ;;
+    *) IMG_ROOT="$arg" ;;
+  esac
+  i=$((i+1))
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMG_ROOT="${1:-$SCRIPT_DIR/btrfs_test_images}"
-SCRUB="$SCRIPT_DIR/target/release/scrub-rs"
-OUT="$SCRIPT_DIR/matrix_results.txt"
-: > "$OUT"
+IMG_ROOT="${IMG_ROOT:-$SCRIPT_DIR/btrfs_test_images}"
+EXPECTATIONS="$IMG_ROOT/expectations.tsv"
+RESULTS="${RESULTS:-$IMG_ROOT/matrix_results.tsv}"
 
-[[ -x "$SCRUB" ]] || { echo "scrub-rs binary not built at $SCRUB"; exit 1; }
+[[ -n "$SCRUB_CMD" ]] || { echo "--scrub-cmd is required"; usage; }
+[[ -f "$EXPECTATIONS" ]] || { echo "expectations manifest not found: $EXPECTATIONS (run btrfs_test_matrix.sh first)"; exit 1; }
 
-# Returns 0 if the ground-truth check file reports the filesystem is bad.
-# btrfs check signals badness two ways we care about here:
-#   - a data-csum error:  "ERROR: errors found in csum tree" (with a
-#     "expected csum" line), or "csum ... expected csum" mismatch lines
-#   - an unopenable fs:    "No valid Btrfs found" / "cannot open file system"
-#     (both superblocks wiped, or primary wiped and check not using backup)
-ground_truth_bad() {
-  local f="$1"
-  [[ -f "$f" ]] || return 1
-  grep -qiE "errors found in csum tree|expected csum|No valid Btrfs found|cannot open file system" "$f" 2>/dev/null
-}
+# ---------------------------------------------------------------------------
+# Output parsing -- adjust these three to match your tool's actual output.
+# ---------------------------------------------------------------------------
+parse_data_mismatches() { awk '/sectors mismatch/{print $NF; exit}' <<<"$1"; }
+parse_meta_mismatches() { awk '/metadata hdr errs/{print $NF; exit}' <<<"$1"; }
+parse_self_heal()       { awk '/self heal/{print $NF; exit}' <<<"$1"; }
 
-total=0; pass=0; fail=0
-printf '%-55s %-6s %-8s %-8s %-8s %-8s %s\n' \
-  "IMAGE" "EXIT" "MISM" "METAERR" "GT_BAD" "RESULT" "NOTE" | tee -a "$OUT"
-printf '%s\n' "--------------------------------------------------------------------------------------------------------" | tee -a "$OUT"
+# ---------------------------------------------------------------------------
+# Load expectations into associative arrays keyed by absolute image path
+# ---------------------------------------------------------------------------
+declare -A EXP_RESULT EXP_MIN EXP_DESC
+while IFS=$'\t' read -r img result minm desc; do
+  [[ "$img" == "image_path" ]] && continue   # header
+  [[ -z "$img" ]] && continue
+  EXP_RESULT["$img"]="$result"
+  EXP_MIN["$img"]="$minm"
+  EXP_DESC["$img"]="$desc"
+done < "$EXPECTATIONS"
 
-# Walk every *.img that is a real filesystem (skip the pristine_baseline copy
-# which has no ground-truth check file of its own, and skip truncated image
-# which scrub-rs cannot even read a superblock from — that's a separate class).
+: > "$RESULTS"
+printf '%-70s %-8s %-6s %-6s %-6s %-20s %-8s %s\n' \
+  "IMAGE" "EXPECTED" "DMISM" "MMISM" "SHEAL" "RC" "RESULT" "NOTE" | tee -a "$RESULTS"
+printf '%s\n' "$(printf '%.0s-' {1..140})" | tee -a "$RESULTS"
+
+total=0; pass=0; fail=0; skipped=0
+
 while IFS= read -r -d '' img; do
-  # skip the pristine baseline (no per-image check file)
-  [[ "$(basename "$img")" == "pristine_baseline_"* ]] && continue
+  [[ -v EXP_RESULT["$img"] ]] || continue   # not a tracked image (e.g. a stray copy)
 
-  dir="$(dirname "$img")"
-  label="$(basename "$dir")/$(basename "$img")"
-  # ground-truth check file: either <label>_check_status.txt or EXPECTED_check_status.txt
-  gt=""
-  for cand in "$dir"/*_check_status.txt "$dir"/EXPECTED_check_status.txt; do
-    [[ -f "$cand" ]] && { gt="$cand"; break; }
-  done
+  expected="${EXP_RESULT[$img]}"
+  expect_min="${EXP_MIN[$img]}"
 
-  out="$("$SCRUB" "$img" 2>/dev/null)"
+  if [[ "$expected" == "unverified" ]]; then
+    skipped=$((skipped+1))
+    total=$((total+1))
+    printf '%-70s %-8s %-6s %-6s %-6s %-20s %-8s %s\n' \
+      "$img" "$expected" "-" "-" "-" "-" "SKIP" "${EXP_DESC[$img]}" | tee -a "$RESULTS"
+    continue
+  fi
+
+  outfile="${img%.img}.scrub_report.txt"
+  cmd="${SCRUB_CMD//\{DEVICE\}/$img}"
+  cmd="${cmd//\{OUTFILE\}/$outfile}"
+  out="$(eval "$cmd" 2>&1)"
   rc=$?
-  mism="$(printf '%s\n' "$out" | awk '/sectors mismatch/{print $NF}')"
-  metaerr="$(printf '%s\n' "$out" | awk '/metadata hdr errs/{print $NF}')"
-  mism="${mism:-0}"; metaerr="${metaerr:-0}"
 
-  gt_bad="no"
-  if [[ -n "$gt" ]]; then
-    if ground_truth_bad "$gt"; then gt_bad="yes"; fi
-  fi
+  dmism="$(parse_data_mismatches "$out")"; dmism="${dmism:-0}"
+  mmism="$(parse_meta_mismatches "$out")"; mmism="${mmism:-0}"
+  sheal="$(parse_self_heal "$out")"; sheal="${sheal:-0}"
+  total_mism=$(( dmism + mmism ))
 
-  # Decide expected: a corrupted variant should be detected (rc != 0).
-  # We classify "should be bad" if ground truth reports a csum error OR the
-  # image lives under 11_corrupted_known_bad (except the superblock-wiped
-  # variants, which btrfs can still read via backup and may scrub clean).
-  should_bad="no"
-  if [[ "$gt_bad" == "yes" ]]; then should_bad="yes"; fi
+  result="?"; note=""
+  case "$expected" in
+    clean)
+      if [[ "$total_mism" -eq 0 && $rc -eq 0 ]]; then result="PASS"
+      else result="FAIL"; note="expected clean, tool reported $total_mism mismatch(es) rc=$rc"
+      fi
+      ;;
+    data_corrupt|meta_corrupt)
+      if [[ "$total_mism" -ge "$expect_min" && $rc -ne 0 ]]; then result="PASS"
+      else result="FAIL"; note="expected >= $expect_min mismatch(es) and rc!=0, got $total_mism mismatch(es) rc=$rc"
+      fi
+      ;;
+    self_heal_recoverable)
+      if [[ "$total_mism" -ge "$expect_min" ]]; then
+        if [[ "$sheal" -ge 1 ]]; then result="PASS"
+        else result="PASS"; note="mismatch detected but tool didn't report it as self-heal-recoverable specifically -- check if that's intentional"
+        fi
+      else
+        result="FAIL"; note="expected >= $expect_min mismatch(es) (recoverable via other copy), got $total_mism"
+      fi
+      ;;
+    unreadable)
+      if [[ $rc -ne 0 ]]; then result="PASS"
+      else result="FAIL"; note="expected the tool to refuse/fail outright (rc!=0), got rc=0"
+      fi
+      ;;
+    *)
+      result="FAIL"; note="unknown expected_result '$expected' in expectations.tsv"
+      ;;
+  esac
 
-  result="?"
-  note=""
-  if [[ "$should_bad" == "yes" ]]; then
-    if [[ $rc -ne 0 ]]; then result="PASS"; else result="FAIL"; note="ground truth bad but scrub-rs clean"; fi
-  else
-    if [[ $rc -eq 0 ]]; then result="PASS"; else result="FAIL"; note="scrub-rs flagged but ground truth clean"; fi
-  fi
-
-  printf '%-55s %-6s %-8s %-8s %-8s %-8s %s\n' \
-    "$label" "$rc" "$mism" "$metaerr" "$gt_bad" "$result" "$note" | tee -a "$OUT"
+  printf '%-70s %-8s %-6s %-6s %-6s %-20s %-8s %s\n' \
+    "$img" "$expected" "$dmism" "$mmism" "$sheal" "$rc" "$result" "$note" | tee -a "$RESULTS"
 
   total=$((total+1))
   if [[ "$result" == "PASS" ]]; then pass=$((pass+1)); else fail=$((fail+1)); fi
 done < <(find "$IMG_ROOT" -name '*.img' -print0 | sort -z)
 
-printf '\nTOTAL=%d PASS=%d FAIL=%d\n' "$total" "$pass" "$fail" | tee -a "$OUT"
-echo "Detailed results: $OUT"
+printf '\nTOTAL=%d PASS=%d FAIL=%d SKIPPED(unverified)=%d\n' "$total" "$pass" "$fail" "$skipped" | tee -a "$RESULTS"
+echo "Detailed results: $RESULTS"
 [[ $fail -eq 0 ]]

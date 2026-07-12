@@ -418,24 +418,29 @@ jobs:
       - name: btrfs matrix — generate images + run scrub-rs
         run: |
           cd scrub-rs
-          # Generate the image matrix (loop-backed, single-device btrfs).
-          sudo ./test_matrix.sh ./btrfs_test_images 2>&1 | tail -20
-          # Run scrub-rs over every image and compare to ground truth.
-          sudo -E ./run_matrix.sh ./btrfs_test_images 2>&1 | tail -30
+          # Generate the image matrix (loop-backed, single-device btrfs)
+          # plus the machine-readable expectations.tsv.
+          sudo ./btrfs_test_matrix.sh ./btrfs_test_images 2>&1 | tail -20
+          # Run scrub-rs over every image and compare to expectations.tsv.
+          sudo -E ./run_matrix.sh --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" ./btrfs_test_images 2>&1 | tail -40
           echo "--- matrix summary ---"
-          tail -1 matrix_results.txt
-          grep -qE '^TOTAL=[0-9]+ PASS=[0-9]+ FAIL=0$' matrix_results.txt \
+          tail -1 ./btrfs_test_images/matrix_results.tsv
+          grep -qE '^TOTAL=[0-9]+ PASS=[0-9]+ FAIL=0 ' ./btrfs_test_images/matrix_results.tsv \
             || { echo "::error::btrfs matrix had failures"; exit 1; }
 
       - name: btrfs live simulation — concurrent churn + scrub
         run: |
           cd scrub-rs
+          # Read-only scrub alongside concurrent churn (no array active, so
+          # --recover is not used). Covers false-positive, true-positive,
+          # and true-positive-dup-one-copy scenarios.
           sudo ./btrfs_live_scrub_test.sh \
-            --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE} --recover" \
-            --mode both --duration 60 --warmup 10 --intensity med
+            --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" \
+            --mode all --duration 60 --warmup 10 --intensity med
           echo "--- live-sim summaries ---"
           for s in /root/btrfs_live_scrub_test_*/false-positive/SUMMARY.txt \
-                   /root/btrfs_live_scrub_test_*/true-positive/SUMMARY.txt; do
+                   /root/btrfs_live_scrub_test_*/true-positive/SUMMARY.txt \
+                   /root/btrfs_live_scrub_test_*/true-positive-dup-one-copy/SUMMARY.txt; do
             [[ -f "$s" ]] && { echo "### $s"; cat "$s"; }
           done
 

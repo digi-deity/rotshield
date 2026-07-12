@@ -67,47 +67,6 @@ fn main() -> ExitCode {
         return resolve_cmd(&device, logical);
     }
 
-    // btrfs2 subcommand: run the standalone raw-disk btrfs2 scrubber
-    // (self-contained re-implementation per OPTIMIZE_PLAN.md).  This path
-    // does NOT use the array/recovery layer — it is for verifying a single
-    // btrfs filesystem's data + metadata integrity directly from the block
-    // device, exactly as `btrfs scrub` would but without the kernel.
-    if dev == "--btrfs2" {
-        let device = match args.next() {
-            Some(d) => d,
-            None => {
-                eprintln!("usage: scrub-rs --btrfs2 <device-or-image> [--offset <bytes>]");
-                return ExitCode::from(2);
-            }
-        };
-        let mut base_offset: u64 = 0;
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--offset" => {
-                    let v = match args.next() {
-                        Some(s) => s,
-                        None => {
-                            eprintln!("error: --offset requires a value");
-                            return ExitCode::from(2);
-                        }
-                    };
-                    base_offset = match parse_offset(&v) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            eprintln!("error parsing --offset {v:?}: {e}");
-                            return ExitCode::from(2);
-                        }
-                    };
-                }
-                other => {
-                    eprintln!("unknown argument for --btrfs2: {other}");
-                    return ExitCode::from(2);
-                }
-            }
-        }
-        return btrfs2_scrub(&device, base_offset);
-    }
-
     run_scrub(dev, args)
 }
 
