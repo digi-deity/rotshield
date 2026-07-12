@@ -401,7 +401,9 @@ jobs:
           cd btrfs-progs-*
           # btrfs-progs uses autotools; configure generates Makefile.inc
           # (the raw Makefile refuses to build without it).
-          ./configure --disable-documentation
+          # --enable-experimental is required: btrfs-corrupt-block is an
+          # experimental/debug tool and is NOT built otherwise.
+          ./configure --disable-documentation --enable-experimental
           make btrfs-corrupt-block
           sudo install -m 0755 btrfs-corrupt-block /usr/local/bin/btrfs-corrupt-block
           command -v btrfs-corrupt-block && echo "btrfs-corrupt-block ready" || echo "WARN: btrfs-corrupt-block not built"
