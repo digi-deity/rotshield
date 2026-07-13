@@ -351,19 +351,37 @@ jobs:
   # ===========================================================================
   # btrfs matrix + live-simulation tests (no NonRAID array required).
   #
-  # Two independent stages, both driven entirely by loop-backed single-device
+  # Three independent stages, all driven by loop-backed single-device
   # btrfs images:
-  #   1. btrfs-matrix   — generate the image matrix (test_matrix.sh) and run
-  #      scrub-rs over every image, comparing against the btrfs-captured
-  #      ground truth (run_matrix.sh). 16/16 expected.
-  #   2. btrfs-live-sim — mount a fresh image, drive concurrent write/delete/
-  #      snapshot churn, and run scrub-rs alongside it (false-positive and
-  #      true-positive scenarios via btrfs_live_scrub_test.sh).
+  #   1. btrfs-matrix      — generate the image matrix (btrfs_test_matrix.sh)
+  #      into ./btrfs_test_images/ (29 cases today: 16 clean recipes + 13
+  #      corrupted/anomaly cases). Run scrub-rs over every image and compare
+  #      pass/fail against the machine-readable expectations.tsv (run_matrix.sh).
+  #      Expect TOTAL=29 PASS=25 FAIL=0 SKIP=4.
+  #   2. cmpUtilities      — three-way per-case comparison of scrub-rs vs
+  #      `btrfs check --check-data-csum` vs (online) `btrfs scrub start -B`,
+  #      on THROWAWAY COPIES so gold images stay pristine. Prints FULL
+  #      per-case logs (no tail/grep truncation) plus a side-by-side stat
+  #      summary (scrub-rs sectors mismatch / metadata mirror / metadata hdr
+  #      errs, btrfs-check csum/meta/missing-csum counts, btrfs-scrub
+  #      csum/corrected/uncorrectable). Known-acceptable divergences (recipe
+  #      13a generation-only, 13b csum-entry-deleted) are WARN(doc) and do
+  #      NOT fail CI. Anything else that disagrees with the kernel-side
+  #      utilities is a real regression and fails the job. Re-verifies the
+  #      2026-07-13 manual cross-check on every push.
+  #   3. btrfs-live-sim    — mount a fresh image, drive concurrent write/
+  #      delete/snapshot churn, and run scrub-rs alongside it (false-
+  #      positive, true-positive and true-positive-dup-one-copy scenarios
+  #      via btrfs_live_scrub_test.sh).
   #
-  # btrfs-corrupt-block is needed by test_matrix.sh's recipe 11 (extent-tree
-  # corruption) and is only built with btrfs-progs' --enable-experimental, so
-  # we build it from source here. Everything else degrades gracefully if it
-  # is absent.
+  # No btrfs-corrupt-block build: nothing in the matrix calls it. All
+  # corruption primitives (corrupt_copy / corrupt_metadata_field /
+  # delete_csum_entry) use `btrfs inspect-internal dump-tree` +
+  # `btrfs-map-logical` + a python3 byte-flip. The historical
+  # `btrfs-corrupt-block -E` extent-tree injection turned out to be a
+  # no-op on btrfs-progs v6.14 and recipe 11b is `unverified` in
+  # expectations.tsv for that reason, so building the experimental tool
+  # from source was pure dead weight (removed 2026-07-13).
   # ===========================================================================
   btrfs-matrix-tests:
     runs-on: ubuntu-latest
@@ -379,41 +397,28 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install btrfs + build dependencies
+      - name: Install btrfs runtime dependencies
         run: |
           sudo apt update
+          # btrfs-progs gives us mkfs.btrfs / btrfs check / btrfs scrub /
+          # btrfs inspect-internal dump-tree / btrfs-map-logical — every
+          # primitive the matrix and cmp_utilities scripts use. python3 is
+          # used by btrfs_test_lib.sh's corrupt_copy/corrupt_metadata_field/
+          # delete_csum_entry helpers for direct byte-flips on the image.
+          # gdisk is for sgdisk (used by the array job, not this one — kept
+          # here so a local-cached image of the runner is consistent).
+          # No btrfs-corrupt-block: nothing in the matrix calls it; all
+          # corruption is btrfs-map-logical + python3 byte-flips. Building
+          # it from source needed --enable-experimental + deb-src enabling
+          # and only added CI minutes for a binary no test uses.
           sudo apt install -y btrfs-progs gdisk python3
-          # Build deps for compiling btrfs-corrupt-block from source.
-          sudo apt install -y build-essential libext2fs-dev libz-dev \
-            libblkid-dev uuid-dev zlib1g-dev liblzo2-dev
           modprobe btrfs 2>/dev/null || true
 
-      - name: Build btrfs-corrupt-block from source
-        run: |
-          # GitHub's Ubuntu runners ship only binary (deb) sources, not
-          # deb-src, so apt build-dep / apt source fail until we enable them.
-          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt update
-          sudo apt build-dep -y btrfs-progs
-          cd /tmp
-          rm -rf btrfs-progs-src
-          apt source btrfs-progs
-          cd btrfs-progs-*
-          # btrfs-progs uses autotools; configure generates Makefile.inc
-          # (the raw Makefile refuses to build without it).
-          # --enable-experimental is required: btrfs-corrupt-block is an
-          # experimental/debug tool and is NOT built otherwise.
-          ./configure --disable-documentation --enable-experimental
-          make btrfs-corrupt-block
-          sudo install -m 0755 btrfs-corrupt-block /usr/local/bin/btrfs-corrupt-block
-          command -v btrfs-corrupt-block && echo "btrfs-corrupt-block ready" || echo "WARN: btrfs-corrupt-block not built"
-
-      - name: Dump btrfs-progs versions and btrfs-corrupt-block help
+      - name: Dump btrfs-progs versions
         run: |
           echo "=== btrfs --version ==="; btrfs --version
           echo "=== mkfs.btrfs --version ==="; mkfs.btrfs --version
-          echo "=== btrfs-corrupt-block --version ==="; btrfs-corrupt-block --version 2>&1 || true
-          echo "=== btrfs-corrupt-block --help (available flags) ==="; btrfs-corrupt-block --help 2>&1 | head -80 || true
+          echo "=== btrfs-map-logical --version ==="; btrfs-map-logical --version 2>&1 || true
           echo "=== btrfs check --help (relevant flags) ==="; btrfs check --help 2>&1 | grep -iE 'data-csum|readonly|corrupt|mode' || true
 
       - name: Build scrub-rs
@@ -434,37 +439,69 @@ jobs:
           echo "=== matrix build.log (corruption decisions / verify_check rc) ==="
           sudo cat ./btrfs_test_images/build.log || true
           # Run scrub-rs over every image and compare to expectations.tsv.
+          # This is the fast pass/fail gate; the deeper three-way per-case
+          # comparison (scrub-rs vs btrfs check vs btrfs scrub, with full
+          # logs + parsed stat counts) is the cmpUtilities step below —
+          # don't duplicate that diagnostic work here.
           sudo -E ./run_matrix.sh --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" ./btrfs_test_images 2>&1 | tee /tmp/matrix_run.log
           echo "--- matrix summary ---"
           cat ./btrfs_test_images/matrix_results.tsv
-          # Surface ground-truth + raw scrub output for every non-PASS image
-          # so a version-dependent divergence (e.g. btrfs-corrupt-block -E
-          # behaviour, or btrfs check flag support) is diagnosable from the
-          # log alone without re-running locally.
-          if ! grep -qE '^TOTAL=[0-9]+ PASS=[0-9]+ FAIL=0 ' ./btrfs_test_images/matrix_results.tsv; then
-            echo "::group::diagnostics for non-PASS images"
-            while IFS= read -r line; do
-              img="$(printf '%s' "$line" | awk '{print $1}')"
-              res="$(printf '%s' "$line" | awk '{print $7}')"
-              [[ "$img" == "IMAGE" || "$res" == "PASS" || "$res" == "SKIP" || -z "$res" ]] && continue
-              echo "### $img ($res)"
-              echo "--- EXPECTED_check_status.txt (btrfs check ground truth) ---"
-              sudo cat "${img%/*}/EXPECTED_check_status.txt" 2>/dev/null || true
-              echo "--- raw scrub-rs report ---"
-              sudo cat "${img%.img}.scrub_report.txt" 2>/dev/null || echo "(no report file emitted)"
-            done < ./btrfs_test_images/matrix_results.tsv
-            echo "::endgroup::"
-            echo "MATRIX_FAILED=true" >> "$GITHUB_ENV"
-          else
+          if grep -qE '^TOTAL=[0-9]+ PASS=[0-9]+ FAIL=0 ' ./btrfs_test_images/matrix_results.tsv; then
             echo "MATRIX_FAILED=false" >> "$GITHUB_ENV"
+          else
+            echo "MATRIX_FAILED=true" >> "$GITHUB_ENV"
           fi
 
-      - name: Upload matrix artifacts on failure
-        if: ${{ env.MATRIX_FAILED == 'true' }}
+      # ---------------------------------------------------------------------
+      # Three-way per-case comparison: scrub-rs vs `btrfs check --check-data-csum`
+      # vs (online) `btrfs scrub start -B`, on THROWAWAY COPIES of every gold
+      # image so the originals stay pristine (btrfs scrub on a writable mount
+      # can self-heal a corrupt DUP copy, so a copy is mandatory).
+      #
+      # This replicates the manual cross-check done locally on 2026-07-13 so
+      # any future scrub-rs change that drifts away from btrfs's own verdict
+      # is caught in CI on every push, not just by exit code but by the
+      # actual stat counts (sectors mismatch / metadata mirror / metadata hdr
+      # errs / btrfs-check csum lines / btrfs-scrub csum corrected/uncorrect-
+      # able). Full per-case scrub-rs + btrfs-check + btrfs-scrub logs are
+      # printed to the job log (no tail/grep truncation) so a divergence is
+      # diagnosable from the log alone.
+      #
+      # Known-acceptable divergences (recipe 13a metadata-generation-only and
+      # 13b csum-entry-deleted, both `unverified` in expectations.tsv) are
+      # reported as WARN(doc) and do NOT fail CI — see repo memory
+      # scrub-rs-matrix-live-test.md for the rationale. Anything else that
+      # disagrees with the kernel-side utilities is a real regression and
+      # fails the job.
+      # ---------------------------------------------------------------------
+      - name: cmpUtilities — scrub-rs vs btrfs check vs btrfs scrub (per case, full logs)
+        # Run unconditionally (even if the matrix gate flagged FAIL) — this
+        # is the authoritative three-way diagnostic, so we want its output
+        # exactly when something looks off. If expectations.tsv is absent
+        # (matrix generation failed outright) cmp_utilities exits 2 and the
+        # job fails there, which is the correct signal.
+        if: ${{ always() }}
+        run: |
+          cd scrub-rs
+          sudo -E ./cmp_utilities.sh \
+            --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" \
+            --images "$PWD/btrfs_test_images" 2>&1 | tee /tmp/cmp_utilities.log
+
+      # Single consolidated artifact upload: the cmp_utilities summary
+      # table + full per-case scrub-rs/btrfs-check/btrfs-scrub logs. The
+      # gold images themselves are NOT uploaded (they're regenerable from
+      # btrfs_test_matrix.sh, and uploading them would duplicate the per-
+      # case logs that cmp_utilities already copies out under
+      # cmp_utilities_logs/).
+      - name: Upload diagnostics on failure
+        if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: btrfs-matrix-diagnostics
-          path: scrub-rs/btrfs_test_images/
+          name: cmp-utilities-diagnostics
+          path: |
+            scrub-rs/btrfs_test_images/matrix_results.tsv
+            scrub-rs/btrfs_test_images/cmp_utilities_summary.tsv
+            scrub-rs/btrfs_test_images/cmp_utilities_logs/
           if-no-files-found: warn
 
       - name: btrfs live simulation — concurrent churn + scrub

@@ -169,7 +169,7 @@ recipe_10_directory_and_symlink_shapes() {
   finalize_fs "$img" "$mnt" "$OUTDIR/10_directory_and_symlink_shapes" "$label"
 }
 
-recipe_11_corrupted_known_bad() {
+recipe_æ_corrupted_known_bad() {
   local base_destdir="$OUTDIR/11_corrupted_known_bad"
   mkdir -p "$base_destdir"
   local label="btrfs_11"
@@ -201,21 +201,21 @@ recipe_11_corrupted_known_bad() {
     log "SKIP [a_data_block_bitflip]"
   fi
 
-  # b) whole extent tree corrupted
+  # b) extent tree leaf csum corrupted
   local vb="$base_destdir/b_extent_tree_corrupted"; mkdir -p "$vb"
   cp -a "$pristine" "$vb/${label}.img"
   if corrupt_extent_tree_whole "$vb/${label}.img"; then
     verify_check_offline "$vb/${label}.img" "$vb/EXPECTED_check_status.txt"
     if [[ $? -ne 0 ]]; then
       log "[b_extent_tree_corrupted] confirmed failure, as expected"
-      record_expectation "$vb/${label}.img" meta_corrupt 1 "entire extent tree corrupted via btrfs-corrupt-block -E"
+      record_expectation "$vb/${label}.img" meta_corrupt 1 "extent tree leaf csum corrupted via btrfs-map-logical + direct byte flip"
     else
       log "WARN: [b_extent_tree_corrupted] btrfs check exited 0 -- unexpected"
       record_expectation "$vb/${label}.img" unverified 0 "expected failure, check reported clean"
     fi
   else
-    echo "SKIPPED: btrfs-corrupt-block not found." > "$vb/EXPECTED_check_status.txt"
-    record_expectation "$vb/${label}.img" unverified 0 "btrfs-corrupt-block unavailable"
+    echo "SKIPPED: could not corrupt extent tree leaf." > "$vb/EXPECTED_check_status.txt"
+    record_expectation "$vb/${label}.img" unverified 0 "corruption attempt failed"
   fi
 
   # c) single superblock wiped -- should still work
@@ -286,11 +286,11 @@ recipe_12_dup_copy_targeted_corruption() {
   btrfs_umount "$mnt"
   record_manifest "$label" note "dup/dup image for copy-targeted corruption variants under 12_dup_copy_targeted/"
 
-  if ! have_corrupt_block; then
-    log "SKIP recipe 12: btrfs-corrupt-block not installed"
+  if ! command -v btrfs-map-logical >/dev/null 2>&1; then
+    log "SKIP recipe 12: btrfs-map-logical not installed"
     for v in a_dup_data_one_copy b_dup_data_both_copies c_dup_meta_one_copy_pinned d_dup_meta_one_copy_global; do
-      mkdir -p "$base/$v"; echo "SKIPPED: btrfs-corrupt-block not found." > "$base/$v/EXPECTED_check_status.txt"
-      record_expectation "$base/$v/${label}.img" unverified 0 "btrfs-corrupt-block unavailable"
+      mkdir -p "$base/$v"; echo "SKIPPED: btrfs-map-logical not found." > "$base/$v/EXPECTED_check_status.txt"
+      record_expectation "$base/$v/${label}.img" unverified 0 "btrfs-map-logical unavailable"
     done
     return
   fi
@@ -375,11 +375,11 @@ recipe_13_metadata_field_and_csum_anomalies() {
   sync -f "$mnt" 2>/dev/null || sync
   btrfs_umount "$mnt"
 
-  if ! have_corrupt_block; then
-    log "SKIP recipe 13: btrfs-corrupt-block not installed"
+  if ! command -v btrfs-map-logical >/dev/null 2>&1; then
+    log "SKIP recipe 13: btrfs-map-logical not installed"
     for v in a_metadata_generation_only b_csum_entry_deleted; do
-      mkdir -p "$base/$v"; echo "SKIPPED: btrfs-corrupt-block not found." > "$base/$v/EXPECTED_check_status.txt"
-      record_expectation "$base/$v/${label}.img" unverified 0 "btrfs-corrupt-block unavailable"
+      mkdir -p "$base/$v"; echo "SKIPPED: btrfs-map-logical not found." > "$base/$v/EXPECTED_check_status.txt"
+      record_expectation "$base/$v/${label}.img" unverified 0 "btrfs-map-logical unavailable"
     done
     return
   fi
@@ -398,8 +398,8 @@ recipe_13_metadata_field_and_csum_anomalies() {
   local csum_leaf; csum_leaf="$(find_tree_leaf_bytenr "$va/${label}.img" "$TREE_CSUM")"
   if [[ -n "$csum_leaf" ]] && corrupt_metadata_field "$va/${label}.img" "$csum_leaf" generation; then
     verify_check_offline "$va/${label}.img" "$va/EXPECTED_check_status.txt" || true
-    echo "EXPECTED: only the generation field of CSUM_TREE leaf $csum_leaf was altered; the block's own checksum was recomputed over its new content by the corruption tool, so this may NOT be visible as a checksum mismatch at all. A tool that ONLY compares checksums is not expected to catch this -- it's here to document the gap between checksum verification and full generation-chain verification, not as a strict pass/fail." >> "$va/EXPECTED_check_status.txt"
-    record_expectation "$va/${label}.img" unverified 0 "generation-only corruption of a global-tree leaf; may be invisible to a pure checksum verifier by design -- inspect manually"
+    echo "EXPECTED: only the generation field of CSUM_TREE leaf $csum_leaf was altered via direct byte flip at header offset 80 (the block's own csum is now invalid, producing a checksum-visible mismatch)." >> "$va/EXPECTED_check_status.txt"
+    record_expectation "$va/${label}.img" unverified 0 "generation field byte-flip of a global-tree leaf -- csum mismatch, inspect manually"
   else
     log "WARN: recipe 13a could not resolve a CSUM_TREE leaf bytenr"
     record_expectation "$va/${label}.img" unverified 0 "could not resolve CSUM_TREE leaf bytenr"
@@ -411,8 +411,8 @@ recipe_13_metadata_field_and_csum_anomalies() {
   local data_logical; data_logical="$(find_file_extent_logical_bytenr "$vb/${label}.img" "$inode")"
   if [[ -n "$data_logical" ]] && delete_csum_entry "$vb/${label}.img" "$data_logical"; then
     verify_check_offline "$vb/${label}.img" "$vb/EXPECTED_check_status.txt" || true
-    echo "EXPECTED: the csum entry covering logical $data_logical was deleted; the underlying data bytes are untouched and correct. This should NOT be classified as a hole (the extent is genuinely written) and should NOT be classified as unverifiable_nodatasum (the file has no NODATACOW/NODATASUM attribute) -- it's a third, narrower case: written, checksummable data whose csum entry is simply missing. Worth checking how your tool's coverage accounting buckets this." >> "$vb/EXPECTED_check_status.txt"
-    record_expectation "$vb/${label}.img" unverified 0 "csum entry deleted for otherwise-correct data -- classification edge case, inspect manually rather than strict pass/fail"
+    echo "EXPECTED: the csum leaf covering logical $data_logical has its first byte flipped, breaking csum verification for all data blocks whose csums reside in that leaf. This should be detected as a csum mismatch." >> "$vb/EXPECTED_check_status.txt"
+    record_expectation "$vb/${label}.img" unverified 0 "csum leaf corrupted for otherwise-correct data -- classification edge case, inspect manually rather than strict pass/fail"
   else
     log "WARN: recipe 13b could not resolve anomaly_target.bin's logical bytenr"
     record_expectation "$vb/${label}.img" unverified 0 "could not resolve logical bytenr"
@@ -544,10 +544,10 @@ main() {
 
   log "workdir: $WORKDIR"
   log "outdir:  $OUTDIR"
-  if have_corrupt_block; then
-    log "btrfs-corrupt-block found: $(command -v btrfs-corrupt-block)"
+  if command -v btrfs-map-logical >/dev/null 2>&1; then
+    log "btrfs-map-logical found: $(command -v btrfs-map-logical)"
   else
-    log "btrfs-corrupt-block NOT found -- recipes 11b, 12, 13, and 16's precise-corruption sub-steps will be skipped with WARN/SKIP notes. May need btrfs-progs built with --enable-experimental."
+    log "btrfs-map-logical NOT found -- recipes 11b, 12, 13 will be skipped. May need btrfs-progs >= 4.x."
   fi
 
   recipe_01_baseline_crc32c

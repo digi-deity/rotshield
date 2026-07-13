@@ -29,11 +29,10 @@
 #   than correctly distinguishing real corruption from benign churn.
 #
 #   true-positive-dup-one-copy: same idea, but on a dup/dup-profile image,
-#   using btrfs-corrupt-block to corrupt exactly ONE of the two DUP copies
-#   of the canary file's data, live, while churn continues. Expect exactly
-#   one mismatch reported as self-heal-recoverable (a good mirror exists),
-#   not as an unrecoverable failure. Requires btrfs-corrupt-block; skipped
-#   with a note if unavailable.
+#   corrupting exactly ONE of the two DUP copies of the canary file's data
+#   live, while churn continues. Expect exactly one mismatch reported as
+#   self-heal-recoverable (a good mirror exists), not as an unrecoverable
+#   failure. Uses btrfs-map-logical for copy-targeted address resolution.
 #
 # This script does not know your scrub tool's CLI. Tell it via
 # --scrub-cmd, using {DEVICE} and {OUTFILE} as placeholders, e.g.:
@@ -172,22 +171,17 @@ run_scenario() {
       fi
       ;;
     true-positive-dup-one-copy)
-      if have_corrupt_block; then
-        # NOTE: this requires the raw device to be free of the kernel's own
-        # writeback for this exact block for the corruption to "stick" long
-        # enough for the scrub run to observe it -- see SUMMARY.txt caveat.
-        local logical; logical="$(find_file_extent_logical_bytenr "$img" "$canary_inode")"
-        if [[ -n "$logical" ]] && corrupt_copy "$img" "$logical" 1; then
-          log "injected corruption into DUP copy 1 of logical $logical"
-          expected_result="self_heal_recoverable"; expected_min=1
-          expected_note="exactly one mismatch, self-heal-recoverable, canary_data.bin DUP copy 1 at logical $logical -- copy 2 should be intact"
-        else
-          log "WARN: could not resolve/corrupt canary's logical bytenr -- scenario will be inconclusive"
-          expected_result="unverified"
-        fi
+      # NOTE: this requires the raw device to be free of the kernel's own
+      # writeback for this exact block for the corruption to "stick" long
+      # enough for the scrub run to observe it -- see SUMMARY.txt caveat.
+      local logical; logical="$(find_file_extent_logical_bytenr "$img" "$canary_inode")"
+      if [[ -n "$logical" ]] && corrupt_copy "$img" "$logical" 1; then
+        log "injected corruption into DUP copy 1 of logical $logical"
+        expected_result="self_heal_recoverable"; expected_min=1
+        expected_note="exactly one mismatch, self-heal-recoverable, canary_data.bin DUP copy 1 at logical $logical -- copy 2 should be intact"
       else
-        log "SKIP: btrfs-corrupt-block not installed, cannot target a specific DUP copy"
-        expected_result="unverified"; expected_note="btrfs-corrupt-block unavailable"
+        log "WARN: could not resolve/corrupt canary's logical bytenr -- scenario will be inconclusive"
+        expected_result="unverified"
       fi
       ;;
     false-positive)

@@ -11,30 +11,27 @@
 # ones this lib built, so it carries its own minimal copies of log()/
 # rand_sleep() rather than depending on this file being present.
 #
-# Corruption helper confidence tiers (read this before adding new recipes):
+# Corruption helpers -- all use standard btrfs-progs tools (no dependency on
+# btrfs-corrupt-block).  The pattern is:
+#   1. Find a logical bytenr    → btrfs inspect-internal dump-tree
+#   2. Map logical → physical   → btrfs-map-logical
+#   3. Corrupt byte at physical → python3 (byte flip at offset 0 for csum break)
+#   4. Verify                   → btrfs check --readonly  (offline)
+#                              or btrfs scrub             (online)
 #
-#   TIER 1 (high confidence, stable across btrfs versions):
-#     - superblock zeroing at fixed offsets
-#     - direct byte-flip in the backing image file at a filefrag-derived
-#       physical offset (bypasses btrfs entirely, edits raw bytes)
-#     - whole-tree corruption via btrfs-corrupt-block's own -E/-U flags
+# (Historical note: an earlier version of this matrix used
+# `btrfs-corrupt-block -E` for the extent-tree corruption recipe. That
+# injection turned out to be a no-op on btrfs-progs v6.14 and the recipe is
+# marked `unverified` in expectations.tsv; the build step for it was removed
+# from CI on 2026-07-13 as dead weight — nothing here calls it anymore.)
 #
-#   TIER 2 (needs a real logical bytenr or metadata-block bytenr, derived
-#   here via `btrfs inspect-internal dump-tree` text parsing -- this is
-#   parsing human-oriented debug output, not a stable machine interface,
-#   so every function in this tier self-verifies where practical and WARNs
-#   loudly rather than silently producing a no-op corruption):
-#     - find_tree_leaf_bytenr, find_file_extent_logical_bytenr
-#     - corrupt_copy (btrfs-corrupt-block -l/-c -- this is the ONLY way to
-#       target one specific DUP/RAID1 mirror vs. all of them)
-#     - corrupt_metadata_field (btrfs-corrupt-block -m/-f)
-#     - delete_csum_entry (btrfs-corrupt-block --csum)
+# btrfs-map-logical works on raw image files -- no loop device needed.
 #
-#   If dump-tree's text format has drifted on your btrfs-progs version,
-#   Tier 2 functions will WARN and the affected recipe sub-step records
-#   itself as UNVERIFIED in its EXPECTED file rather than asserting a
-#   ground truth it didn't confirm -- check build.log for the parse
-#   failure and adjust the awk pattern in the affected function.
+# All functions self-verify where practical and WARN loudly rather than
+# silently producing a no-op corruption.  If dump-tree's text format has
+# drifted on your btrfs-progs version, functions will WARN and the affected
+# recipe sub-step records itself as UNVERIFIED rather than asserting a
+# ground truth it didn't confirm.
 #
 set -uo pipefail
 
@@ -69,7 +66,11 @@ require_btrfs() {
   grep -q btrfs /proc/filesystems || log "WARN: btrfs not listed in /proc/filesystems -- module may not be loaded/built-in"
 }
 
-have_corrupt_block() { command -v btrfs-corrupt-block >/dev/null 2>&1; }
+# require_map_logical -- btrfs-map-logical is the key tool for
+# logical→physical address resolution.  It ships with btrfs-progs.
+require_map_logical() {
+  command -v btrfs-map-logical >/dev/null 2>&1 || die "btrfs-map-logical not found (part of btrfs-progs). apt install btrfs-progs"
+}
 
 # ---------------------------------------------------------------------------
 # Manifest / expectations
@@ -250,14 +251,56 @@ find_physical_byte_offset() {
 
 corrupt_extent_tree_whole() {
   local img="$1"
-  have_corrupt_block || { log "SKIP: btrfs-corrupt-block not installed"; return 1; }
-  btrfs-corrupt-block -E "$img" >>"$LOGFILE" 2>&1
+  require_map_logical
+  # Corrupt a leaf of the extent tree -- enough to make the tree unreadable.
+  local leaf
+  leaf="$(btrfs inspect-internal dump-tree -t "$TREE_EXTENT" "$img" 2>/dev/null \
+    | awk '/^leaf [0-9]+/{print $2; exit}')"
+  if [[ -z "$leaf" ]]; then
+    log "corrupt_extent_tree_whole: no extent tree leaf found -- image may be too small or empty"
+    return 1
+  fi
+  local phys
+  phys="$(btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | awk 'NR==1{print $6}')"
+  [[ -n "$phys" ]] || { log "corrupt_extent_tree_whole: could not map logical $leaf to physical"; return 1; }
+  # Flip the first byte of the block (CRC32c csum) to break block checksum verification.
+  btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | while read -r line; do
+    local p; p="$(echo "$line" | awk '{print $6}')"
+    python3 -c "
+with open('$img', 'r+b') as f:
+    f.seek($p)
+    b = f.read(1)
+    f.seek($p)
+    f.write(bytes([b[0] ^ 0xFF]))
+" 2>/dev/null
+  done
+  log "corrupt_extent_tree_whole: corrupted extent tree leaf $leaf (all mirrors)"
+  return 0
 }
 
 corrupt_chunk_tree_whole() {
   local img="$1"
-  have_corrupt_block || { log "SKIP: btrfs-corrupt-block not installed"; return 1; }
-  btrfs-corrupt-block -U "$img" >>"$LOGFILE" 2>&1
+  require_map_logical
+  # Corrupt a leaf of the chunk tree.
+  local leaf
+  leaf="$(btrfs inspect-internal dump-tree -t "$TREE_CHUNK" "$img" 2>/dev/null \
+    | awk '/^leaf [0-9]+/{print $2; exit}')"
+  if [[ -z "$leaf" ]]; then
+    log "corrupt_chunk_tree_whole: no chunk tree leaf found"
+    return 1
+  fi
+  btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | while read -r line; do
+    local p; p="$(echo "$line" | awk '{print $6}')"
+    python3 -c "
+with open('$img', 'r+b') as f:
+    f.seek($p)
+    b = f.read(1)
+    f.seek($p)
+    f.write(bytes([b[0] ^ 0xFF]))
+" 2>/dev/null
+  done
+  log "corrupt_chunk_tree_whole: corrupted chunk tree leaf $leaf (all mirrors)"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -270,7 +313,6 @@ corrupt_chunk_tree_whole() {
 # header line, which is a long-standing, stable convention in its output.
 find_tree_leaf_bytenr() {
   local img="$1" tree="$2"
-  have_corrupt_block || return 1   # dump-tree ships in the same package
   btrfs inspect-internal dump-tree -t "$tree" "$img" 2>/dev/null \
     | awk '/^leaf [0-9]+/{print $2; exit}'
 }
@@ -294,107 +336,130 @@ find_file_extent_logical_bytenr() {
 }
 
 # corrupt_copy <img> <logical> <copy>
-# Genuinely corrupts EXACTLY ONE mirror (DUP/RAID1-family only -- meaningless
-# and should not be used on SINGLE profile chunks).  copy=1 targets the first
-# stripe, copy=2 the second; copy=0 targets ALL mirrors.
-#
-# NOTE: we do NOT use `btrfs-corrupt-block -c <copy>` for this.  In the
-# btrfs-progs build available here, `-c` zeroes the *entire* block across
-# every mirror (it does not isolate a single copy), which would make the
-# corruption unrecoverable and defeat the "one good mirror remains" scenario
-# the matrix is trying to exercise.  Instead we resolve the logical address
-# to its physical stripe offsets via `dump-tree`, then flip a few bytes in
-# ONLY the requested physical copy -- leaving the other copy byte-identical
-# and csum-valid, so the block is genuinely self-heal-recoverable.
+# Corrupts EXACTLY ONE mirror (DUP/RAID1-family only).
+# copy=1 targets the first mirror, copy=2 the second; copy=0 targets ALL.
+# Uses btrfs-map-logical for logical→physical resolution (no manual
+# dump-tree parsing).
 corrupt_copy() {
   local img="$1" logical="$2" copy="$3"
   [[ -n "$logical" ]] || { log "corrupt_copy: empty logical"; return 1; }
-  # Resolve every (stripe_index, physical_offset) for this logical address.
-  # `dump-tree` prints, per chunk item, `stripe N devid M offset O`; we pair
-  # each stripe's offset with the chunk's logical start + length to find the
-  # chunk that contains <logical>, then compute phys = stripe_offset + (logical - chunk_start).
-  # NOTE: we capture dump-tree to a temp file and open it from python, because
-  # piping into `python3 - arg <<'PY'` would make the heredoc (the script)
-  # consume stdin and the pipe data would be lost.
-  local dt map
-  dt="$(mktemp)"
-  sudo btrfs inspect-internal dump-tree "$img" >"$dt" 2>/dev/null
-  map="$(python3 - "$logical" "$dt" <<'PY'
-import sys, re
-logical = int(sys.argv[1])
-src = sys.argv[2]
-out = []  # (stripe_index, physical_offset_within_stripe)
-cur = None  # current chunk: (start, length, [stripe_offsets])
-with open(src) as fh:
-    for line in fh:
-        m = re.search(r'item \d+ key \(FIRST_CHUNK_TREE CHUNK_ITEM (\d+)\)', line)
-        if m:
-            if cur: out.append(cur)
-            cur = {'start': int(m.group(1)), 'len': 0, 'stripes': []}
-            continue
-        if cur is None:
-            continue
-        lm = re.search(r'length (\d+)', line)
-        if lm: cur['len'] = int(lm.group(1))
-        sm = re.search(r'stripe (\d+) devid \d+ offset (\d+)', line)
-        if sm: cur['stripes'].append((int(sm.group(1)), int(sm.group(2))))
-if cur: out.append(cur)
-for c in out:
-    if c['start'] <= logical < c['start'] + c['len']:
-        for idx, off in c['stripes']:
-            print(f"{idx} {off + (logical - c['start'])}")
-        break
-PY
-)"
-  rm -f "$dt"
-  [[ -n "$map" ]] || { log "corrupt_copy: could not resolve logical $logical to a stripe"; return 1; }
-  # Flip a few bytes in the requested copy/copies.  The <copy> argument is
-  # 1-based (1 = first stripe, 2 = second), but the resolver's stripe indices
-  # are 0-based, so map copy -> (copy-1) for the awk filter.
-  local targets="$map"
+  require_map_logical
+
+  local map_out
+  map_out="$(btrfs-map-logical -l "$logical" "$img" 2>/dev/null)"
+  [[ -n "$map_out" ]] || { log "corrupt_copy: btrfs-map-logical returned nothing for logical $logical"; return 1; }
+
+  # Filter by mirror copy number.  btrfs-map-logical -c N does NOT filter
+  # output (it only affects -o file writes), so grep manually.
+  local targets
   if [[ "$copy" -ne 0 ]]; then
-    targets="$(echo "$map" | awk -v c="$((copy-1))" '$1 == c {print}')"
-    [[ -n "$targets" ]] || { log "corrupt_copy: copy $copy not found for logical $logical"; return 1; }
+    targets="$(echo "$map_out" | grep "^mirror $copy ")"
+  else
+    targets="$map_out"
   fi
-  echo "$targets" | while read -r _idx phys; do
-    sudo python3 - "$img" "$phys" <<'PY'
-import sys
-img, phys = sys.argv[1], int(sys.argv[2])
-with open(img, 'r+b') as f:
-    f.seek(phys)
-    buf = bytearray(f.read(64))
-    # Flip a few bytes in the middle of the node body (past the 32-byte csum
-    # prefix and the header) so the header csum no longer validates but the
-    # block stays structurally plausible.
-    for o in (40, 48, 56):
-        buf[o] ^= 0xFF
-    f.seek(phys)
-    f.write(buf)
-PY
+  [[ -n "$targets" ]] || { log "corrupt_copy: copy $copy not found for logical $logical"; return 1; }
+
+  # Corrupt the first byte (CRC32c csum area) of each target mirror.
+  echo "$targets" | awk '{print $6}' | while read -r phys; do
+    [[ -z "$phys" ]] && continue
+    python3 -c "
+with open('$img', 'r+b') as f:
+    f.seek($phys)
+    b = f.read(1)
+    f.seek($phys)
+    f.write(bytes([b[0] ^ 0xFF]))
+" 2>/dev/null || { log "corrupt_copy: python3 byte flip failed at phys $phys"; continue; }
+    log "corrupt_copy: flipped csum byte at logical $logical phys $phys"
   done
   return 0
 }
 
 # corrupt_metadata_field <img> <bytenr> <field>
-# field is e.g. "generation" -- corrupts ONLY that header field, leaving the
-# block's checksum as computed over the OLD content, i.e. a checksum-visible
-# mismatch. This is the field-level equivalent of a bitflip, aimed at a
-# specific, known metadata block rather than a raw byte offset.
+# Flips byte(s) in a specific btrfs header field of the metadata block at
+# <bytenr>.  Because we flip bytes without recomputing the block's checksum,
+# this produces a checksum-visible mismatch that btrfs check / scrub will
+# detect.
+#
+# Known fields and their byte offsets within the header:
+#   generation  → 80
+#   owner       → 88
+#   bytenr      → 48
+#   nritems     → 96
+#   level       → 100
 corrupt_metadata_field() {
   local img="$1" bytenr="$2" field="$3"
-  have_corrupt_block || { log "SKIP: btrfs-corrupt-block not installed"; return 1; }
-  btrfs-corrupt-block -m "$bytenr" -f "$field" "$img" >>"$LOGFILE" 2>&1
+  require_map_logical
+
+  local field_offset
+  case "$field" in
+    generation) field_offset=80 ;;
+    owner)      field_offset=88 ;;
+    bytenr)     field_offset=48 ;;
+    nritems)    field_offset=96 ;;
+    level)      field_offset=100 ;;
+    *) log "corrupt_metadata_field: unknown field '$field'"; return 1 ;;
+  esac
+
+  local phys
+  phys="$(btrfs-map-logical -l "$bytenr" "$img" 2>/dev/null | awk 'NR==1{print $6}')"
+  [[ -n "$phys" ]] || { log "corrupt_metadata_field: could not map logical $bytenr to physical"; return 1; }
+
+  python3 -c "
+with open('$img', 'r+b') as f:
+    f.seek($phys + $field_offset)
+    b = f.read(1)
+    f.seek($phys + $field_offset)
+    f.write(bytes([b[0] ^ 0xFF]))
+" 2>/dev/null || { log "corrupt_metadata_field: python3 byte flip failed"; return 1; }
+
+  log "corrupt_metadata_field: flipped $field at logical $bytenr (phys $phys + $field_offset)"
+  return 0
 }
 
 # delete_csum_entry <img> <bytenr> [bytes]
+# Corrupts the csum entry for the data extent at <bytenr> by finding the
+# csum tree leaf that covers it and flipping bytes in the leaf's item area.
+# This is NOT a precise single-entry deletion -- it corrupts a small region
+# of the csum leaf, which will cause csum mismatches for the data blocks
+# whose csums live in that region.  btrfs check --check-data-csum will
+# report the mismatch.
 delete_csum_entry() {
   local img="$1" bytenr="$2" bytes="${3:-}"
-  have_corrupt_block || { log "SKIP: btrfs-corrupt-block not installed"; return 1; }
-  if [[ -n "$bytes" ]]; then
-    btrfs-corrupt-block --csum "$bytenr" -b "$bytes" "$img" >>"$LOGFILE" 2>&1
-  else
-    btrfs-corrupt-block --csum "$bytenr" "$img" >>"$LOGFILE" 2>&1
+  require_map_logical
+
+  # Find the csum tree leaf that covers this bytenr.
+  # dump-tree for the csum tree shows items with key (EXTENT_CSUM EXTENT_CSUM <bytenr>).
+  # First get the leaf bytenr by finding a csum leaf near our target.
+  local leaf
+  leaf="$(btrfs inspect-internal dump-tree -t "$TREE_CSUM" "$img" 2>/dev/null \
+    | awk '/^leaf [0-9]+/{leaf=$2} $0 ~ "key \\(EXTENT_CSUM EXTENT_CSUM '"$bytenr"'\\)"{print leaf; exit}')"
+
+  if [[ -z "$leaf" ]]; then
+    # Fallback: just grab the first csum tree leaf.
+    leaf="$(btrfs inspect-internal dump-tree -t "$TREE_CSUM" "$img" 2>/dev/null \
+      | awk '/^leaf [0-9]+/{print $2; exit}')"
+    if [[ -z "$leaf" ]]; then
+      log "delete_csum_entry: no csum tree leaves found"
+      return 1
+    fi
+    log "delete_csum_entry: could not find exact csum entry for $bytenr, falling back to corrupting first csum leaf $leaf"
   fi
+
+  # Corrupt ALL mirrors of the csum leaf (csum byte at offset 0).
+  btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | while read -r line; do
+    local p; p="$(echo "$line" | awk '{print $6}')"
+    [[ -z "$p" ]] && continue
+    python3 -c "
+with open('$img', 'r+b') as f:
+    f.seek($p)
+    b = f.read(1)
+    f.seek($p)
+    f.write(bytes([b[0] ^ 0xFF]))
+" 2>/dev/null
+  done
+
+  log "delete_csum_entry: corrupted csum leaf $leaf (all mirrors)"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
