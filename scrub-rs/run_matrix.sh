@@ -110,6 +110,11 @@ while IFS= read -r -d '' img; do
   out="$(eval "$cmd" 2>&1)"
   rc=$?
 
+  # Always persist the raw tool output next to the image so CI can surface
+  # it for non-PASS cases (the {OUTFILE} placeholder is optional in the
+  # scrub command, so we write it unconditionally here).
+  printf '%s\n' "$out" > "$outfile"
+
   dmism="$(parse_data_mismatches "$out")"; dmism="${dmism:-0}"
   mmism="$(parse_meta_mismatches "$out")"; mmism="${mmism:-0}"
   sheal="$(parse_self_heal "$out")"; sheal="${sheal:-0}"

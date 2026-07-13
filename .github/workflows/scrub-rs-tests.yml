@@ -408,6 +408,14 @@ jobs:
           sudo install -m 0755 btrfs-corrupt-block /usr/local/bin/btrfs-corrupt-block
           command -v btrfs-corrupt-block && echo "btrfs-corrupt-block ready" || echo "WARN: btrfs-corrupt-block not built"
 
+      - name: Dump btrfs-progs versions and btrfs-corrupt-block help
+        run: |
+          echo "=== btrfs --version ==="; btrfs --version
+          echo "=== mkfs.btrfs --version ==="; mkfs.btrfs --version
+          echo "=== btrfs-corrupt-block --version ==="; btrfs-corrupt-block --version 2>&1 || true
+          echo "=== btrfs-corrupt-block --help (available flags) ==="; btrfs-corrupt-block --help 2>&1 | head -80 || true
+          echo "=== btrfs check --help (relevant flags) ==="; btrfs check --help 2>&1 | grep -iE 'data-csum|readonly|corrupt|mode' || true
+
       - name: Build scrub-rs
         run: |
           cd scrub-rs
@@ -416,19 +424,51 @@ jobs:
           echo "SCRUB_RS_DIR=$PWD/target/release" >> "$GITHUB_ENV"
 
       - name: btrfs matrix — generate images + run scrub-rs
+        continue-on-error: true
         run: |
           cd scrub-rs
           # Generate the image matrix (loop-backed, single-device btrfs)
-          # plus the machine-readable expectations.tsv.
-          sudo ./btrfs_test_matrix.sh ./btrfs_test_images 2>&1 | tail -20
+          # plus the machine-readable expectations.tsv. Capture FULL output
+          # (no tail) so version-dependent corruption decisions are visible.
+          sudo ./btrfs_test_matrix.sh ./btrfs_test_images 2>&1 | tee /tmp/matrix_gen.log
+          echo "=== matrix build.log (corruption decisions / verify_check rc) ==="
+          sudo cat ./btrfs_test_images/build.log || true
           # Run scrub-rs over every image and compare to expectations.tsv.
-          sudo -E ./run_matrix.sh --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" ./btrfs_test_images 2>&1 | tail -40
+          sudo -E ./run_matrix.sh --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" ./btrfs_test_images 2>&1 | tee /tmp/matrix_run.log
           echo "--- matrix summary ---"
-          tail -1 ./btrfs_test_images/matrix_results.tsv
-          grep -qE '^TOTAL=[0-9]+ PASS=[0-9]+ FAIL=0 ' ./btrfs_test_images/matrix_results.tsv \
-            || { echo "::error::btrfs matrix had failures"; exit 1; }
+          cat ./btrfs_test_images/matrix_results.tsv
+          # Surface ground-truth + raw scrub output for every non-PASS image
+          # so a version-dependent divergence (e.g. btrfs-corrupt-block -E
+          # behaviour, or btrfs check flag support) is diagnosable from the
+          # log alone without re-running locally.
+          if ! grep -qE '^TOTAL=[0-9]+ PASS=[0-9]+ FAIL=0 ' ./btrfs_test_images/matrix_results.tsv; then
+            echo "::group::diagnostics for non-PASS images"
+            while IFS= read -r line; do
+              img="$(printf '%s' "$line" | awk '{print $1}')"
+              res="$(printf '%s' "$line" | awk '{print $7}')"
+              [[ "$img" == "IMAGE" || "$res" == "PASS" || "$res" == "SKIP" || -z "$res" ]] && continue
+              echo "### $img ($res)"
+              echo "--- EXPECTED_check_status.txt (btrfs check ground truth) ---"
+              sudo cat "${img%/*}/EXPECTED_check_status.txt" 2>/dev/null || true
+              echo "--- raw scrub-rs report ---"
+              sudo cat "${img%.img}.scrub_report.txt" 2>/dev/null || echo "(no report file emitted)"
+            done < ./btrfs_test_images/matrix_results.tsv
+            echo "::endgroup::"
+            echo "MATRIX_FAILED=true" >> "$GITHUB_ENV"
+          else
+            echo "MATRIX_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload matrix artifacts on failure
+        if: ${{ env.MATRIX_FAILED == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-matrix-diagnostics
+          path: scrub-rs/btrfs_test_images/
+          if-no-files-found: warn
 
       - name: btrfs live simulation — concurrent churn + scrub
+        if: ${{ env.MATRIX_FAILED != 'true' }}
         run: |
           cd scrub-rs
           # Read-only scrub alongside concurrent churn (no array active, so
@@ -443,6 +483,14 @@ jobs:
                    /root/btrfs_live_scrub_test_*/true-positive-dup-one-copy/SUMMARY.txt; do
             [[ -f "$s" ]] && { echo "### $s"; cat "$s"; }
           done
+
+      - name: Fail job if matrix had failures
+        if: always()
+        run: |
+          if [[ "${MATRIX_FAILED:-false}" == "true" ]]; then
+            echo "::error::btrfs matrix had failures (see diagnostics above / uploaded artifact)"
+            exit 1
+          fi
 
       - name: Cleanup
         if: always()
