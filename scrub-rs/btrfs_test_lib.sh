@@ -249,21 +249,36 @@ find_physical_byte_offset() {
   echo $(( physblock * 4096 ))
 }
 
-corrupt_extent_tree_whole() {
-  local img="$1"
+# corrupt_tree_whole <img> <tree_objectid> [name_for_logs]
+#
+# Corrupt the first leaf of an arbitrary well-known btrfs tree by flipping
+# the first byte of EVERY physical mirror the chunk map identifies for that
+# leaf's logical bytenr (so on a DUP/SINGLE profile both/all copies are
+# broken). The first byte of a btrfs metadata block is part of its CRC32c
+# checksum area, so this reliably produces a checksum-visible mismatch
+# for any tree a verifier walks.
+#
+# Use this to construct a `meta_corrupt` test case targeting a tree your
+# scrub tool actually reads: scrub-rs's open-time metadata-mirror check
+# walks the chunk tree + root tree, and the per-sector scrub drives reads
+# off the DEV_TREE, so for scrub-rs TARGET should be one of TREE_CHUNK,
+# TREE_ROOT, or TREE_DEV (NOT TREE_EXTENT, which scrub-rs only resolves
+# the root of -- it does not walk the extent-tree leaves with mirror
+# verification, so an extent-tree-only corruption is invisible to it).
+corrupt_tree_whole() {
+  local img="$1" tree="$2" name="${3:-tree}"
   require_map_logical
-  # Corrupt a leaf of the extent tree -- enough to make the tree unreadable.
   local leaf
-  leaf="$(btrfs inspect-internal dump-tree -t "$TREE_EXTENT" "$img" 2>/dev/null \
+  leaf="$(btrfs inspect-internal dump-tree -t "$tree" "$img" 2>/dev/null \
     | awk '/^leaf [0-9]+/{print $2; exit}')"
   if [[ -z "$leaf" ]]; then
-    log "corrupt_extent_tree_whole: no extent tree leaf found -- image may be too small or empty"
+    log "corrupt_tree_whole: no $name leaf found -- image may be too small or empty"
     return 1
   fi
   local phys
   phys="$(btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | awk 'NR==1{print $6}')"
-  [[ -n "$phys" ]] || { log "corrupt_extent_tree_whole: could not map logical $leaf to physical"; return 1; }
-  # Flip the first byte of the block (CRC32c csum) to break block checksum verification.
+  [[ -n "$phys" ]] || { log "corrupt_tree_whole: could not map logical $leaf to physical"; return 1; }
+  # Flip the first byte of every mirror of the leaf (CRC32c csum area).
   btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | while read -r line; do
     local p; p="$(echo "$line" | awk '{print $6}')"
     python3 -c "
@@ -274,34 +289,16 @@ with open('$img', 'r+b') as f:
     f.write(bytes([b[0] ^ 0xFF]))
 " 2>/dev/null
   done
-  log "corrupt_extent_tree_whole: corrupted extent tree leaf $leaf (all mirrors)"
+  log "corrupt_tree_whole: corrupted $name leaf $leaf (all mirrors)"
   return 0
 }
 
-corrupt_chunk_tree_whole() {
-  local img="$1"
-  require_map_logical
-  # Corrupt a leaf of the chunk tree.
-  local leaf
-  leaf="$(btrfs inspect-internal dump-tree -t "$TREE_CHUNK" "$img" 2>/dev/null \
-    | awk '/^leaf [0-9]+/{print $2; exit}')"
-  if [[ -z "$leaf" ]]; then
-    log "corrupt_chunk_tree_whole: no chunk tree leaf found"
-    return 1
-  fi
-  btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | while read -r line; do
-    local p; p="$(echo "$line" | awk '{print $6}')"
-    python3 -c "
-with open('$img', 'r+b') as f:
-    f.seek($p)
-    b = f.read(1)
-    f.seek($p)
-    f.write(bytes([b[0] ^ 0xFF]))
-" 2>/dev/null
-  done
-  log "corrupt_chunk_tree_whole: corrupted chunk tree leaf $leaf (all mirrors)"
-  return 0
-}
+# Back-compat wrappers -- the original names are still used by a couple of
+# recipes, keep them so existing callers don't break.
+corrupt_extent_tree_whole() { corrupt_tree_whole "$1" "$TREE_EXTENT" extent; }
+corrupt_chunk_tree_whole()   { corrupt_tree_whole "$1" "$TREE_CHUNK"  chunk;  }
+corrupt_root_tree_whole()    { corrupt_tree_whole "$1" "$TREE_ROOT"  root;  }
+corrupt_dev_tree_whole()     { corrupt_tree_whole "$1" "$TREE_DEV"    dev;    }
 
 # ---------------------------------------------------------------------------
 # Tier 2 corruption helpers -- see confidence-tier note at top of file

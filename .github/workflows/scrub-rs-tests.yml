@@ -515,11 +515,22 @@ jobs:
             --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" \
             --mode all --duration 60 --warmup 10 --intensity med
           echo "--- live-sim summaries ---"
+          # btrfs_live_scrub_test.sh defaults OUTDIR to /root/... (root-only
+          # readable), so the SUMMARIES must be read via sudo. The runner's
+          # shell is bash -e, so guard EVERY access so a missing SUMMARY
+          # can't abort the step under set -e — the three scenarios above are
+          # the real signal. shopt nullglob makes an unexpanded glob a zero-
+          # length list so the loop body never runs `[[ -f ]]` against a
+          # literal non-existent path (which would return 1 under set -e).
+          shopt -s nullglob
+          read_summaries=0
           for s in /root/btrfs_live_scrub_test_*/false-positive/SUMMARY.txt \
                    /root/btrfs_live_scrub_test_*/true-positive/SUMMARY.txt \
                    /root/btrfs_live_scrub_test_*/true-positive-dup-one-copy/SUMMARY.txt; do
-            [[ -f "$s" ]] && { echo "### $s"; cat "$s"; }
+            sudo test -f "$s" && { echo "### $s"; sudo cat "$s"; read_summaries=1; } || true
           done
+          shopt -u nullglob
+          [[ "$read_summaries" -eq 1 ]] || echo "WARN: no SUMMARY.txt files found"
 
       - name: Fail job if matrix had failures
         if: always()

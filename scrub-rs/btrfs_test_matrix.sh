@@ -169,7 +169,7 @@ recipe_10_directory_and_symlink_shapes() {
   finalize_fs "$img" "$mnt" "$OUTDIR/10_directory_and_symlink_shapes" "$label"
 }
 
-recipe_æ_corrupted_known_bad() {
+recipe_11_corrupted_known_bad() {
   local base_destdir="$OUTDIR/11_corrupted_known_bad"
   mkdir -p "$base_destdir"
   local label="btrfs_11"
@@ -201,20 +201,30 @@ recipe_æ_corrupted_known_bad() {
     log "SKIP [a_data_block_bitflip]"
   fi
 
-  # b) extent tree leaf csum corrupted
-  local vb="$base_destdir/b_extent_tree_corrupted"; mkdir -p "$vb"
+  # b) metadata-tree leaf csum corrupted (DEV_TREE)
+  #
+  # Targets the DEV_TREE specifically, not the EXTENT_TREE: scrub-rs's
+  # open() walks the chunk tree and the root tree (for the metadata-mirror
+  # cross-check) and its per-sector scrub drives reads off the DEV_TREE
+  # (which it also walks eagerly in scrub_driver to enumerate dev-extents).
+  # An EXTENT_TREE leaf is only located, never walked for mirror checks, so
+  # an extent-tree-only corruption is invisible to scrub-rs by design and
+  # would make this case FAIL rather than be a clean `meta_corrupt` PASS.
+  # btrfs check (which audits every tree's metadata csum) and btrfs scrub
+  # (which the kernel drives across every tree) both see it regardless.
+  local vb="$base_destdir/b_dev_tree_corrupted"; mkdir -p "$vb"
   cp -a "$pristine" "$vb/${label}.img"
-  if corrupt_extent_tree_whole "$vb/${label}.img"; then
+  if corrupt_dev_tree_whole "$vb/${label}.img"; then
     verify_check_offline "$vb/${label}.img" "$vb/EXPECTED_check_status.txt"
     if [[ $? -ne 0 ]]; then
-      log "[b_extent_tree_corrupted] confirmed failure, as expected"
-      record_expectation "$vb/${label}.img" meta_corrupt 1 "extent tree leaf csum corrupted via btrfs-map-logical + direct byte flip"
+      log "[b_dev_tree_corrupted] confirmed failure, as expected"
+      record_expectation "$vb/${label}.img" meta_corrupt 1 "DEV tree leaf csum corrupted via btrfs-map-logical + direct byte flip (targeting a tree scrub-rs walks)"
     else
-      log "WARN: [b_extent_tree_corrupted] btrfs check exited 0 -- unexpected"
+      log "WARN: [b_dev_tree_corrupted] btrfs check exited 0 -- unexpected"
       record_expectation "$vb/${label}.img" unverified 0 "expected failure, check reported clean"
     fi
   else
-    echo "SKIPPED: could not corrupt extent tree leaf." > "$vb/EXPECTED_check_status.txt"
+    echo "SKIPPED: could not corrupt DEV tree leaf." > "$vb/EXPECTED_check_status.txt"
     record_expectation "$vb/${label}.img" unverified 0 "corruption attempt failed"
   fi
 

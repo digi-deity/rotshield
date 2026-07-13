@@ -64,6 +64,8 @@ pub fn build_dev_extents(
     chunk_map: &ChunkMap,
     dev_tree_root: u64,
     devid: u64,
+    metadata_header_errors: &mut u64,
+    metadata_mirror_mismatches: &mut u64,
 ) -> io::Result<Vec<DevExtent>> {
     let mut out = Vec::new();
     walk_leaves(
@@ -99,13 +101,12 @@ pub fn build_dev_extents(
             }
             Ok(())
         },
-        |_logical| {
-            // A mirrored (DUP) dev-tree node with no good copy — the walk
-            // already skips that branch; nothing to count here.
-        },
-        |_logical| {
-            // Mirror divergence on the dev tree is not counted here.
-        },
+        // The DEV_TREE drives scrub_dev_tree; a corrupted DEV_TREE leaf
+        // means the scrub would silently enumerate fewer/no dev-extents
+        // and report 0 mismatches with exit 0. Count it as a metadata
+        // header error so the gap surfaces in the summary and exit code.
+        |_logical| *metadata_header_errors += 1,
+        |_logical| *metadata_mirror_mismatches += 1,
     )?;
     Ok(out)
 }

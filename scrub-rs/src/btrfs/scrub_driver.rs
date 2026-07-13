@@ -104,8 +104,8 @@ impl BtrfsScrub {
             superblock,
             roots,
             strategy,
-            metadata_header_errors,
-            metadata_mirror_mismatches,
+            mut metadata_header_errors,
+            mut metadata_mirror_mismatches,
         } = ctx;
 
         // Build the checksum map from the CSUM tree.  The strategy (csum
@@ -115,7 +115,21 @@ impl BtrfsScrub {
         // scrub's source of truth: it enumerates every checksummed data
         // sector exactly once, across all subvolumes/snapshots.
         let mut csum_map = CsumMap::new();
-        build_csum_map(&mut reader, &chunk_map, roots.csum_root, &strategy, &mut csum_map)?;
+        // build_csum_map walks the CSUM_TREE; if a CSUM_TREE leaf's header
+        // csum is broken (no good mirror copy) the walk skips that branch
+        // and the affected csum entries become unreachable for this scrub.
+        // Count those as metadata_header_errors and mirror mismatches so
+        // the gap surfaces in the summary + exit code rather than silently
+        // producing undercoverage with exit 0.
+        build_csum_map(
+            &mut reader,
+            &chunk_map,
+            roots.csum_root,
+            &strategy,
+            &mut csum_map,
+            &mut metadata_header_errors,
+            &mut metadata_mirror_mismatches,
+        )?;
 
         // Enumerate the device's dev-extents from the DEV_TREE, in ascending
         // physical order.  This is the drive set for the physical-order
@@ -123,12 +137,21 @@ impl BtrfsScrub {
         // single tree walk) so the caller can choose either scrub path
         // without re-opening the device.  `dev_tree_root` is always present
         // on a real filesystem; `expect` keeps the contract tight.
+        //
+        // As with build_csum_map above, a corrupted DEV_TREE leaf (no good
+        // mirror copy) would make the walk skip that branch, enumerate
+        // fewer/no dev-extents, and the scrub would run with an effectively
+        // empty drive set and report 0 mismatches with exit 0.  Count it as
+        // metadata_header_errors / metadata_mirror_mismatches so the gap
+        // surfaces instead of silently under-scrubbing the device.
         let dev_tree_root = roots.dev_tree_root.expect("DEV_TREE root missing from btrfs root tree");
         let dev_extents = build_dev_extents(
             &mut reader,
             &chunk_map,
             dev_tree_root,
             superblock.devid,
+            &mut metadata_header_errors,
+            &mut metadata_mirror_mismatches,
         )?;
 
         Ok(Self {

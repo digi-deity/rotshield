@@ -185,23 +185,38 @@ classify() {
       if [[ "$bc_data" -eq 0 && "$bc_meta" -eq 0 && "$bc_nofs" != "1" ]]; then ok=0; fi
       [[ "$ok" -eq 1 ]] && echo "ALIGN" || echo "FAIL"
       ;;
+    meta_corrupt)
+      # Unmirrored (or all-mirrors-broken) metadata corruption in a tree
+      # scrub-rs walks (targeted by the new recipe 11b at the DEV_TREE).
+      # All three tools should surface SOMETHING:
+      #   scrub-rs: a metadata mirror mismatch (mir>=1), a metadata header
+      #            error (hdr>=1), OR a data mismatch the broken tree would
+      #            have served (mm>=1) — e.g. a broken DEV_TREE leaf makes
+      #            scrub-rs unable to enumerate dev-extents and the open()
+      #            metadata-mirror walk should flag it.
+      #   btrfs check: must flag metadata csum (meta>0) OR refuse (rc!=0 / nofs).
+      #   btrfs scrub: must mount-fail (no good metadata copy) OR report errors.
+      local ok=1
+      local sr_total=$(( sr_mis + sr_mir + sr_hdr ))
+      [[ "$sr_total" -ge "${EXP_MIN[$cn]:-1}" && "$sr_rc" -ne 0 ]] || ok=0
+      if [[ "$bc_meta" -eq 0 && "$bc_nofs" != "1" && "$bc_rc" -eq 0 ]]; then ok=0; fi
+      [[ "$ok" -eq 1 ]] && echo "ALIGN" || echo "FAIL"
+      ;;
     unreadable)
       if [[ "$sr_rc" -ne 0 && "$bc_rc" -ne 0 ]]; then echo "ALIGN"
       else echo "FAIL"; fi
       ;;
     unverified)
-      # Logged only. Two known-acceptable divergences live here:
+      # Logged only. Known-acceptable divergences that live here:
       #   13a metadata_generation_only: scrub-rs clean (no csum audit),
-      #                                  btrfs check flags bad generation,
-      #                                  btrfs scrub mount fails. WARN.
-      #   13b csum_entry_deleted:         scrub-rs clean (missing-csum !=
-      #                                  corruption), btrfs check flags
-      #                                  missing csum, btrfs scrub clean. WARN.
-      #   11b extent_tree_corrupted:     injection was a no-op on btrfs-progs
-      #                                  v6.14; all three agree clean. ALIGN.
-      #   11c single_superblock_wiped:   scrub-rs refuses (no backup-SB
-      #                                  fallback), btrfs check refuses,
-      #                                  btrfs scrub mount refuses. ALIGN.
+      #                               btrfs check flags bad generation,
+      #                               btrfs scrub mount fails. WARN.
+      #   13b csum_entry_deleted:       scrub-rs clean (missing-csum !=
+      #                               corruption), btrfs check flags
+      #                               missing csum, btrfs scrub clean. WARN.
+      #   11c single_superblock_wiped: scrub-rs refuses (no backup-SB
+      #                               fallback), btrfs check refuses,
+      #                               btrfs scrub mount refuses. ALIGN.
       echo "SKIP"
       ;;
     *)
@@ -328,9 +343,9 @@ while IFS= read -r -d '' img; do
     "$bs_rc" "$bs_csum" "$bs_corr" "$bs_unc" "$([[ $bs_nomnt == 1 ]] && echo FAIL || echo OK)" \
     "$align" "$note" | tee -a "$SUMMARY"
 
-  if [[ "$align" == "FAIL" ]]; then
+  if [[ "$align" == "FAIL" || "$align" == "FAIL_UNKNOWN_EXP" ]]; then
     unexpected_failures=$((unexpected_failures+1))
-    echo "::error::UNEXPECTED misalignment in case $cn (see full logs above)"
+    echo "::error::UNEXPECTED misalignment in case $cn (align=$align; full logs above)"
   fi
 
   [[ $KEEP -eq 0 ]] && rm -f "$work_img"

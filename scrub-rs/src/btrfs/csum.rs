@@ -41,6 +41,8 @@ pub fn build_csum_map(
     csum_root: u64,
     strategy: &CsumStrategy,
     map: &mut CsumMap,
+    metadata_header_errors: &mut u64,
+    metadata_mirror_mismatches: &mut u64,
 ) -> std::io::Result<usize> {
     let hash_len = strategy.hash_len;
     let sector_size = strategy.sector_size;
@@ -69,11 +71,13 @@ pub fn build_csum_map(
         }
         Ok(())
     },
-        // The csum tree walk only needs the csum entries; metadata-header
-        // errors are surfaced by the scrub's own tree walks, not here.
-        |_logical| {},
-        // Mirror-divergence reporting is not needed for csum-map building.
-        |_logical| {},
+        // The CSUM tree is walked to build the csum map; metadata-header
+        // errors (no good mirror copy of a CSUM_TREE node) actually mean
+        // sectors of CSUM entries are unreachable for this scrub, so we MUST
+        // count them (they would otherwise cause silent undercoverage with
+        // exit 0 — a corrupted CSUM_TREE leaf yielding fewer/no csums).
+        |_logical| *metadata_header_errors += 1,
+        |_logical| *metadata_mirror_mismatches += 1,
     )?;
     Ok(count)
 }
