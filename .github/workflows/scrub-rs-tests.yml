@@ -354,10 +354,13 @@ jobs:
   # Three independent stages, all driven by loop-backed single-device
   # btrfs images:
   #   1. btrfs-matrix      — generate the image matrix (btrfs_test_matrix.sh)
-  #      into ./btrfs_test_images/ (29 cases today: 16 clean recipes + 13
+  #      into ./btrfs_test_images/ (30 cases today: 18 clean recipes + 12
   #      corrupted/anomaly cases). Run scrub-rs over every image and compare
   #      pass/fail against the machine-readable expectations.tsv (run_matrix.sh).
-  #      Expect TOTAL=29 PASS=25 FAIL=0 SKIP=4.
+  #      Expect TOTAL=30 PASS=27 FAIL=0 SKIP=3.  (recipe 19 added 2026-07-13:
+  #      partial CSUM_TREE break — the dangerous undercoverage case where the
+  #      DEV_TREE stays walkable so sectors checked > 0 but a broken csum leaf
+  #      is silently skipped; must surface as metadata_header_errors / rc!=0.)
   #   2. cmpUtilities      — three-way per-case comparison of scrub-rs vs
   #      `btrfs check --check-data-csum` vs (online) `btrfs scrub start -B`,
   #      on THROWAWAY COPIES so gold images stay pristine. Prints FULL

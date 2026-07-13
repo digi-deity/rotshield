@@ -544,6 +544,60 @@ recipe_18_subvolume_lifecycle_edge_cases() {
 }
 
 # ===========================================================================
+# Recipe 19: partial CSUM_TREE break -- the dangerous undercoverage case.
+#
+# The DEV_TREE stays fully walkable (so the data-scrub loop runs and
+# `sectors checked` is non-zero), but ONE CSUM_TREE leaf (both DUP mirrors)
+# has its header checksum broken.  The csum entries living in that leaf
+# become unreachable, so scrub-rs silently skips those sectors.  The broken
+# leaf must surface as `metadata_header_errors` (hard error, non-zero exit)
+# so the undercoverage is NOT mistaken for a clean scrub.
+#
+# This is the partial-but-non-zero shape (distinct from the all-or-nothing
+# DEV_TREE-broken case in 11b): we deliberately populate enough data to
+# force a multi-leaf CSUM_TREE, then break a NON-first leaf, so coverage
+# stays partial rather than collapsing to `sectors checked: 0`.
+# ===========================================================================
+recipe_19_csum_tree_partial_break() {
+  local base="$OUTDIR/19_csum_tree_partial_break"
+  mkdir -p "$base"
+  local label="btrfs_19"
+  local img="$WORKDIR/${label}.img" mnt="$WORKDIR/mnt_${label}"
+
+  # `dup` metadata so the DUP cross-check is exercised; enough data to force
+  # a multi-leaf CSUM_TREE (each leaf holds ~node_size / csum_width sectors
+  # of csums; ~300 MiB of data at 4K sectors comfortably spans several
+  # leaves).  `single` data keeps the data layout simple for the scrub.
+  btrfs_mkfs "$img" "$IMG_SIZE_LARGE" crc32c 16k single dup
+  btrfs_mount "$img" "$mnt"
+  # ~300 MiB across several files so the CSUM_TREE spans multiple leaves.
+  populate_large_multiextent "$mnt" 30 10
+  record_manifest "$label" note "large image ($IMG_SIZE_LARGE) with ~300MiB data to force a multi-leaf CSUM_TREE; one non-first csum leaf broken (both DUP mirrors)"
+  btrfs_umount "$mnt"
+
+  if ! command -v btrfs-map-logical >/dev/null 2>&1; then
+    log "SKIP recipe 19: btrfs-map-logical not installed"
+    mkdir -p "$base/a_csum_leaf_broken"
+    echo "SKIPPED: btrfs-map-logical not found." > "$base/a_csum_leaf_broken/EXPECTED_check_status.txt"
+    record_expectation "$base/a_csum_leaf_broken/${label}.img" unverified 0 "btrfs-map-logical unavailable"
+    return
+  fi
+
+  # a) one non-first CSUM_TREE leaf broken (both mirrors) -> partial
+  # undercoverage that MUST surface as metadata_header_errors (non-zero exit)
+  local va="$base/a_csum_leaf_broken"; mkdir -p "$va"
+  cp -a "$img" "$va/${label}.img"
+  if corrupt_csum_tree_whole "$va/${label}.img"; then
+    verify_check_offline "$va/${label}.img" "$va/EXPECTED_check_status.txt" || true
+    echo "EXPECTED: a non-first CSUM_TREE leaf (both DUP mirrors) has its header csum broken. The DEV_TREE is intact so the data-scrub loop runs (sectors checked > 0), but the csum entries in the broken leaf are unreachable and silently skipped. scrub-rs MUST report this as metadata_header_errors (>=1) with a non-zero exit, NOT a clean scrub." >> "$va/EXPECTED_check_status.txt"
+    record_expectation "$va/${label}.img" meta_corrupt 1 "one non-first CSUM_TREE leaf broken (both DUP mirrors) -- partial undercoverage must surface as metadata_header_errors"
+  else
+    log "WARN: recipe 19a could not corrupt a CSUM_TREE leaf"
+    record_expectation "$va/${label}.img" unverified 0 "could not corrupt CSUM_TREE leaf"
+  fi
+}
+
+# ===========================================================================
 # Main
 # ===========================================================================
 main() {
@@ -578,6 +632,7 @@ main() {
   recipe_16_feature_flag_toggles
   recipe_17_nocow_and_mixed_compression
   recipe_18_subvolume_lifecycle_edge_cases
+  recipe_19_csum_tree_partial_break
 
   rm -rf "$WORKDIR"
 

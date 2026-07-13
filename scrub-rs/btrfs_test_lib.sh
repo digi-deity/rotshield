@@ -459,6 +459,54 @@ with open('$img', 'r+b') as f:
   return 0
 }
 
+# corrupt_csum_tree_whole <img> [leaf_bytenr]
+# Breaks the header checksum of a SINGLE CSUM_TREE leaf (every mirror of
+# it), leaving the rest of the CSUM_TREE intact.  This is the partial-
+# coverage metadata-corruption case: the DEV_TREE is still fully walkable
+# (so the data-scrub loop runs), but the csum entries living in the broken
+# leaf are unreachable, so scrub-rs silently skips those sectors.  The
+# broken leaf must surface as a `metadata_header_errors` (hard error, non-
+# zero exit) so the undercoverage is not mistaken for a clean scrub.
+#
+# If `leaf_bytenr` is omitted, the SECOND csum leaf is chosen (the first is
+# usually the root's own csum entries and is tiny); on a filesystem with
+# enough data to force multiple csum leaves this guarantees the broken leaf
+# is NOT the only one, so coverage stays partial-but-non-zero rather than
+# collapsing to the all-or-nothing shape.  Callers that want a guaranteed
+# multi-leaf CSUM_TREE should populate enough data first (see recipe 19).
+corrupt_csum_tree_whole() {
+  local img="$1" leaf="${2:-}"
+  require_map_logical
+  if [[ -z "$leaf" ]]; then
+    # Pick the 2nd csum leaf dump-tree walks (NR==2).  Falls back to the
+    # first if there is only one.
+    leaf="$(btrfs inspect-internal dump-tree -t "$TREE_CSUM" "$img" 2>/dev/null \
+      | awk '/^leaf [0-9]+/{n++; if (n==2) {print $2; exit}} END{if (n<2) exit}')"
+    if [[ -z "$leaf" ]]; then
+      leaf="$(btrfs inspect-internal dump-tree -t "$TREE_CSUM" "$img" 2>/dev/null \
+        | awk '/^leaf [0-9]+/{print $2; exit}')"
+    fi
+  fi
+  if [[ -z "$leaf" ]]; then
+    log "corrupt_csum_tree_whole: no CSUM_TREE leaf found"
+    return 1
+  fi
+  # Flip the first byte of every mirror of the chosen leaf (CRC32c csum area).
+  btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | while read -r line; do
+    local p; p="$(echo "$line" | awk '{print $6}')"
+    [[ -z "$p" ]] && continue
+    python3 -c "
+with open('$img', 'r+b') as f:
+    f.seek($p)
+    b = f.read(1)
+    f.seek($p)
+    f.write(bytes([b[0] ^ 0xFF]))
+" 2>/dev/null
+  done
+  log "corrupt_csum_tree_whole: corrupted CSUM_TREE leaf $leaf (all mirrors)"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Data population helpers
 # ---------------------------------------------------------------------------
