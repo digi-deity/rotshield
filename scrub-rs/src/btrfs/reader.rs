@@ -49,7 +49,13 @@ pub const GEN_DONT_CHECK: u64 = u64::MAX;
 /// a later transaction).  Callers should treat this as untrustworthy and
 /// skip the branch, exactly as with `all_mirrors_failed`.
 pub struct ReadNodeResult {
-    pub node: Node,
+    /// The parsed node.  `None` when no mirror copy could be verified (i.e.
+    /// `all_mirrors_failed` is `true`) — we deliberately do **not** parse a
+    /// corrupt buffer, because its `nritems`/slot offsets are untrustworthy
+    /// and the unchecked indexing in `Node::parse` would panic on garbage.
+    /// Callers only ever read this on the `!all_mirrors_failed` path (see
+    /// `walk_leaves`), so a failed node is correctly left unparsed.
+    pub node: Option<Node>,
     pub all_mirrors_failed: bool,
     pub generation_mismatch: bool,
     /// `true` iff the node lives in a mirrored (DUP/RAID1/…) chunk and at
@@ -316,7 +322,7 @@ impl FsReader {
             None => {
                 let buf = self.read_logical(chunk_map, logical, self.node_size)?;
                 return Ok(ReadNodeResult {
-                    node: super::node::Node::parse(buf),
+                    node: Some(super::node::Node::parse(buf)),
                     all_mirrors_failed: false,
                     generation_mismatch: false,
                     mirror_mismatch: false,
@@ -414,9 +420,20 @@ impl FsReader {
                  (no verifiable copy; {} mirror(s) read)",
                 stripes.len()
             );
+            // Do NOT parse the corrupt buffer: its `nritems`/slot offsets are
+            // unverified and `Node::parse`'s unchecked indexing would panic
+            // on garbage.  The caller (`walk_leaves`) only reads `node` on
+            // the `!all_mirrors_failed` path, so leaving it `None` is safe
+            // and turns a would-be crash into a clean "skip this branch".
+            return Ok(ReadNodeResult {
+                node: None,
+                all_mirrors_failed,
+                generation_mismatch,
+                mirror_mismatch,
+            });
         }
         Ok(ReadNodeResult {
-            node: super::node::Node::parse(buf),
+            node: Some(super::node::Node::parse(buf)),
             all_mirrors_failed,
             generation_mismatch,
             mirror_mismatch,

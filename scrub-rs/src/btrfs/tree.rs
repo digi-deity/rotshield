@@ -126,7 +126,7 @@ where
         if res.mirror_mismatch {
             on_mirror_mismatch(logical);
         }
-        let node = res.node;
+        let node = res.node.unwrap();
         match node {
             Node::Leaf(leaf) => f(reader, &leaf, logical)?,
             Node::Internal(internal) => {

@@ -50,7 +50,11 @@ impl CsumStrategy {
     /// Build the strategy from a parsed superblock.
     ///
     /// Returns an error for csum types this tool does not implement, so we
-    /// fail loudly instead of silently producing false mismatches.
+    /// fail loudly instead of silently producing false mismatches.  The
+    /// algorithm/length come from the superblock's `csum_type`; the real
+    /// data `sector_size` (which the old code ignored, hard-wiring 4096) is
+    /// taken from the superblock so the scrub honours what the filesystem
+    /// actually uses.
     pub fn from_superblock(sb: &Superblock) -> io::Result<Self> {
         let (name, hash_len) = match sb.csum_type {
             csum_type::CRC32C => ("crc32c", 4usize),
@@ -79,6 +83,72 @@ impl CsumStrategy {
             hash_len,
             sector_size,
         })
+    }
+
+    /// Verify a btrfs metadata node/leaf header checksum given only the
+    /// on-disk `csum_type` — no [`CsumStrategy`] object required.
+    ///
+    /// This is the single shared primitive behind both
+    /// [`CsumStrategy::verify_node_header`] (used for every tree node) and
+    /// [`super::superblock::Superblock::read`] (which verifies the
+    /// superblock's *own* header before any tree walk begins).  The
+    /// chicken-and-egg there is resolved by *ordering*, not by a separate
+    /// code path: the caller reads the raw 4096-byte block, peeks
+    /// `csum_type` (a plain `le_u16` at offset 196, itself inside the
+    /// checksummed body), and calls this — the algorithm id is covered by
+    /// the very checksum we are about to check, so a corrupt `csum_type`
+    /// simply fails verification rather than causing a circular dependency.
+    ///
+    /// Returns `Err` for an unsupported `csum_type` (so the caller fails
+    /// loudly), `Ok(true)` iff the stored header csum matches the computed
+    /// one.  `node_buf` must be exactly `node_size` bytes (the full on-disk
+    /// node); the superblock is a 4096-byte node with the identical
+    /// csum-prefix layout, so it verifies with the same code.
+    pub(crate) fn verify_header(csum_type: u16, node_buf: &[u8]) -> io::Result<bool> {
+        const CSUM_PREFIX: usize = 32; // btrfs_header.csum[32]
+        if node_buf.len() <= CSUM_PREFIX {
+            return Ok(false);
+        }
+        let (_name, hash_len) = match csum_type {
+            csum_type::CRC32C => ("crc32c", 4usize),
+            csum_type::XXHASH => ("xxhash", 8usize),
+            csum_type::SHA256 => ("sha256", 32usize),
+            csum_type::BLAKE2 => ("blake2", 32usize),
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported btrfs csum_type {other} (only crc32c/xxhash/sha256/blake2 are implemented)"),
+                ));
+            }
+        };
+        // Only the first `hash_len` bytes of the 32-byte csum field are the
+        // real checksum; the rest is padding.  Comparing the full 32-byte
+        // prefix against `compute` (which returns `hash_len` bytes) would
+        // always mismatch for crc32c/xxhash (hash_len < 32) and falsely
+        // fail every clean node.
+        let stored = &node_buf[..hash_len];
+        let body = &node_buf[CSUM_PREFIX..];
+        let actual = match csum_type {
+            csum_type::CRC32C => crc32c::crc32c(body).to_le_bytes().to_vec(),
+            csum_type::XXHASH => xxhash_rust::xxh64::xxh64(body, 0).to_le_bytes().to_vec(),
+            csum_type::SHA256 => {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(body);
+                h.finalize().to_vec()
+            }
+            csum_type::BLAKE2 => {
+                use blake2::{Blake2bVar, digest::Update, digest::VariableOutput};
+                let mut h = Blake2bVar::new(32).expect("32 is a valid BLAKE2b digest size");
+                h.update(body);
+                let mut out = [0u8; 32];
+                h.finalize_variable(&mut out)
+                    .expect("32-byte output is always valid for BLAKE2b");
+                out.to_vec()
+            }
+            _ => unreachable!("csum_type validated above"),
+        };
+        Ok(stored == actual.as_slice())
     }
 
     /// Compute the checksum of `data` under this strategy, returning the raw
@@ -132,18 +202,11 @@ impl CsumStrategy {
     ///
     /// Returns `true` iff the stored header csum matches the computed one.
     /// `node_buf` must be exactly `node_size` bytes (the full on-disk node).
+    ///
+    /// Delegates to the shared [`CsumStrategy::verify_header`] primitive so
+    /// the superblock (which has no [`CsumStrategy`] yet) and every tree
+    /// node verify with one identical code path.
     pub fn verify_node_header(&self, node_buf: &[u8]) -> bool {
-        const CSUM_PREFIX: usize = 32; // btrfs_header.csum[32]
-        if node_buf.len() <= CSUM_PREFIX {
-            return false;
-        }
-        // Only the first `hash_len` bytes of the 32-byte csum field are the
-        // real checksum; the rest is padding.  Comparing the full 32-byte
-        // prefix against `compute` (which returns `hash_len` bytes) would
-        // always mismatch for crc32c/xxhash (hash_len < 32) and falsely
-        // fail every clean node.
-        let stored = &node_buf[..self.hash_len];
-        let body = &node_buf[CSUM_PREFIX..];
-        stored == self.compute(body).as_slice()
+        CsumStrategy::verify_header(self.csum_type, node_buf).unwrap_or(false)
     }
 }

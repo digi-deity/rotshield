@@ -4,12 +4,27 @@
 //! fsid, root/chunk_root bytenr, node/sector sizes, and the system chunk
 //! array (the bootstrap needed to walk the chunk tree).
 
-use std::io::{Read, Seek};
+use std::io::{self, Read, Seek};
 
+use super::csum_strategy::CsumStrategy;
 use super::util::{le_u16, le_u32, le_u64, read_at};
 
 /// Offset of the primary superblock on the device (64 KiB).
 pub const SUPERBLOCK_OFFSET: u64 = 0x10_000;
+/// btrfs keeps mirror copies of the superblock at well-known offsets so the
+/// filesystem can still be opened if the primary is corrupted.  The primary
+/// lives at 64 KiB; further backups exist at 64 MiB, 256 GiB, and 1 TiB.
+/// btrfs only writes a given backup if the device is large enough to contain
+/// it (a backup at offset X is meaningless on a device smaller than X+4KiB),
+/// so [`Superblock::read`] only probes a copy when the device can hold it.
+/// We try each reachable copy in order and use the first that passes magic +
+/// header-checksum verification — exactly as the kernel and `btrfs check` do.
+pub const SUPERBLOCK_BACKUP_OFFSETS: &[u64] = &[
+    0x10_000,       // 64 KiB  — primary
+    0x400_0000,     // 64 MiB  — backup 1
+    0x40_0000_0000, // 256 GiB — backup 2
+    0x100_0000_0000, // 1 TiB   — backup 3
+];
 /// btrfs magic bytes.
 pub const BTRFS_MAGIC: [u8; 8] = *b"_BHRfS_M";
 /// Bytes of CRC32C stored at the start of a metadata/superblock header.
@@ -105,14 +120,68 @@ const OFF_DEVID: usize = 198 + 3;
 const OFF_SYS_CHUNKS: usize = 811;
 
 impl Superblock {
-    /// Read and parse the primary superblock from `fp`.
+    /// Read and parse the superblock from `fp`, falling back through the
+    /// btrfs superblock mirror copies if the primary is unusable.
     ///
     /// `offset` is the byte offset of the start of the btrfs partition
     /// within the underlying file/device (0 for a bare btrfs image or an
     /// array partition like /dev/nmd1p1; the partition's start sector for a
     /// whole-disk image or a raw rdev that needs rdevOffset added).
+    ///
+    /// btrfs stores mirror copies of the superblock at well-known offsets
+    /// (see [`SUPERBLOCK_BACKUP_OFFSETS`]); we try each *reachable* copy in
+    /// order and use the first that passes both magic and header-checksum
+    /// verification.  A copy whose 4096-byte block would extend past
+    /// end-of-device yields a short read, which we treat as "this backup
+    /// isn't present on this device" and skip — so larger backups (256 GiB,
+    /// 1 TiB) are only consulted when the device is actually big enough to
+    /// hold them.  This means a corrupted primary superblock (e.g. a wiped
+    /// 64 KiB copy) no longer makes the tool refuse outright — it
+    /// transparently uses an intact backup, exactly as the kernel and `btrfs
+    /// check` do.  A superblock is accepted only after its own 32-byte header
+    /// checksum is verified with the same [`CsumStrategy::verify_header`]
+    /// primitive every tree node uses, so the trust chain still starts from a
+    /// verified block.
     pub fn read<R: Read + Seek>(fp: &mut R, offset: u64) -> std::io::Result<Self> {
-        let buf = read_at(fp, offset + SUPERBLOCK_OFFSET, 4096)?;
+        // We probe each superblock mirror copy in order and use the first
+        // that passes magic + header-checksum verification.  A copy whose
+        // 4096-byte block would extend past end-of-device yields a short read
+        // (UnexpectedEof); we treat that as "this copy isn't present on this
+        // device" and skip to the next, rather than failing the whole open.
+        // This makes the fallback size-aware without needing to stat `fp`
+        // (which the generic `R: Read + Seek` bound doesn't allow), and works
+        // for any seekable reader — a regular file, a block device, or a pipe.
+        let mut last_err: Option<io::Error> = None;
+        for &sb_off in SUPERBLOCK_BACKUP_OFFSETS {
+            let abs_off = offset + sb_off;
+            match Self::read_one(fp, abs_off) {
+                Ok(sb) => return Ok(sb),
+                // A short read means this backup copy doesn't physically exist
+                // on this device (device too small) — skip it, try the next.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => continue,
+                // Keep the most informative error (the primary's) but try the
+                // next reachable copy; only surface it if every copy fails.
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "no readable btrfs superblock found")
+        }))
+    }
+
+    /// Read and parse a single superblock copy at absolute byte `abs_off`.
+    ///
+    /// Verifies magic first (cheap reject for a wiped/zeroed block), then the
+    /// superblock's OWN 32-byte header checksum using the shared
+    /// [`CsumStrategy::verify_header`] primitive — the superblock is just a
+    /// 4096-byte node with the identical csum-prefix layout (csum[32] at
+    /// offset 0, body from offset 32).  The chicken-and-egg is resolved by
+    /// *ordering*: we read the raw block, peek `csum_type` (offset 196, itself
+    /// inside the checksummed body), and verify — the algorithm id is covered
+    /// by the very checksum we are about to check, so a corrupt `csum_type`
+    /// simply fails verification.
+    fn read_one<R: Read + Seek>(fp: &mut R, abs_off: u64) -> std::io::Result<Self> {
+        let buf = read_at(fp, abs_off, 4096)?;
 
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&buf[OFF_MAGIC..OFF_MAGIC + 8]);
@@ -125,7 +194,14 @@ impl Superblock {
                 ),
             ));
         }
-
+        // Verify this copy's OWN 32-byte header checksum (see `read_one` doc).
+        let csum_type = le_u16(&buf, OFF_CSUM_TYPE);
+        if !CsumStrategy::verify_header(csum_type, &buf)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "superblock header checksum mismatch (block corrupt or not a btrfs superblock)",
+            ));
+        }
         let mut fsid = [0u8; 16];
         fsid.copy_from_slice(&buf[OFF_FSID..OFF_FSID + 16]);
 

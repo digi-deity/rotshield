@@ -232,7 +232,7 @@ fn extent_covers(
             .read_node(chunk_map, node_logical, crate::btrfs::reader::GEN_DONT_CHECK, None, None)
             .ok();
         let node = match res {
-            Some(r) if !r.all_mirrors_failed => r.node,
+            Some(r) if !r.all_mirrors_failed => r.node.unwrap(),
             _ => return ExtentLive::Unreadable,
         };
         match node {
@@ -325,7 +325,7 @@ fn csum_at(
             .read_node(chunk_map, node_logical, crate::btrfs::reader::GEN_DONT_CHECK, None, None)
             .ok();
         let node = match res {
-            Some(r) if !r.all_mirrors_failed => r.node,
+            Some(r) if !r.all_mirrors_failed => r.node.unwrap(),
             _ => return CsumLive::Unreadable,
         };
         match node {
