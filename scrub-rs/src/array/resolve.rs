@@ -44,11 +44,7 @@ pub struct ResolvedLocation {
 /// `pread`/`pwrite` the raw rdev directly.
 ///
 /// Returns `Err` if the devid is not a data disk in the array config.
-pub fn resolve(
-    config: &ArrayConfig,
-    devid: u64,
-    array_phys: u64,
-) -> io::Result<ResolvedLocation> {
+pub fn resolve(config: &ArrayConfig, devid: u64, array_phys: u64) -> io::Result<ResolvedLocation> {
     let dev_path = config.data_dev(devid).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,

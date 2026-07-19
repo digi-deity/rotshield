@@ -55,7 +55,7 @@ use std::process::ExitCode;
 use scrub_rs::array::config;
 use scrub_rs::btrfs;
 
-const BLOCK: usize = btrfs::superblock::BTRFS_SECTOR_SIZE as usize;
+const BLOCK: usize = btrfs::superblock::BTRFS_SECTOR_SIZE;
 
 /// What to corrupt and how to handle the parity disks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,29 +151,33 @@ fn main() -> ExitCode {
             }
             "--flip" => {
                 let v = iter.next().expect("--flip requires a value");
-                opts.flip =
-                    u64::from_str_radix(v.trim_start_matches("0x"), 16).expect("invalid --flip")
-                        as u8;
+                opts.flip = u64::from_str_radix(v.trim_start_matches("0x"), 16)
+                    .expect("invalid --flip") as u8;
             }
             "--targets" => {
-                opts.targets =
-                    Targets::parse(iter.next().expect("--targets requires a value"))
-                        .unwrap_or_else(|e| {
-                            eprintln!("{e}");
-                            std::process::exit(2);
-                        });
+                opts.targets = Targets::parse(iter.next().expect("--targets requires a value"))
+                    .unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(2);
+                    });
             }
             "--partner" => {
                 opts.partner_slot = Some(
-                    iter.next().expect("--partner requires a value").parse().expect("invalid --partner slot"),
+                    iter.next()
+                        .expect("--partner requires a value")
+                        .parse()
+                        .expect("invalid --partner slot"),
                 );
             }
             "--backup" => {
-                opts.backup = Some(PathBuf::from(iter.next().expect("--backup requires a value")));
+                opts.backup = Some(PathBuf::from(
+                    iter.next().expect("--backup requires a value"),
+                ));
             }
             "--restore" => {
-                opts.restore =
-                    Some(PathBuf::from(iter.next().expect("--restore requires a value")));
+                opts.restore = Some(PathBuf::from(
+                    iter.next().expect("--restore requires a value"),
+                ));
             }
             "-h" | "--help" => {
                 usage();
@@ -189,9 +193,7 @@ fn main() -> ExitCode {
     }
 
     if positional.len() != 2 {
-        eprintln!(
-            "error: expected exactly two positional args: <array-partition-dev> <file-path>"
-        );
+        eprintln!("error: expected exactly two positional args: <array-partition-dev> <file-path>");
         usage();
         return ExitCode::from(2);
     }
@@ -238,7 +240,7 @@ struct FsContext {
 }
 
 /// Open `dev` (an array partition or a raw image) and build the chunk map
-/// + locate the FS/CSUM tree roots via the shared [`btrfs::open`].  The
+/// and locate the FS/CSUM tree roots via the shared [`btrfs::open`].  The
 /// chunk-map / root-tree walk is owned there now — this binary no longer
 /// carries its own copy.
 fn open_fs(dev: &str, base_offset: u64) -> io::Result<FsContext> {
@@ -268,14 +270,14 @@ fn find_file_sector(ctx: &mut FsContext, sector: usize) -> io::Result<(u64, u64,
         |_r, leaf, _logical| {
             for i in 0..leaf.slots.len() {
                 let slot = leaf.slots[i];
-                if slot.key.ty == btrfs::key::key_type::EXTENT_DATA {
-                    if let Some(ext) = btrfs::extent::FileExtent::parse(
+                if slot.key.ty == btrfs::key::key_type::EXTENT_DATA
+                    && let Some(ext) = btrfs::extent::FileExtent::parse(
                         leaf.item_data(i),
                         slot.key.objectid,
                         slot.key.offset,
-                    ) {
-                        extents.push(ext);
-                    }
+                    )
+                {
+                    extents.push(ext);
                 }
             }
             Ok(())
@@ -309,10 +311,12 @@ fn find_file_sector(ctx: &mut FsContext, sector: usize) -> io::Result<(u64, u64,
         )
     })?;
     let logical = ext.disk_start() + (remaining_sector as u64) * BLOCK as u64;
-    let (devid, array_phys) = ctx
-        .chunk_map
-        .lookup(logical)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no chunk mapping for logical 0x{logical:x}")))?;
+    let (devid, array_phys) = ctx.chunk_map.lookup(logical).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no chunk mapping for logical 0x{logical:x}"),
+        )
+    })?;
     Ok((devid, array_phys, logical, ext.inode))
 }
 
@@ -358,10 +362,7 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
         ));
     };
     let dev_path = dev_path.to_path_buf();
-    println!(
-        "file: {file_path}  inode={inode}  sector={}",
-        opts.sector
-    );
+    println!("file: {file_path}  inode={inode}  sector={}", opts.sector);
     println!(
         "  devid={devid}  logical=0x{logical:x}  array_phys=0x{array_phys:x}  dev={}",
         dev_path.display()
@@ -386,10 +387,14 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
     let p_expected = scrub_rs::array::parity::compute_p(&cfg, array_phys, BLOCK)?;
     let q_expected = scrub_rs::array::parity::compute_q(&cfg, array_phys, BLOCK)?;
     if p_before != p_expected {
-        eprintln!("warning: P does not match XOR(data) — array P not in sync, test may be meaningless");
+        eprintln!(
+            "warning: P does not match XOR(data) — array P not in sync, test may be meaningless"
+        );
     }
     if q_before != q_expected {
-        eprintln!("warning: Q does not match GF syndrome — array Q not in sync, test may be meaningless");
+        eprintln!(
+            "warning: Q does not match GF syndrome — array Q not in sync, test may be meaningless"
+        );
     }
 
     // 4. Build the corrupt version.
@@ -416,14 +421,13 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
     //     recover the target disk.
     let mut partner: Option<(u64, PathBuf, Vec<u8>, Vec<u8>)> = None; // (slot, path, orig, corrupt)
     if opts.targets == Targets::TwoDisk {
-        let chosen_slot = match opts.partner_slot {
-            Some(s) => s,
-            None => *cfg
-                .data_devs
-                .keys()
-                .find(|s| **s != devid)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no partner data disk"))?,
-        };
+        let chosen_slot =
+            match opts.partner_slot {
+                Some(s) => s,
+                None => *cfg.data_devs.keys().find(|s| **s != devid).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "no partner data disk")
+                })?,
+            };
         let Some(p_path) = cfg.data_dev(chosen_slot) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -431,7 +435,8 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
             ));
         };
         let p_path = p_path.to_path_buf();
-        let p_orig = scrub_rs::array::stripe::read_block_or_zeros(&cfg, &p_path, array_phys, BLOCK)?;
+        let p_orig =
+            scrub_rs::array::stripe::read_block_or_zeros(&cfg, &p_path, array_phys, BLOCK)?;
         // Flip a different byte on the partner so the two corruptions are
         // genuinely independent.
         let mut p_corrupt = p_orig.clone();
@@ -464,7 +469,9 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
     // 6. Compute the new P and/or Q depending on --targets.
     let (new_p, new_q): (Vec<u8>, Vec<u8>) = match opts.targets {
         Targets::Data => {
-            println!("  targets=data: corrupting data block only; P and Q left consistent with original");
+            println!(
+                "  targets=data: corrupting data block only; P and Q left consistent with original"
+            );
             (p_before.clone(), q_before.clone())
         }
         Targets::BakeP => {
@@ -474,14 +481,18 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
             let p = scrub_rs::array::parity::compute_p_with_override(
                 &cfg, devid, &corrupt, array_phys, BLOCK,
             )?;
-            println!("  targets=bake-p: P recomputed from corrupt data (P-only recovery will FAIL); Q intact");
+            println!(
+                "  targets=bake-p: P recomputed from corrupt data (P-only recovery will FAIL); Q intact"
+            );
             (p, q_before.clone())
         }
         Targets::BakeQ => {
             let q = scrub_rs::array::parity::compute_q_with_override(
                 &cfg, devid, &corrupt, array_phys, BLOCK,
             )?;
-            println!("  targets=bake-q: Q recomputed from corrupt data (Q-only recovery will FAIL); P intact");
+            println!(
+                "  targets=bake-q: Q recomputed from corrupt data (Q-only recovery will FAIL); P intact"
+            );
             (p_before.clone(), q)
         }
         Targets::BakeBoth => {
@@ -491,7 +502,9 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
             let q = scrub_rs::array::parity::compute_q_with_override(
                 &cfg, devid, &corrupt, array_phys, BLOCK,
             )?;
-            println!("  targets=bake-both: P and Q both recomputed from corrupt data (NEITHER single-parity path can recover)");
+            println!(
+                "  targets=bake-both: P and Q both recomputed from corrupt data (NEITHER single-parity path can recover)"
+            );
             (p, q)
         }
         Targets::TwoDisk => {
@@ -507,7 +520,9 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
             // from the corrupt data would destroy the original-syndrome
             // the solver relies on, so we deliberately do NOT do that.
             let (_p_slot, _pp, _p_orig, _p_corrupt) = partner.as_ref().unwrap();
-            println!("  targets=two-disk: target + partner both corrupt; P and Q LEFT INTACT (still reflect original data); single-parity paths FAIL; PQ 2-disk solve is the only path that can recover the target");
+            println!(
+                "  targets=two-disk: target + partner both corrupt; P and Q LEFT INTACT (still reflect original data); single-parity paths FAIL; PQ 2-disk solve is the only path that can recover the target"
+            );
             (p_before.clone(), q_before.clone())
         }
     };
@@ -523,7 +538,10 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
     }
     if let Some((p_slot, p_path, _p_orig, p_corrupt)) = &partner {
         scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, p_corrupt)?;
-        println!("  wrote corrupt block to partner slot {p_slot} ({})", p_path.display());
+        println!(
+            "  wrote corrupt block to partner slot {p_slot} ({})",
+            p_path.display()
+        );
     }
 
     drop_caches();
@@ -540,7 +558,9 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
         Targets::BakeP => "FAILED via P (ParityBakedIn), RECOVERED via Q",
         Targets::BakeQ => "RECOVERED via P (Q is baked in, fallback not needed but P works)",
         Targets::BakeBoth => "FAILED: AllPathsFailed (P baked in, Q baked in)",
-        Targets::TwoDisk => "MISMATCH, both single-parity paths FAIL, RECOVERED via PQ(partner=slot N)",
+        Targets::TwoDisk => {
+            "MISMATCH, both single-parity paths FAIL, RECOVERED via PQ(partner=slot N)"
+        }
     };
     println!("expected: MISMATCH at 0x{array_phys:x}, {expected}");
     Ok(())
@@ -573,7 +593,9 @@ fn restore_cmd(dev: &str, _file_path: &str, backup: &Path, opts: &Opts) -> ExitC
     // used to look up the array config — derive the real slot from the
     // array-partition device name instead.
     let Some(devid) = config::slot_from_array_partition(dev) else {
-        eprintln!("cannot determine NonRAID slot from device path {dev:?} (expected an array-partition path like /dev/nmd2p1)");
+        eprintln!(
+            "cannot determine NonRAID slot from device path {dev:?} (expected an array-partition path like /dev/nmd2p1)"
+        );
         return ExitCode::from(1);
     };
     let Some(dev_path) = cfg.data_dev(devid) else {
@@ -603,7 +625,10 @@ fn restore_cmd(dev: &str, _file_path: &str, backup: &Path, opts: &Opts) -> ExitC
         let p_orig = match fs::read(&partner_backup) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("error reading partner backup {}: {e}", partner_backup.display());
+                eprintln!(
+                    "error reading partner backup {}: {e}",
+                    partner_backup.display()
+                );
                 return ExitCode::from(1);
             }
         };
@@ -622,12 +647,16 @@ fn restore_cmd(dev: &str, _file_path: &str, backup: &Path, opts: &Opts) -> ExitC
             if *slot == devid {
                 continue;
             }
-            let cur = match scrub_rs::array::stripe::read_block_or_zeros(&cfg, p_path, array_phys, BLOCK) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+            let cur =
+                match scrub_rs::array::stripe::read_block_or_zeros(&cfg, p_path, array_phys, BLOCK)
+                {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
             if cur.len() == BLOCK && cur != p_orig {
-                if let Err(e) = scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, &p_orig) {
+                if let Err(e) =
+                    scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, &p_orig)
+                {
                     eprintln!("error restoring partner block on slot {slot}: {e}");
                     return ExitCode::from(1);
                 }
@@ -650,21 +679,19 @@ fn restore_cmd(dev: &str, _file_path: &str, backup: &Path, opts: &Opts) -> ExitC
             return ExitCode::from(1);
         }
     };
-    if let Some(p_path) = cfg.parity_p.as_ref() {
-        if let Err(e) = scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, &p) {
-            eprintln!("error writing P: {e}");
-            return ExitCode::from(1);
-        }
+    if let Some(p_path) = cfg.parity_p.as_ref()
+        && let Err(e) = scrub_rs::array::stripe::write_block(&cfg, p_path, array_phys, &p)
+    {
+        eprintln!("error writing P: {e}");
+        return ExitCode::from(1);
     }
-    if let Some(q_path) = cfg.parity_q.as_ref() {
-        if let Err(e) = scrub_rs::array::stripe::write_block(&cfg, q_path, array_phys, &q) {
-            eprintln!("error writing Q: {e}");
-            return ExitCode::from(1);
-        }
+    if let Some(q_path) = cfg.parity_q.as_ref()
+        && let Err(e) = scrub_rs::array::stripe::write_block(&cfg, q_path, array_phys, &q)
+    {
+        eprintln!("error writing Q: {e}");
+        return ExitCode::from(1);
     }
     drop_caches();
-    println!(
-        "restored block at array_phys=0x{array_phys:x} and recomputed P+Q from original data"
-    );
+    println!("restored block at array_phys=0x{array_phys:x} and recomputed P+Q from original data");
     ExitCode::SUCCESS
 }

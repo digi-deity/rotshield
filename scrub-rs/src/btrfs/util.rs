@@ -15,12 +15,7 @@ pub fn le_u16(buf: &[u8], pos: usize) -> u16 {
 }
 
 pub fn le_u32(buf: &[u8], pos: usize) -> u32 {
-    u32::from_le_bytes([
-        buf[pos],
-        buf[pos + 1],
-        buf[pos + 2],
-        buf[pos + 3],
-    ])
+    u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
 }
 
 pub fn le_u64(buf: &[u8], pos: usize) -> u64 {

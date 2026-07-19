@@ -64,7 +64,9 @@ impl CsumStrategy {
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("unsupported btrfs csum_type {other} (only crc32c/xxhash/sha256/blake2 are implemented)"),
+                    format!(
+                        "unsupported btrfs csum_type {other} (only crc32c/xxhash/sha256/blake2 are implemented)"
+                    ),
                 ));
             }
         };
@@ -117,7 +119,9 @@ impl CsumStrategy {
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("unsupported btrfs csum_type {other} (only crc32c/xxhash/sha256/blake2 are implemented)"),
+                    format!(
+                        "unsupported btrfs csum_type {other} (only crc32c/xxhash/sha256/blake2 are implemented)"
+                    ),
                 ));
             }
         };
@@ -172,8 +176,7 @@ impl CsumStrategy {
             csum_type::BLAKE2 => {
                 use blake2::{Blake2bVar, digest::Update, digest::VariableOutput};
                 // btrfs uses BLAKE2b with a 32-byte (256-bit) digest.
-                let mut h = Blake2bVar::new(32)
-                    .expect("32 is a valid BLAKE2b digest size");
+                let mut h = Blake2bVar::new(32).expect("32 is a valid BLAKE2b digest size");
                 h.update(data);
                 let mut out = [0u8; 32];
                 h.finalize_variable(&mut out)

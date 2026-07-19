@@ -138,8 +138,20 @@ impl FsReader {
     ///
     /// Pass `strategy: None` to disable metadata-header verification (the
     /// reader then trusts the first stripe it reads, as it used to).
-    pub fn new(fp: File, node_size: usize, base_offset: u64, strategy: Option<CsumStrategy>) -> Self {
-        Self { fp, node_size, base_offset, strategy, devid: None, fsid: None }
+    pub fn new(
+        fp: File,
+        node_size: usize,
+        base_offset: u64,
+        strategy: Option<CsumStrategy>,
+    ) -> Self {
+        Self {
+            fp,
+            node_size,
+            base_offset,
+            strategy,
+            devid: None,
+            fsid: None,
+        }
     }
 
     /// Set the btrfs device ID of the backing store.  Enables the devid
@@ -227,21 +239,14 @@ impl FsReader {
     /// silent read of the wrong disk.  `base_offset` is still applied, so
     /// the same reader works for a bare image, an array partition, or a
     /// whole-disk raw rdev.
-    pub fn read_physical(
-        &mut self,
-        devid: u64,
-        phys: u64,
-        n: usize,
-    ) -> std::io::Result<Vec<u8>> {
-        if let Some(expected) = self.devid {
-            if devid != expected {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "read_physical devid {devid} does not match opened device {expected}"
-                    ),
-                ));
-            }
+    pub fn read_physical(&mut self, devid: u64, phys: u64, n: usize) -> std::io::Result<Vec<u8>> {
+        if let Some(expected) = self.devid
+            && devid != expected
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("read_physical devid {devid} does not match opened device {expected}"),
+            ));
         }
         read_at(&mut self.fp, self.base_offset + phys, n)
     }
@@ -485,22 +490,22 @@ impl FsReader {
         // fsid must match the filesystem we opened.  The superblock's fsid
         // is carried on the reader via the strategy-independent path; we
         // stash it on the reader at construction time (see `with_fsid`).
-        if let Some(fsid) = self.fsid {
-            if hdr.fsid != fsid {
-                return false;
-            }
+        if let Some(fsid) = self.fsid
+            && hdr.fsid != fsid
+        {
+            return false;
         }
         // level must be exactly one below the parent's level.
-        if let Some(lvl) = expected_level {
-            if hdr.level != lvl {
-                return false;
-            }
+        if let Some(lvl) = expected_level
+            && hdr.level != lvl
+        {
+            return false;
         }
         // owner (tree id) must match the parent's owner.
-        if let Some(owner) = expected_owner {
-            if hdr.owner != owner {
-                return false;
-            }
+        if let Some(owner) = expected_owner
+            && hdr.owner != owner
+        {
+            return false;
         }
         // generation check (the core stale-block guard).
         if expected_generation != GEN_DONT_CHECK && hdr.generation != expected_generation {

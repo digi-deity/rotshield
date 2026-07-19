@@ -25,13 +25,13 @@
 use std::io;
 
 use crate::btrfs::chunk::ChunkMap;
-use crate::btrfs::csum::{build_csum_map, CsumMap};
+use crate::btrfs::csum::{CsumMap, build_csum_map};
 use crate::btrfs::csum_strategy::CsumStrategy;
 use crate::btrfs::dev_extent::build_dev_extents;
 use crate::btrfs::reader::FsReader;
 use crate::btrfs::scrub::scrub_dev_tree;
 use crate::btrfs::superblock::Superblock;
-use crate::fs::{ScrubEvent, ScrubStats};
+use crate::fs::{ScrubEvent, ScrubStats, SectorVerifier};
 
 /// A btrfs filesystem scrub.
 ///
@@ -144,7 +144,9 @@ impl BtrfsScrub {
         // empty drive set and report 0 mismatches with exit 0.  Count it as
         // metadata_header_errors / metadata_mirror_mismatches so the gap
         // surfaces instead of silently under-scrubbing the device.
-        let dev_tree_root = roots.dev_tree_root.expect("DEV_TREE root missing from btrfs root tree");
+        let dev_tree_root = roots
+            .dev_tree_root
+            .expect("DEV_TREE root missing from btrfs root tree");
         let dev_extents = build_dev_extents(
             &mut reader,
             &chunk_map,
@@ -293,7 +295,10 @@ impl BtrfsScrub {
         let mut emit = |r: &crate::btrfs::scrub::SectorResult| {
             // 1. Log line (btrfs-owned format).
             let stored_tag = match &r.stored_csum {
-                None => format!("actual=0x{} (no stored csum)", crate::btrfs::util::hex(&r.actual_csum)),
+                None => format!(
+                    "actual=0x{} (no stored csum)",
+                    crate::btrfs::util::hex(&r.actual_csum)
+                ),
                 Some(stored) => format!(
                     "stored=0x{} actual=0x{}",
                     crate::btrfs::util::hex(stored),
@@ -314,8 +319,7 @@ impl BtrfsScrub {
             let verify = r.stored_csum.as_ref().map(|stored| {
                 let stored = stored.clone();
                 let strategy = self.strategy;
-                std::sync::Arc::new(move |b: &[u8]| strategy.compute(b) == stored)
-                    as std::sync::Arc<dyn Fn(&[u8]) -> bool + Send + Sync>
+                std::sync::Arc::new(move |b: &[u8]| strategy.compute(b) == stored) as SectorVerifier
             });
             callbacks.on_event(&ScrubEvent {
                 array_phys: r.array_phys,
@@ -362,4 +366,3 @@ impl BtrfsScrub {
         })
     }
 }
-

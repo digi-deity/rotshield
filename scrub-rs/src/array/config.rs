@@ -169,8 +169,12 @@ fn parse_nmdstat(path: &str) -> std::io::Result<ArrayConfig> {
     let mut config = ArrayConfig::default();
 
     for (key, value) in &values {
-        let Some(slot_str) = key.strip_prefix("rdevName.") else { continue };
-        let Ok(slot) = slot_str.parse::<u64>() else { continue };
+        let Some(slot_str) = key.strip_prefix("rdevName.") else {
+            continue;
+        };
+        let Ok(slot) = slot_str.parse::<u64>() else {
+            continue;
+        };
         if value.is_empty() {
             continue;
         }
@@ -190,7 +194,9 @@ fn parse_nmdstat(path: &str) -> std::io::Result<ArrayConfig> {
             .get(&format!("rdevOffset.{slot}"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        config.rdev_offsets.insert(full_path.clone(), rdev_off_sectors * 512);
+        config
+            .rdev_offsets
+            .insert(full_path.clone(), rdev_off_sectors * 512);
 
         if slot == 0 {
             config.parity_p = Some(full_path);

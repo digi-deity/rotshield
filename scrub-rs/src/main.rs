@@ -44,7 +44,6 @@ use std::process::ExitCode;
 ///      `btrfs check --repair` offline. Highest-priority non-clean outcome:
 ///      it overrides the data-recovery codes because unreadable metadata
 ///      invalidates even a "recovered" data result.
-const EXIT_OK: u8 = 0;
 const EXIT_RUNTIME_ERROR: u8 = 1;
 const EXIT_USAGE_ERROR: u8 = 2;
 const EXIT_ISSUES_FOUND: u8 = 3;
@@ -254,8 +253,15 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         println!("node_size     : {}", sb.node_size);
         println!("stripesize    : {}", sb.stripesize);
         println!("csum_type     : {} ({})", sb.csum_type, scrub.csum_name());
-        println!("csum sectors  : {} ({} bytes)", scrub.num_sectors(), scrub.csum_bytes());
-        println!("dev extents   : {} (physical-order scrub)", scrub.num_dev_extents());
+        println!(
+            "csum sectors  : {} ({} bytes)",
+            scrub.num_sectors(),
+            scrub.csum_bytes()
+        );
+        println!(
+            "dev extents   : {} (physical-order scrub)",
+            scrub.num_dev_extents()
+        );
     }
 
     // Recovery glue: the contract routes two streams through one
@@ -305,7 +311,11 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     };
     println!(
         "\nscrubbing{}:",
-        if dry_run { " (recovery assessment + dry-run)" } else { " (recovery assessment + REPAIR)" }
+        if dry_run {
+            " (recovery assessment + dry-run)"
+        } else {
+            " (recovery assessment + REPAIR)"
+        }
     );
 
     // The two contract streams route through a single `ScrubCallbacks`
@@ -340,7 +350,10 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
                 return;
             };
             let Some(failing_dev) = cfg.data_dev(self.scrub_slot) else {
-                eprintln!("  [slot {}] not a data disk in array config", self.scrub_slot);
+                eprintln!(
+                    "  [slot {}] not a data disk in array config",
+                    self.scrub_slot
+                );
                 return;
             };
             let raw_phys = cfg.raw_phys(self.scrub_slot, ev.array_phys).expect(
@@ -382,10 +395,12 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     if !dry_run && freeze_enabled && freeze_mount.is_some() {
         println!(
             "\nfreeze         : enabled for live mount {} (per-batch window)",
-            freeze_mount.as_ref().unwrap()
+            freeze_mount.as_deref().unwrap_or("")
         );
     } else if !dry_run && freeze_mount.is_none() {
-        println!("\nfreeze         : disabled (no --freeze-mount; offline/unmounted image or not declared)");
+        println!(
+            "\nfreeze         : disabled (no --freeze-mount; offline/unmounted image or not declared)"
+        );
     }
 
     // Recovery-possibility assessment runs in EVERY mode.  When an array
@@ -405,8 +420,10 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     if let Some(cfg) = cfg.clone() {
         scrub.set_recover_batch(true);
         // Move the freeze controller into the writer thread.
-        let fc =
-            std::mem::replace(&mut freeze_controller, scrub_rs::freeze::FreezeController::new(None));
+        let fc = std::mem::replace(
+            &mut freeze_controller,
+            scrub_rs::freeze::FreezeController::new(None),
+        );
         let (tx, acc, handle) = match scrub_rs::batch_recover::spawn_pipeline(
             cfg,
             fc,
@@ -433,14 +450,18 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         writer_handle = Some(handle);
         println!(
             "recovery       : assessment pipeline (max {} candidates/batch, {}s idle flush){}",
-            batch_max, batch_idle, if dry_run { " [dry-run: no writes]" } else { " [REPAIR enabled]" }
+            batch_max,
+            batch_idle,
+            if dry_run {
+                " [dry-run: no writes]"
+            } else {
+                " [REPAIR enabled]"
+            }
         );
     } else {
         // No array: plain scrub with inline reconfirm.  `set_recover_batch`
         // stays false so the scrub loop owns mismatch/stale accounting.
-        println!(
-            "recovery       : disabled (no array config / not a data disk) — plain scrub"
-        );
+        println!("recovery       : disabled (no array config / not a data disk) — plain scrub");
     }
 
     // The freeze lives on the writer thread in every mode, so the scrub loop
@@ -475,9 +496,15 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     println!("\nscrub complete:");
     println!("  sectors checked    : {}", stats.sectors_checked);
     println!("  sectors ok         : {}", stats.sectors_ok);
-    println!("  sectors mismatch   : {}", stats.sectors_mismatch + batch_stats.mismatch);
+    println!(
+        "  sectors mismatch   : {}",
+        stats.sectors_mismatch + batch_stats.mismatch
+    );
     println!("  sectors no csum    : {}", stats.sectors_no_csum);
-    println!("  sectors stale      : {}", stats.sectors_stale + batch_stats.stale);
+    println!(
+        "  sectors stale      : {}",
+        stats.sectors_stale + batch_stats.stale
+    );
     println!("  sectors read error : {}", stats.sectors_read_error);
     println!("  metadata hdr errs  : {}", stats.metadata_header_errors);
     println!("  metadata mirror   : {}", stats.metadata_mirror_mismatches);
@@ -586,19 +613,14 @@ fn parse_offset(s: &str) -> Result<u64, String> {
         _ => (1u64, s),
     };
     let raw: u64 = if let Some(h) = rest.strip_prefix("0x") {
-        u64::from_str_radix(h, 16)
-            .map_err(|e| format!("invalid hex: {e}"))?
+        u64::from_str_radix(h, 16).map_err(|e| format!("invalid hex: {e}"))?
     } else {
         rest.parse::<u64>()
             .map_err(|e| format!("invalid decimal: {e}"))?
     };
     // Only a leading `+` indicates 512-byte-sector units (matching
     // /proc/nmdstat's rdevOffset units); a plain integer is in bytes.
-    let bytes = if s.starts_with('+') {
-        raw * 512
-    } else {
-        raw
-    };
+    let bytes = if s.starts_with('+') { raw * 512 } else { raw };
     Ok(sign * bytes)
 }
 
@@ -612,7 +634,8 @@ fn dump_array() -> ExitCode {
     match array::config::load() {
         Ok(cfg) => {
             fn disp(o: &Option<PathBuf>) -> String {
-                o.as_ref().map_or("None".to_string(), |p| p.display().to_string())
+                o.as_ref()
+                    .map_or("None".to_string(), |p| p.display().to_string())
             }
             println!("parity_p : {}", disp(&cfg.parity_p));
             println!("parity_q : {}", disp(&cfg.parity_q));
@@ -671,7 +694,11 @@ fn resolve_cmd(device: &str, logical: u64) -> ExitCode {
         Ok(loc) => {
             println!(
                 "devid={} logical=0x{:x} array_phys=0x{:x} dev_path={} raw_phys=0x{:x}",
-                loc.devid, logical, loc.array_phys, loc.dev_path.display(), loc.raw_phys
+                loc.devid,
+                logical,
+                loc.array_phys,
+                loc.dev_path.display(),
+                loc.raw_phys
             );
             ExitCode::SUCCESS
         }

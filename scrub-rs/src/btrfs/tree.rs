@@ -92,7 +92,13 @@ where
         exp_level: None,
         exp_owner: None,
     }];
-    while let Some(NodeRef { logical, exp_gen, exp_level, exp_owner }) = queue.pop() {
+    while let Some(NodeRef {
+        logical,
+        exp_gen,
+        exp_level,
+        exp_owner,
+    }) = queue.pop()
+    {
         // The root's generation is unknown to the caller; for every other
         // node we pass the parent's expected generation so `read_node` can
         // reject a stale (freed/reused) block.

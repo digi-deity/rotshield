@@ -63,12 +63,13 @@ use crate::array::config::ArrayConfig;
 use crate::array::stripe;
 use crate::btrfs::chunk::ChunkMap;
 use crate::btrfs::csum_strategy::CsumStrategy;
-use crate::btrfs::extent::reconfirm_mismatch;
 use crate::btrfs::extent::Reconfirm;
+use crate::btrfs::extent::reconfirm_mismatch;
 use crate::btrfs::open::live_data_tree_roots;
 use crate::btrfs::reader::FsReader;
 use crate::freeze::FreezeController;
-use crate::recovery::{recover_block, RecoveryInput, RecoveryResult};
+use crate::fs::SectorVerifier;
+use crate::recovery::{RecoveryInput, RecoveryResult, recover_block};
 
 /// A single corruption candidate handed from the scrub thread to the
 /// writer thread.  Carries everything the writer needs to re-confirm and
@@ -89,7 +90,7 @@ pub struct Candidate {
     pub stored_csum: Vec<u8>,
     /// Verifier closure: `true` iff a candidate block is the correct
     /// original data.  Used both for recovery verification and read-back.
-    pub verify: std::sync::Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+    pub verify: SectorVerifier,
     /// Raw-rdev byte offset, for log lines only.
     pub raw_phys: u64,
     /// Raw-rdev path of the failing disk, for the write-back.
@@ -169,6 +170,7 @@ pub struct BatchStats {
 /// yields the [`BatchStats`].  The writer takes ownership of `freeze` (so
 /// the freeze lives entirely on its thread), a fresh `FsReader` + the
 /// populated `ChunkMap` clone for re-confirmation, and the array config.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_pipeline(
     cfg: ArrayConfig,
     freeze: FreezeController,
@@ -183,7 +185,11 @@ pub fn spawn_pipeline(
     dry_run: bool,
     batch_max: usize,
     batch_idle: Duration,
-) -> io::Result<(SyncSender<Msg>, std::thread::JoinHandle<()>, std::thread::JoinHandle<BatchStats>)> {
+) -> io::Result<(
+    SyncSender<Msg>,
+    std::thread::JoinHandle<()>,
+    std::thread::JoinHandle<BatchStats>,
+)> {
     let f = std::fs::File::open(&dev)?;
     let mut reader = FsReader::new(f, node_size, base_offset, Some(strategy));
     reader = reader.with_devid(devid).with_fsid(fsid);
@@ -285,16 +291,18 @@ fn run_writer(
 ) -> BatchStats {
     let mut stats = BatchStats::default();
 
-    loop {
-        match rx.recv() {
-            Ok(BatchMsg::Batch(batch)) => {
-                flush_batch(
-                    &batch, &cfg, &mut freeze, &mut reader, &chunk_map, scrub_slot, dry_run,
-                    strategy, &mut stats,
-                );
-            }
-            Ok(BatchMsg::Done) | Err(_) => break,
-        }
+    while let Ok(BatchMsg::Batch(batch)) = rx.recv() {
+        flush_batch(
+            &batch,
+            &cfg,
+            &mut freeze,
+            &mut reader,
+            &chunk_map,
+            scrub_slot,
+            dry_run,
+            strategy,
+            &mut stats,
+        );
     }
 
     stats
@@ -318,7 +326,7 @@ fn flush_batch(
     // be recovered — so we keep distinct array_phys and only collapse a
     // true accidental duplicate of the same physical location.
     let mut batch = batch.to_vec();
-    batch.sort_by(|a, b| (a.devid, a.array_phys).cmp(&(b.devid, b.array_phys)));
+    batch.sort_by_key(|a| (a.devid, a.array_phys));
     batch.dedup_by(|a, b| a.devid == b.devid && a.array_phys == b.array_phys);
 
     // One freeze for the whole batch's reconfirm + write + read-back.
@@ -330,18 +338,16 @@ fn flush_batch(
         // sector could not be read, we skip just this candidate — we do
         // NOT block the other candidates in the batch.
         let verdict = match live_data_tree_roots(reader, chunk_map, reader.base_offset()) {
-            Some((ext_root, csum_root)) => {
-                reconfirm_mismatch(
-                    reader,
-                    chunk_map,
-                    ext_root,
-                    csum_root,
-                    cand.logical,
-                    &cand.stored_csum,
-                    strategy.hash_len,
-                    strategy.sector_size,
-                )
-            }
+            Some((ext_root, csum_root)) => reconfirm_mismatch(
+                reader,
+                chunk_map,
+                ext_root,
+                csum_root,
+                cand.logical,
+                &cand.stored_csum,
+                strategy.hash_len,
+                strategy.sector_size,
+            ),
             // Couldn't re-read the live trees — be conservative and treat
             // as real corruption (never hide a possible mismatch).
             None => Reconfirm::Corruption,
@@ -379,14 +385,15 @@ fn flush_batch(
                 continue;
             }
         };
-        let stripe_chunks = match stripe::gather_stripe(cfg, scrub_slot, cand.array_phys, cand.block_size) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  [0x{:x}] gather stripe failed: {e}", cand.raw_phys);
-                stats.failed += 1;
-                continue;
-            }
-        };
+        let stripe_chunks =
+            match stripe::gather_stripe(cfg, scrub_slot, cand.array_phys, cand.block_size) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  [0x{:x}] gather stripe failed: {e}", cand.raw_phys);
+                    stats.failed += 1;
+                    continue;
+                }
+            };
         let input = RecoveryInput {
             failing_slot: scrub_slot,
             corrupt_block: &corrupt_block,
@@ -450,7 +457,10 @@ fn flush_batch(
                 // Re-confirm said corruption, but parity reconstruction
                 // produced a block the verifier rejects as the original —
                 // or the block already matches.  Nothing to write.
-                eprintln!("  [0x{:x}] not corrupt (matches stored csum)", cand.raw_phys);
+                eprintln!(
+                    "  [0x{:x}] not corrupt (matches stored csum)",
+                    cand.raw_phys
+                );
             }
             RecoveryResult::Failed { reason } => {
                 eprintln!(

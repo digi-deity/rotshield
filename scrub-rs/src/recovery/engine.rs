@@ -15,9 +15,7 @@
 //! [`recover_block`].
 
 use crate::recovery::gf;
-use crate::recovery::model::{
-    FailureReason, ParityPath, RecoveryInput, RecoveryResult,
-};
+use crate::recovery::model::{FailureReason, ParityPath, RecoveryInput, RecoveryResult};
 
 /// Outcome of the Q-path reconstruction attempt (internal helper).
 enum QOutcome {
@@ -42,10 +40,7 @@ enum QOutcome {
 /// can fabricate mini-stripes (the kernel uses 4096; tests might use 4 or
 /// 16).  Every slice in `input` must be exactly `block_size` bytes or
 /// the function panics (cheap guard at the seam).
-pub fn recover_block(
-    input: &RecoveryInput<'_>,
-    block_size: usize,
-) -> RecoveryResult {
+pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryResult {
     // 1. Cheap sanity: the failing block already passes the verifier?  Then
     //    the scrub raced with a kernel rewrite — nothing to recover.  This
     //    also establishes a baseline against the "baked in" check, which
@@ -102,7 +97,10 @@ pub fn recover_block(
                 corrupt,
             ) {
                 QOutcome::Recovered { block } => {
-                    return RecoveryResult::Recovered { via: ParityPath::Q, block };
+                    return RecoveryResult::Recovered {
+                        via: ParityPath::Q,
+                        block,
+                    };
                 }
                 QOutcome::BakedIn => Some(FailureReason::ParityBakedIn { via: ParityPath::Q }),
                 QOutcome::CsumMismatch => Some(FailureReason::CsumMismatch { via: ParityPath::Q }),
@@ -113,16 +111,12 @@ pub fn recover_block(
     // 4. PQ 2-disk solve: only possible if both P and Q chunks are present.
     //    We don't know which other disk is the partner, so brute-force every
     //    candidate; the verifier tells us which guess was right.
-    let p_singleton = p_reason
-        .clone()
-        .unwrap_or_else(|| FailureReason::InternalInconsistency(
-            "internal: P path returned no reason".into(),
-        ));
-    let q_singleton = q_reason
-        .clone()
-        .unwrap_or_else(|| FailureReason::InternalInconsistency(
-            "internal: Q path returned no reason".into(),
-        ));
+    let p_singleton = p_reason.clone().unwrap_or_else(|| {
+        FailureReason::InternalInconsistency("internal: P path returned no reason".into())
+    });
+    let q_singleton = q_reason.clone().unwrap_or_else(|| {
+        FailureReason::InternalInconsistency("internal: Q path returned no reason".into())
+    });
 
     if let (Some(p_block), Some(q_block)) = (input.p_block, input.q_block) {
         let mut partners_tried: Vec<u64> = Vec::new();
@@ -135,15 +129,16 @@ pub fn recover_block(
                 *partner_slot,
                 input.failing_slot,
                 block_size,
-            ) {
-                if (input.verifier)(&candidate) {
-                    return RecoveryResult::Recovered {
-                        via: ParityPath::PQ { partner_slot: *partner_slot },
-                        block: candidate,
-                    };
-                }
-                // Wrong partner — keep trying.
+            ) && (input.verifier)(&candidate)
+            {
+                return RecoveryResult::Recovered {
+                    via: ParityPath::PQ {
+                        partner_slot: *partner_slot,
+                    },
+                    block: candidate,
+                };
             }
+            // Wrong partner — keep trying.
         }
         return RecoveryResult::Failed {
             reason: FailureReason::AllPathsFailed {
@@ -158,7 +153,9 @@ pub fn recover_block(
     //    single reason rather than packaging a phantom Q result.
     RecoveryResult::Failed {
         reason: if input.q_block.is_none() {
-            FailureReason::NoQPathAndPFailed { p_reason: Box::new(p_singleton) }
+            FailureReason::NoQPathAndPFailed {
+                p_reason: Box::new(p_singleton),
+            }
         } else {
             // P chunk was None but Q present — Q path already ran above and
             // produced q_singleton.  Surface as exhausted-all-paths with an
@@ -296,7 +293,11 @@ pub fn solve_two_disk(
     let mut d_a = d_b.clone();
     xor_inplace(&mut d_a, &delta_p);
 
-    Some(if failing_slot < partner_slot { d_a } else { d_b })
+    Some(if failing_slot < partner_slot {
+        d_a
+    } else {
+        d_b
+    })
 }
 
 /// XOR `b` into `a` in place.  Panics if lengths differ.
@@ -365,7 +366,11 @@ mod tests {
         }
 
         fn others(&self, failing_slot: u64) -> Vec<(u64, Vec<u8>)> {
-            self.data.iter().filter(|(s, _)| *s != failing_slot).cloned().collect()
+            self.data
+                .iter()
+                .filter(|(s, _)| *s != failing_slot)
+                .cloned()
+                .collect()
         }
     }
 
@@ -403,7 +408,16 @@ mod tests {
         let data: Vec<(u64, Vec<u8>)> = stripe
             .data
             .iter()
-            .map(|(s, b)| (*s, if *s == failing { corrupt.to_vec() } else { b.clone() }))
+            .map(|(s, b)| {
+                (
+                    *s,
+                    if *s == failing {
+                        corrupt.to_vec()
+                    } else {
+                        b.clone()
+                    },
+                )
+            })
             .collect();
         compute_p(&data, BLOCK)
     }
@@ -413,7 +427,16 @@ mod tests {
         let data: Vec<(u64, Vec<u8>)> = stripe
             .data
             .iter()
-            .map(|(s, b)| (*s, if *s == failing { corrupt.to_vec() } else { b.clone() }))
+            .map(|(s, b)| {
+                (
+                    *s,
+                    if *s == failing {
+                        corrupt.to_vec()
+                    } else {
+                        b.clone()
+                    },
+                )
+            })
             .collect();
         compute_q(&data, BLOCK)
     }
@@ -446,11 +469,7 @@ mod tests {
             q_block: None,
             verifier: &v,
         };
-        expect_recovered(
-            recover_block(&input, BLOCK),
-            ParityPath::P,
-            &golden,
-        );
+        expect_recovered(recover_block(&input, BLOCK), ParityPath::P, &golden);
     }
 
     #[test]
@@ -473,11 +492,7 @@ mod tests {
             q_block: Some(&q_orig),
             verifier: &v,
         };
-        expect_recovered(
-            recover_block(&input, BLOCK),
-            ParityPath::Q,
-            &golden,
-        );
+        expect_recovered(recover_block(&input, BLOCK), ParityPath::Q, &golden);
     }
 
     #[test]
@@ -500,11 +515,7 @@ mod tests {
             q_block: Some(&q_baked),
             verifier: &v,
         };
-        expect_recovered(
-            recover_block(&input, BLOCK),
-            ParityPath::P,
-            &golden,
-        );
+        expect_recovered(recover_block(&input, BLOCK), ParityPath::P, &golden);
     }
 
     #[test]
@@ -557,7 +568,9 @@ mod tests {
         };
         expect_recovered(
             recover_block(&input, BLOCK),
-            ParityPath::PQ { partner_slot: partner },
+            ParityPath::PQ {
+                partner_slot: partner,
+            },
             &golden,
         );
     }
@@ -586,7 +599,10 @@ mod tests {
         };
         match recover_block(&input, BLOCK) {
             RecoveryResult::Failed {
-                reason: FailureReason::AllPathsFailed { pq_partners_tried, .. },
+                reason:
+                    FailureReason::AllPathsFailed {
+                        pq_partners_tried, ..
+                    },
             } => {
                 assert!(!pq_partners_tried.is_empty(), "should have tried partners");
             }

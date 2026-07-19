@@ -34,13 +34,9 @@ use crate::recovery::gf;
 /// disk's end — the same convention [`stripe::gather_stripe`] uses, so
 /// the result matches the on-disk P disk bit-for-bit on a consistent
 /// array.
-pub fn compute_p(
-    config: &ArrayConfig,
-    array_phys: u64,
-    block_size: usize,
-) -> io::Result<Vec<u8>> {
+pub fn compute_p(config: &ArrayConfig, array_phys: u64, block_size: usize) -> io::Result<Vec<u8>> {
     let mut p = vec![0u8; block_size];
-    for (_, path) in &config.data_devs {
+    for path in config.data_devs.values() {
         let block = stripe::read_block_or_zeros(config, path, array_phys, block_size)?;
         xor_inplace(&mut p, &block);
     }
@@ -77,11 +73,7 @@ pub fn compute_p_with_override(
 /// (block_size bytes).  Same read convention as [`compute_p`] — raw-rdev
 /// reads via [`stripe::read_block_or_zeros`], zero-substitution past a
 /// smaller disk's end.
-pub fn compute_q(
-    config: &ArrayConfig,
-    array_phys: u64,
-    block_size: usize,
-) -> io::Result<Vec<u8>> {
+pub fn compute_q(config: &ArrayConfig, array_phys: u64, block_size: usize) -> io::Result<Vec<u8>> {
     let mut q = vec![0u8; block_size];
     for (slot, path) in &config.data_devs {
         let coef = gf::gf_exp(*slot as i32 - 1);
@@ -112,8 +104,7 @@ pub fn compute_q_with_override(
         let block: &[u8] = if *slot == override_slot {
             override_block
         } else {
-            block_owned =
-                stripe::read_block_or_zeros(config, path, array_phys, block_size)?;
+            block_owned = stripe::read_block_or_zeros(config, path, array_phys, block_size)?;
             &block_owned
         };
         let table = &gf::GFMUL[coef as usize];

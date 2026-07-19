@@ -141,7 +141,11 @@ const fn build_gfinv() -> [u8; 256] {
     let mut t = [0u8; 256];
     let mut i = 0;
     while i < 256 {
-        t[i] = if i == 0 { 0 } else { gf_pow_const(i as u8, 254) };
+        t[i] = if i == 0 {
+            0
+        } else {
+            gf_pow_const(i as u8, 254)
+        };
         i += 1;
     }
     t
@@ -227,8 +231,8 @@ mod tests {
     fn gfexp_matches_double_and_reduce() {
         // GFEXP[e] must equal 2 multiplied by itself e times.
         let mut v: u8 = 1;
-        for e in 0..255 {
-            assert_eq!(GFEXP[e], v, "GFEXP[{e}]");
+        for (e, gfexp) in GFEXP.iter().enumerate().take(255) {
+            assert_eq!(gfexp, &v, "GFEXP[{e}]");
             let hi = v & 0x80;
             v = (v << 1) ^ (if hi != 0 { 0x1d } else { 0 });
         }

@@ -8,8 +8,8 @@
 pub mod array;
 pub mod batch_recover;
 pub mod btrfs;
-pub mod fs;
 pub mod freeze;
+pub mod fs;
 pub mod recovery;
 
 pub use btrfs::csum_strategy::CsumStrategy;

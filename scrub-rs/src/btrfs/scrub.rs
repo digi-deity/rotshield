@@ -104,7 +104,7 @@ pub struct ScrubStats {
 /// physical order for sequential I/O.  The earlier `scrub_extents`
 /// (per-inode FS-tree walk) and `scrub_csum_tree` (logical-order CSUM-tree
 /// walk) variants were removed; `scrub_dev_tree` is the sole path.
-
+///
 /// Scrub every DATA sector by driving reads off the **device tree** instead
 /// of the CSUM tree.
 ///
@@ -135,6 +135,7 @@ pub struct ScrubStats {
 /// * **Metadata/system chunks are skipped** via the `bg_flag::DATA` filter,
 ///   matching the existing convention that the data-scrub loops don't
 ///   traverse metadata.  Their dev-extents are simply not scrubbed here.
+#[allow(clippy::too_many_arguments)]
 pub fn scrub_dev_tree<F>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
@@ -194,7 +195,13 @@ where
         // triggers and costs at most a handful of extra syscalls per scrub.
         const MAX_RUN_SECTORS: usize = 16384; // 16384 * 4096 = 64 MiB at default sector size
         let mut run: Vec<(u64, &Vec<u8>)> = Vec::new();
-        let mut flush = |reader: &mut FsReader, chunk_map: &ChunkMap, strategy: &CsumStrategy, batch: bool, freeze: &mut Option<&mut crate::freeze::FreezeController>, run: &[(u64, &Vec<u8>)], stats: &mut ScrubStats| {
+        let mut flush = |reader: &mut FsReader,
+                         chunk_map: &ChunkMap,
+                         strategy: &CsumStrategy,
+                         batch: bool,
+                         freeze: &mut Option<&mut crate::freeze::FreezeController>,
+                         run: &[(u64, &Vec<u8>)],
+                         stats: &mut ScrubStats| {
             if run.is_empty() {
                 return;
             }
@@ -293,7 +300,9 @@ where
                         eprintln!(
                             "read error at phys 0x{:x} (devid {}, logical 0x{:x}): {}",
                             dext.phys_start + (*sector_logical - dext.chunk_offset),
-                            dext.devid, *sector_logical, e
+                            dext.devid,
+                            *sector_logical,
+                            e
                         );
                     }
                 }
@@ -309,13 +318,29 @@ where
             // Flush when contiguity breaks, when the run hits the memory
             // cap, or at the end of the chunk.
             if !contiguous || run.len() >= MAX_RUN_SECTORS {
-                flush(&mut *reader, chunk_map, strategy, batch, &mut freeze, &run, &mut stats);
+                flush(
+                    &mut *reader,
+                    chunk_map,
+                    strategy,
+                    batch,
+                    &mut freeze,
+                    &run,
+                    &mut stats,
+                );
                 run.clear();
             }
             run.push((sector_logical, stored));
             prev_logical = Some(sector_logical);
         }
-        flush(&mut *reader, chunk_map, strategy, batch, &mut freeze, &run, &mut stats);
+        flush(
+            &mut *reader,
+            chunk_map,
+            strategy,
+            batch,
+            &mut freeze,
+            &run,
+            &mut stats,
+        );
     }
 
     stats

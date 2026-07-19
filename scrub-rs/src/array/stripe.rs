@@ -250,12 +250,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d1 = make_image(&dir, "d1", 8192, 0x11);
         let d2 = make_image(&dir, "d2", 4096, 0x22);
-        let cfg = config_from_files(
-            vec![(1, d1.clone()), (2, d2.clone())],
-            None,
-            None,
-            vec![],
-        );
+        let cfg = config_from_files(vec![(1, d1.clone()), (2, d2.clone())], None, None, vec![]);
         // Offset 4096 (block index 1): d1 has real data; d2's file is only
         // 4096 bytes long so seeking to 4096 reads EOF → zero block.
         let chunks = gather_stripe(&cfg, 1, 4096, 4096).unwrap();

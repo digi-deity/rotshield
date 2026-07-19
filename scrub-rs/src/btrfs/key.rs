@@ -49,8 +49,7 @@ pub mod bg_flag {
     pub const RAID1C4: u64 = 1 << 10;
 
     /// Any flag that means each stripe is a full mirror copy.
-    pub const MIRROR_MASK: u64 =
-        RAID1 | DUP | RAID1C3 | RAID1C4;
+    pub const MIRROR_MASK: u64 = RAID1 | DUP | RAID1C3 | RAID1C4;
 
     /// Profiles the physical-order scrub explicitly rejects: striped layouts
     /// whose mapping math the simple linear resolver cannot handle.  A
@@ -71,21 +70,41 @@ pub struct Key {
 impl Key {
     /// Construct a key directly.
     pub fn new(objectid: u64, ty: u8, offset: u64) -> Self {
-        Self { objectid, ty, offset }
+        Self {
+            objectid,
+            ty,
+            offset,
+        }
     }
 
     /// Parse a 17-byte key from `buf` at `pos`.
     pub fn parse(buf: &[u8], pos: usize) -> Self {
         let objectid = u64::from_le_bytes([
-            buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3],
-            buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7],
+            buf[pos],
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+            buf[pos + 4],
+            buf[pos + 5],
+            buf[pos + 6],
+            buf[pos + 7],
         ]);
         let ty = buf[pos + 8];
         let offset = u64::from_le_bytes([
-            buf[pos + 9], buf[pos + 10], buf[pos + 11], buf[pos + 12],
-            buf[pos + 13], buf[pos + 14], buf[pos + 15], buf[pos + 16],
+            buf[pos + 9],
+            buf[pos + 10],
+            buf[pos + 11],
+            buf[pos + 12],
+            buf[pos + 13],
+            buf[pos + 14],
+            buf[pos + 15],
+            buf[pos + 16],
         ]);
-        Self { objectid, ty, offset }
+        Self {
+            objectid,
+            ty,
+            offset,
+        }
     }
 }
 
@@ -103,13 +122,29 @@ impl KeyPtr {
     pub fn parse(buf: &[u8], pos: usize) -> Self {
         let key = Key::parse(buf, pos);
         let blockptr = u64::from_le_bytes([
-            buf[pos + 17], buf[pos + 18], buf[pos + 19], buf[pos + 20],
-            buf[pos + 21], buf[pos + 22], buf[pos + 23], buf[pos + 24],
+            buf[pos + 17],
+            buf[pos + 18],
+            buf[pos + 19],
+            buf[pos + 20],
+            buf[pos + 21],
+            buf[pos + 22],
+            buf[pos + 23],
+            buf[pos + 24],
         ]);
         let generation = u64::from_le_bytes([
-            buf[pos + 25], buf[pos + 26], buf[pos + 27], buf[pos + 28],
-            buf[pos + 29], buf[pos + 30], buf[pos + 31], buf[pos + 32],
+            buf[pos + 25],
+            buf[pos + 26],
+            buf[pos + 27],
+            buf[pos + 28],
+            buf[pos + 29],
+            buf[pos + 30],
+            buf[pos + 31],
+            buf[pos + 32],
         ]);
-        Self { key, blockptr, generation }
+        Self {
+            key,
+            blockptr,
+            generation,
+        }
     }
 }

@@ -28,11 +28,11 @@
 
 use std::io;
 
+use super::chunk::ChunkMap;
 use super::key::key_type;
 use super::reader::FsReader;
 use super::tree::walk_leaves;
 use super::util::le_u64;
-use super::chunk::ChunkMap;
 
 /// A single device extent as enumerated from the DEV_TREE.
 ///
@@ -90,8 +90,8 @@ pub fn build_dev_extents(
                         format!("DEV_EXTENT item too short: {} bytes", data.len()),
                     ));
                 }
-                let chunk_offset = le_u64(&data, 16);
-                let length = le_u64(&data, 24);
+                let chunk_offset = le_u64(data, 16);
+                let length = le_u64(data, 24);
                 out.push(DevExtent {
                     devid,
                     phys_start: slot.key.offset,

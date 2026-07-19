@@ -52,25 +52,25 @@ pub fn build_csum_map(
         chunk_map,
         csum_root,
         |_r, leaf, _logical| {
-        for i in 0..leaf.slots.len() {
-            let slot = leaf.slots[i];
-            if slot.key.ty != key_type::EXTENT_CSUM {
-                continue;
+            for i in 0..leaf.slots.len() {
+                let slot = leaf.slots[i];
+                if slot.key.ty != key_type::EXTENT_CSUM {
+                    continue;
+                }
+                let data = leaf.item_data(i);
+                // The csum array is packed `hash_len`-byte entries; any trailing
+                // partial entry (shouldn't happen on a well-formed fs) is ignored.
+                let n = data.len() / hash_len;
+                for s in 0..n {
+                    let start = s * hash_len;
+                    let csum = data[start..start + hash_len].to_vec();
+                    let logical = slot.key.offset + (s as u64) * sector_size;
+                    map.insert(logical, csum);
+                    count += 1;
+                }
             }
-            let data = leaf.item_data(i);
-            // The csum array is packed `hash_len`-byte entries; any trailing
-            // partial entry (shouldn't happen on a well-formed fs) is ignored.
-            let n = data.len() / hash_len;
-            for s in 0..n {
-                let start = s * hash_len;
-                let csum = data[start..start + hash_len].to_vec();
-                let logical = slot.key.offset + (s as u64) * sector_size;
-                map.insert(logical, csum);
-                count += 1;
-            }
-        }
-        Ok(())
-    },
+            Ok(())
+        },
         // The CSUM tree is walked to build the csum map; metadata-header
         // errors (no good mirror copy of a CSUM_TREE node) actually mean
         // sectors of CSUM entries are unreachable for this scrub, so we MUST

@@ -117,19 +117,19 @@ impl FreezeController {
         if !self.frozen {
             return;
         }
-        if let Some(mountpoint) = self.mountpoint.as_ref() {
-            if let Err(e) = thaw_path(mountpoint) {
-                // A failed thaw is serious: the FS stays frozen.  Log loudly;
-                // the operator can `fsfreeze -u <mnt>` manually.  We do not
-                // panic here (we may already be unwinding).
-                eprintln!(
-                    "ERROR: failed to thaw {} after recovery write: {} \
+        if let Some(mountpoint) = self.mountpoint.as_ref()
+            && let Err(e) = thaw_path(mountpoint)
+        {
+            // A failed thaw is serious: the FS stays frozen.  Log loudly;
+            // the operator can `fsfreeze -u <mnt>` manually.  We do not
+            // panic here (we may already be unwinding).
+            eprintln!(
+                "ERROR: failed to thaw {} after recovery write: {} \
                      (filesystem may still be frozen — run `fsfreeze -u {}`)",
-                    mountpoint.display(),
-                    e,
-                    mountpoint.display(),
-                );
-            }
+                mountpoint.display(),
+                e,
+                mountpoint.display(),
+            );
         }
         clear_active_mount();
         self.frozen = false;
@@ -180,8 +180,7 @@ fn install_panic_hook() {
 /// Tracks the mountpoint of the currently-held freeze so the panic hook can
 /// thaw it as a last resort.  Only the most recent freeze is recorded; the
 /// RAII guard remains the primary mechanism.
-static ACTIVE_FREEZE_MOUNT: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+static ACTIVE_FREEZE_MOUNT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 /// Record the active freeze mountpoint (called by [`FreezeController::guard`]
 /// on success) so the panic hook has something to thaw.
@@ -244,6 +243,16 @@ fn thaw_path(mountpoint: &Path) -> io::Result<()> {
 /// recovery writer, for `BLKFLSBUF` cache invalidation) can issue raw
 /// ioctls without re-importing `nix::libc`.  `request` is the ioctl
 /// number; `arg` is passed through unchanged.
-pub(crate) unsafe fn libc_ioctl(fd: std::os::raw::c_int, request: std::os::raw::c_ulong, arg: std::os::raw::c_ulong) -> std::os::raw::c_int {
-    unsafe { libc::ioctl(fd, request as std::os::raw::c_ulong, arg as std::os::raw::c_ulong) }
+pub(crate) unsafe fn libc_ioctl(
+    fd: std::os::raw::c_int,
+    request: std::os::raw::c_ulong,
+    arg: std::os::raw::c_ulong,
+) -> std::os::raw::c_int {
+    unsafe {
+        libc::ioctl(
+            fd,
+            request as std::os::raw::c_ulong,
+            arg as std::os::raw::c_ulong,
+        )
+    }
 }

@@ -83,6 +83,13 @@
 /// thread-safe since they only read their captured bytes.
 use std::sync::Arc;
 
+/// A thread-safe closure that returns `true` iff `candidate` is the correct
+/// original data for a given sector.  Captured per-event by the filesystem
+/// implementation together with the right checksum algorithm, so the
+/// recovery layer can verify a reconstructed block without knowing which
+/// on-disk format produced it.
+pub type SectorVerifier = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
 pub struct ScrubEvent {
     /// Byte offset on the failing disk's **array partition**
     /// (`/dev/nmd1p1`-space).  The array layer adds `rdevOffset` to reach
@@ -104,7 +111,7 @@ pub struct ScrubEvent {
     /// Stored as `Arc` (not `Box`) so a recovery sink can clone it onto a
     /// channel for a batched writer thread without re-deriving the
     /// algorithm.
-    pub verify: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    pub verify: Option<SectorVerifier>,
     /// Logical address of the sector (btrfs-internal).  Carried so a
     /// filesystem-specific recovery sink can re-confirm the mismatch
     /// against the live EXTENT_TREE/CSUM_TREE at write time (the

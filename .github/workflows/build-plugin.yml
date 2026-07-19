@@ -1,8 +1,9 @@
 name: Build unRAID Plugin
 
-# Builds the scrub-rs + craft-corrupt binaries (static musl for portability
-# on unRAID's older glibc) and packages them into the unRAID plugin .txz
-# bundle. The Rust test suite lives in scrub-rs-tests.yml; this workflow is
+# Builds the scrub-rs + craft-corrupt binaries (gnu target, matching the
+# integration tests and unRAID's glibc runtime) and packages them into the
+# unRAID plugin .txz bundle. The Rust test suite lives in scrub-rs-tests.yml;
+# this workflow is
 # intentionally independent so a packaging change can't be blocked by the
 # (slower) integration tests, but it runs the unit tests itself as a cheap
 # gate before shipping.
@@ -20,38 +21,37 @@ jobs:
     runs-on: ubuntu-latest
     name: Build binaries + package plugin
     timeout-minutes: 30
+    # contents: write is required so the tag-triggered release step can
+    # publish the .txz bundle via the default GITHUB_TOKEN, regardless of
+    # the repo's default workflow-permission setting.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (+ musl target)
+      - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          rustup target add x86_64-unknown-linux-musl
-
-      - name: Install musl build deps
-        run: |
-          sudo apt update
-          sudo apt install -y musl-tools
 
       - name: Unit tests (cheap gate before packaging)
         run: |
           cd scrub-rs
-          cargo test --release --target x86_64-unknown-linux-musl
+          cargo test --release
 
-      - name: Build scrub-rs (static, musl)
+      - name: Build scrub-rs (gnu)
         run: |
           cd scrub-rs
-          cargo build --release --target x86_64-unknown-linux-musl
-          ls -l target/x86_64-unknown-linux-musl/release/scrub-rs \
-                 target/x86_64-unknown-linux-musl/release/craft-corrupt
+          cargo build --release
+          ls -l target/release/scrub-rs \
+                 target/release/craft-corrupt
 
       - name: Stage binaries into plugin tree
         run: |
           BIN_DIR="plugin/source/btrfs-integrity-recovery/usr/local/emhttp/plugins/btrfs-integrity-recovery/bin"
           mkdir -p "$BIN_DIR"
-          cp scrub-rs/target/x86_64-unknown-linux-musl/release/scrub-rs    "$BIN_DIR/"
-          cp scrub-rs/target/x86_64-unknown-linux-musl/release/craft-corrupt "$BIN_DIR/"
+          cp scrub-rs/target/release/scrub-rs    "$BIN_DIR/"
+          cp scrub-rs/target/release/craft-corrupt "$BIN_DIR/"
           chmod 755 "$BIN_DIR/scrub-rs" "$BIN_DIR/craft-corrupt"
           file "$BIN_DIR/scrub-rs"
 
@@ -59,7 +59,7 @@ jobs:
         run: |
           cd plugin/source/btrfs-integrity-recovery
           bash pkg_build.sh
-          ls -l ../../../archive/
+          ls -l ../../archive/
 
       - name: Compute md5 and inject into .plg
         run: |

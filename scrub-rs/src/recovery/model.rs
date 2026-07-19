@@ -143,4 +143,3 @@ pub enum FailureReason {
     /// "Q unavailable, would have tried PQ".
     NoQPathAndPFailed { p_reason: Box<FailureReason> },
 }
-

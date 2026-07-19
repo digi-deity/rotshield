@@ -20,9 +20,9 @@ pub const SUPERBLOCK_OFFSET: u64 = 0x10_000;
 /// We try each reachable copy in order and use the first that passes magic +
 /// header-checksum verification — exactly as the kernel and `btrfs check` do.
 pub const SUPERBLOCK_BACKUP_OFFSETS: &[u64] = &[
-    0x10_000,       // 64 KiB  — primary
-    0x400_0000,     // 64 MiB  — backup 1
-    0x40_0000_0000, // 256 GiB — backup 2
+    0x10_000,        // 64 KiB  — primary
+    0x400_0000,      // 64 MiB  — backup 1
+    0x40_0000_0000,  // 256 GiB — backup 2
     0x100_0000_0000, // 1 TiB   — backup 3
 ];
 /// btrfs magic bytes.
@@ -165,7 +165,10 @@ impl Superblock {
             }
         }
         Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "no readable btrfs superblock found")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no readable btrfs superblock found",
+            )
         }))
     }
 
@@ -177,6 +180,28 @@ impl Superblock {
     /// 4096-byte node with the identical csum-prefix layout (csum[32] at
     /// offset 0, body from offset 32).  The chicken-and-egg is resolved by
     /// *ordering*: we read the raw block, peek `csum_type` (offset 196, itself
+    /// Read and parse *only* the primary superblock copy (the 64 KiB mirror
+    /// at [`SUPERBLOCK_BACKUP_OFFSETS`]\[0\]), without falling back to the
+    /// backup copies.
+    ///
+    /// This is used by the open path to detect a wiped/primary-with-intact-
+    /// backup situation: the main [`Superblock::read`] transparently falls
+    /// back to a backup when the primary is unusable, so a caller that wants
+    /// to *know* whether the primary itself is bad must probe it in
+    /// isolation. A bad primary is a recoverable metadata divergence (the
+    /// filesystem is still fully readable via a backup), so this is
+    /// deliberately non-fatal for the overall scrub.
+    ///
+    /// `offset` is the byte offset of the start of the btrfs partition within
+    /// the underlying file/device (same meaning as in [`Superblock::read`]).
+    pub fn read_primary<R: Read + Seek>(fp: &mut R, offset: u64) -> std::io::Result<Self> {
+        let primary_off = SUPERBLOCK_BACKUP_OFFSETS
+            .first()
+            .copied()
+            .unwrap_or(0x10_000);
+        Self::read_one(fp, offset + primary_off)
+    }
+
     /// inside the checksummed body), and verify — the algorithm id is covered
     /// by the very checksum we are about to check, so a corrupt `csum_type`
     /// simply fails verification.

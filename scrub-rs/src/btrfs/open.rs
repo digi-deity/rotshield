@@ -134,10 +134,7 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
     // remain and report a false "clean" — exactly the case `btrfs check`
     // refuses with "couldn't read chunk root" / "short device".  Treat a
     // device shorter than the declared total_bytes as unopenable.
-    let dev_size = fp
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let dev_size = fp.metadata().map(|m| m.len()).unwrap_or(0);
     if dev_size > 0 && dev_size < base_offset + superblock.total_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -248,10 +245,16 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
     )?;
     let roots = TreeRoots {
         fs_root: fs_root.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "FS_TREE root not found in btrfs root tree")
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "FS_TREE root not found in btrfs root tree",
+            )
         })?,
         csum_root: csum_root.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "CSUM_TREE root not found in btrfs root tree")
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "CSUM_TREE root not found in btrfs root tree",
+            )
         })?,
         dev_tree_root,
         extent_tree_root,

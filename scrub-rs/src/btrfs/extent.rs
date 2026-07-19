@@ -135,23 +135,22 @@ pub enum Reconfirm {
 ///
 /// Logic (both trees must agree it's stale before we downgrade):
 ///   1. EXTENT_TREE lookup at `logical`:
-///        - no covering EXTENT_ITEM        -> Stale (freed / orphaned)
-///        - covering item has NODATASUM    -> Stale (intentionally uncsummed)
-///        - covering item (normal)         -> continue to csum check
-///        - tree unreadable for THIS addr  -> Unverifiable (skip write for
-///                                            this sector only)
+///      - no covering EXTENT_ITEM        -> Stale (freed / orphaned)
+///      - covering item has NODATASUM    -> Stale (intentionally uncsummed)
+///      - covering item (normal)         -> continue to csum check
+///      - tree unreadable for THIS addr  -> Unverifiable (skip write for this sector only)
 ///   2. CSUM_TREE lookup at `logical` (live):
-///        - no entry                       -> Stale (consistent with freed)
-///        - entry == `stored`              -> Corruption (live tree still
-///                                            expects `stored`; data is bad)
-///        - entry != `stored`              -> Stale (extent rewritten under us)
-///        - tree unreadable for THIS addr  -> Unverifiable
+///      - no entry                       -> Stale (consistent with freed)
+///      - entry == `stored`              -> Corruption (live tree still expects `stored`; data is bad)
+///      - entry != `stored`              -> Stale (extent rewritten under us)
+///      - tree unreadable for THIS addr  -> Unverifiable
 ///
 /// Note the gate is **per-sector**: an `Unreadable` here means the metadata
 /// node covering *this logical address* had no good copy.  A metadata error
 /// elsewhere in the filesystem does NOT produce `Unverifiable` for sectors
 /// whose own metadata read fine — so we never block an unrelated write just
 /// because some other part of the tree was unreadable.
+#[allow(clippy::too_many_arguments)]
 pub fn reconfirm_mismatch(
     reader: &mut crate::btrfs::reader::FsReader,
     chunk_map: &crate::btrfs::chunk::ChunkMap,
@@ -220,16 +219,19 @@ fn extent_covers(
     // any EXTENT_ITEM with start <= logical sort at or before the target —
     // we then pick the greatest such key and test coverage.  (Using offset 0
     // would wrongly exclude every real extent, whose offset is its length.)
-    let target = crate::btrfs::key::Key::new(
-        logical,
-        crate::btrfs::key::key_type::EXTENT_ITEM,
-        u64::MAX,
-    );
+    let target =
+        crate::btrfs::key::Key::new(logical, crate::btrfs::key::key_type::EXTENT_ITEM, u64::MAX);
     let mut node_logical = extent_root;
     // Guard against pathological loops.
     for _depth in 0..16 {
         let res = reader
-            .read_node(chunk_map, node_logical, crate::btrfs::reader::GEN_DONT_CHECK, None, None)
+            .read_node(
+                chunk_map,
+                node_logical,
+                crate::btrfs::reader::GEN_DONT_CHECK,
+                None,
+                None,
+            )
             .ok();
         let node = match res {
             Some(r) if !r.all_mirrors_failed => r.node.unwrap(),
@@ -322,7 +324,13 @@ fn csum_at(
     let mut node_logical = csum_root;
     for _depth in 0..16 {
         let res = reader
-            .read_node(chunk_map, node_logical, crate::btrfs::reader::GEN_DONT_CHECK, None, None)
+            .read_node(
+                chunk_map,
+                node_logical,
+                crate::btrfs::reader::GEN_DONT_CHECK,
+                None,
+                None,
+            )
             .ok();
         let node = match res {
             Some(r) if !r.all_mirrors_failed => r.node.unwrap(),

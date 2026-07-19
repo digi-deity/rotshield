@@ -56,7 +56,16 @@ impl Header {
         let owner = u64::from_le_bytes(buf[88..96].try_into().unwrap());
         let nritems = u32::from_le_bytes(buf[96..100].try_into().unwrap());
         let level = buf[100];
-        Self { fsid, bytenr, flags, chunk_tree_uuid, generation, owner, nritems, level }
+        Self {
+            fsid,
+            bytenr,
+            flags,
+            chunk_tree_uuid,
+            generation,
+            owner,
+            nritems,
+            level,
+        }
     }
 }
 
@@ -74,7 +83,11 @@ impl LeafItemSlot {
         let key = Key::parse(buf, pos);
         let data_offset = u32::from_le_bytes(buf[pos + 17..pos + 21].try_into().unwrap());
         let data_size = u32::from_le_bytes(buf[pos + 21..pos + 25].try_into().unwrap());
-        Self { key, data_offset, data_size }
+        Self {
+            key,
+            data_offset,
+            data_size,
+        }
     }
 }
 

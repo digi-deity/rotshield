@@ -1,0 +1,50 @@
+name: Rust lint (fmt + clippy)
+
+# Fast, dependency-free gate that runs on every push/PR before the heavier
+# integration/plugin jobs. It fails the build on any formatting drift or
+# clippy lint so style/quality regressions are caught immediately, not
+# buried in the (slower) btrfs matrix / array / packaging runs.
+
+on:
+  push:
+    paths:
+      - 'scrub-rs/**'
+      - '.github/workflows/rust-lint.yml'
+  pull_request:
+    paths:
+      - 'scrub-rs/**'
+      - '.github/workflows/rust-lint.yml'
+  workflow_dispatch:
+
+jobs:
+  rust-lint:
+    runs-on: ubuntu-latest
+    name: cargo fmt + clippy
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: scrub-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with clippy + rustfmt)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component rustfmt clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            scrub-rs/target
+          key: ${{ runner.os }}-rust-lint-${{ hashFiles('scrub-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-lint-
+
+      - name: Check formatting (cargo fmt --check)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings

@@ -45,7 +45,13 @@ impl ChunkItem {
             // skip the 16-byte dev_uuid
             stripes.push(Stripe { devid, offset });
         }
-        Self { length, stripe_len, ty, num_stripes, stripes }
+        Self {
+            length,
+            stripe_len,
+            ty,
+            num_stripes,
+            stripes,
+        }
     }
 }
 
@@ -76,7 +82,10 @@ pub fn parse_sys_chunks(buf: &[u8]) -> Vec<ChunkRecord> {
             break;
         }
         let chunk = ChunkItem::parse(&buf[pos..pos + chunk_len]);
-        out.push(ChunkRecord { logical: key.offset, chunk });
+        out.push(ChunkRecord {
+            logical: key.offset,
+            chunk,
+        });
         pos += chunk_len;
     }
     out
@@ -142,17 +151,23 @@ impl ChunkMap {
     /// `btrfs_chunk.type` field) so callers can filter by block-group class
     /// and guard against striped profiles.
     pub fn info(&self, chunk_offset: u64) -> Option<ChunkInfo> {
-        let idx = self.entries.binary_search_by(|e| {
-            if chunk_offset < e.begin {
-                std::cmp::Ordering::Greater
-            } else if chunk_offset >= e.end {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }).ok()?;
+        let idx = self
+            .entries
+            .binary_search_by(|e| {
+                if chunk_offset < e.begin {
+                    std::cmp::Ordering::Greater
+                } else if chunk_offset >= e.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
         let e = &self.entries[idx];
-        Some(ChunkInfo { length: e.end - e.begin, flags: e.ty })
+        Some(ChunkInfo {
+            length: e.end - e.begin,
+            flags: e.ty,
+        })
     }
 
     /// Resolve `logical` to a (devid, physical) on the first available stripe.
@@ -163,15 +178,18 @@ impl ChunkMap {
     /// stripe as a fallback (which is wrong for them — but we don't target
     /// those here).
     pub fn lookup(&self, logical: u64) -> Option<(u64, u64)> {
-        let idx = self.entries.binary_search_by(|e| {
-            if logical < e.begin {
-                std::cmp::Ordering::Greater
-            } else if logical >= e.end {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }).ok()?;
+        let idx = self
+            .entries
+            .binary_search_by(|e| {
+                if logical < e.begin {
+                    std::cmp::Ordering::Greater
+                } else if logical >= e.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
         let e = &self.entries[idx];
         let log_offset = logical - e.begin;
         let s = &e.stripes[0];
@@ -187,15 +205,18 @@ impl ChunkMap {
     /// to [`ChunkMap::lookup`]'s result).  Returns `None` if `logical` is
     /// not covered by any chunk.
     pub fn lookup_stripes(&self, logical: u64) -> Option<Vec<(u64, u64)>> {
-        let idx = self.entries.binary_search_by(|e| {
-            if logical < e.begin {
-                std::cmp::Ordering::Greater
-            } else if logical >= e.end {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }).ok()?;
+        let idx = self
+            .entries
+            .binary_search_by(|e| {
+                if logical < e.begin {
+                    std::cmp::Ordering::Greater
+                } else if logical >= e.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
         let e = &self.entries[idx];
         let log_offset = logical - e.begin;
         Some(
@@ -206,18 +227,28 @@ impl ChunkMap {
         )
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 
     /// Debug helper: list every chunk, mirroring the Python output.
     pub fn dump(&self) {
         for e in &self.entries {
-            let stripes: Vec<String> = e.stripes.iter()
+            let stripes: Vec<String> = e
+                .stripes
+                .iter()
                 .map(|s| format!("({}, 0x{:x})", s.devid, s.offset))
                 .collect();
             println!(
                 "  logical 0x{:x}..0x{:x} stripe_len={} mirrored={} stripes=[{}]",
-                e.begin, e.end, e.stripe_len, e.mirrored, stripes.join(", ")
+                e.begin,
+                e.end,
+                e.stripe_len,
+                e.mirrored,
+                stripes.join(", ")
             );
         }
     }
