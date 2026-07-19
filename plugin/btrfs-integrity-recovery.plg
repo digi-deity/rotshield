@@ -39,6 +39,13 @@ binary download at install time (we build & ship it ourselves).
 <INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh</INLINE>
 </FILE>
 
+<!-- Re-run the same logic on upgrade: upgradepkg re-extracts the bundle,
+     but without this Method="upgrade" hook the post-install steps
+     (perms, default config, rc restart) would be skipped on version bumps. -->
+<FILE Run="/bin/bash" Method="upgrade">
+<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh</INLINE>
+</FILE>
+
 <!-- Uninstall logic. -->
 <FILE Run="/bin/bash" Method="remove">
 <INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/uninstall.sh</INLINE>
