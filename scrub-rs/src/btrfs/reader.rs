@@ -26,6 +26,42 @@ use super::csum_strategy::CsumStrategy;
 use super::node::Node;
 use super::util::read_at;
 
+/// Issue `POSIX_FADV_SEQUENTIAL` on the reader's backing store so the
+/// kernel's read-ahead window grows.  Cheap and safe on both regular
+/// files and block devices; ignored where unsupported (e.g. a regular
+/// image already cached, or a kernel without fadvise).
+#[cfg(unix)]
+fn advise_sequential(file: &File) {
+    use std::os::fd::AsRawFd;
+    // nix 0.29 exposes POSIX_FADV_SEQUENTIAL / WILLNEED.
+    let _ = nix::fcntl::posix_fadvise(
+        file.as_raw_fd(),
+        0,
+        0,
+        nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+    );
+}
+
+/// Issue `POSIX_FADV_WILLNEED` for the byte range the scrub is about to
+/// read — tells the kernel to start fetching it asynchronously while
+/// we checksum the previous run.  `offset`/`len` are in bytes from the
+/// start of the backing store (BEFORE `base_offset`; the caller has
+/// already added `base_offset` if needed).  Used only by the bulk data
+/// scrub loop; never per-sector.
+#[cfg(unix)]
+fn advise_willneed(file: &File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return;
+    }
+    let _ = nix::fcntl::posix_fadvise(
+        file.as_raw_fd(),
+        offset as i64,
+        len as i64,
+        nix::fcntl::PosixFadviseAdvice::POSIX_FADV_WILLNEED,
+    );
+}
+
 /// Sentinel `expected_generation` meaning "do not generation-check".  Passed
 /// by callers that do not yet know the correct generation (e.g. the
 /// filesystem-global tree roots before they are wired to real generations).
@@ -144,6 +180,12 @@ impl FsReader {
         base_offset: u64,
         strategy: Option<CsumStrategy>,
     ) -> Self {
+        // Hint the kernel this reader is for sequential bulk reads — the
+        // DEV_TREE-order scrub walks the device front-to-back, so a larger
+        // read-ahead window pays off.  Safe on block devices and regular
+        // files (advisory, ignored where unsupported).
+        #[cfg(unix)]
+        advise_sequential(&fp);
         Self {
             fp,
             node_size,
@@ -247,6 +289,21 @@ impl FsReader {
                 std::io::ErrorKind::InvalidInput,
                 format!("read_physical devid {devid} does not match opened device {expected}"),
             ));
+        }
+        // Ask the kernel to start prefetching the *next* contiguous run
+        // while we checksum the current one.  The window matches this
+        // read's length (capped to READAHEAD_CAP) so the disk stays busy
+        // for the whole checksum window on long runs — a 1-MiB fixed
+        // hint would let the disk go idle while a 64-MiB SHA256 run is
+        // still hashing.  `advise_willneed` is a no-op where unsupported.
+        // Hinted here — at the bulk-read boundary — rather than per-sector,
+        // since the per-sector loop is already contiguous in memory.
+        #[cfg(unix)]
+        {
+            const READAHEAD_CAP: u64 = 64 << 20; // 64 MiB, matches MAX_RUN_SECTORS
+            let readahead = (n as u64).min(READAHEAD_CAP);
+            let start = self.base_offset + phys + n as u64;
+            advise_willneed(&self.fp, start, readahead);
         }
         read_at(&mut self.fp, self.base_offset + phys, n)
     }

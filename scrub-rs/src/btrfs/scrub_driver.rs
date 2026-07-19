@@ -25,7 +25,7 @@
 use std::io;
 
 use crate::btrfs::chunk::ChunkMap;
-use crate::btrfs::csum::{CsumMap, build_csum_map};
+use crate::btrfs::csum::LazyCsumProvider;
 use crate::btrfs::csum_strategy::CsumStrategy;
 use crate::btrfs::dev_extent::build_dev_extents;
 use crate::btrfs::reader::FsReader;
@@ -52,7 +52,15 @@ use crate::fs::{ScrubEvent, ScrubStats, SectorVerifier};
 pub struct BtrfsScrub {
     reader: FsReader,
     chunk_map: ChunkMap,
-    csum_map: CsumMap,
+    /// Bounded-memory CSUM lookup — walks the CSUM_TREE on demand for each
+    /// dev-extent's logical range, instead of materialising every sector's
+    /// csum into a `BTreeMap` at open.  This is the fix for the `OOM
+    /// (rc=137)` bug on multi-TB disks: peak csum memory stays bounded by
+    /// the largest single block group's csum span regardless of disk size.
+    /// See [`crate::btrfs::csum::LazyCsumProvider`] for the contract + the
+    /// bound; the eager `CsumMap` path is kept only for `craft-corrupt`
+    /// back-compat (the scrub never materialises it).
+    csum_provider: LazyCsumProvider,
     /// Dev-extents enumerated from the DEV_TREE, in ascending physical order.
     /// The drive set for the physical-order scrub ([`scrub_dev_tree`]); built
     /// once in [`BtrfsScrub::open`] so the caller can pick either scrub path.
@@ -108,28 +116,28 @@ impl BtrfsScrub {
             mut metadata_mirror_mismatches,
         } = ctx;
 
-        // Build the checksum map from the CSUM tree.  The strategy (csum
-        // algorithm + sector size) comes from the superblock (built once in
-        // `btrfs::open` and threaded through `BtrfsContext`) so the scrub
-        // honours what the filesystem actually uses.  The csum map is the
-        // scrub's source of truth: it enumerates every checksummed data
-        // sector exactly once, across all subvolumes/snapshots.
-        let mut csum_map = CsumMap::new();
-        // build_csum_map walks the CSUM_TREE; if a CSUM_TREE leaf's header
-        // csum is broken (no good mirror copy) the walk skips that branch
-        // and the affected csum entries become unreachable for this scrub.
-        // Count those as metadata_header_errors and mirror mismatches so
-        // the gap surfaces in the summary + exit code rather than silently
-        // producing undercoverage with exit 0.
-        build_csum_map(
-            &mut reader,
-            &chunk_map,
+        // Build the lazy CSUM-tree walker up front (cheap — it owns an
+        // independent file handle + a clone of the chunk map, but performs
+        // no walk until `range()` is called per dev-extent in the scrub).
+        // This replaces the eager whole-disk `CsumMap` materialisation and
+        // is the fix for the `OOM (rc=137)` bug on multi-TB disks: peak
+        // csum memory is bounded by the largest single block group's csum
+        // span, independent of disk size.  See [`LazyCsumProvider`] for the
+        // bound + the metadata-error-counter fold-up below.
+        //
+        // `reader.reopen()` dups the backing fd so the lazy walker's seek
+        // position never races the main reader's metadata walks.
+        let lazy_file = reader.reopen()?;
+        let csum_provider = LazyCsumProvider::new(
+            lazy_file,
+            superblock.node_size as usize,
+            reader.base_offset(),
+            strategy,
+            superblock.devid,
+            superblock.fsid,
+            chunk_map.clone(),
             roots.csum_root,
-            &strategy,
-            &mut csum_map,
-            &mut metadata_header_errors,
-            &mut metadata_mirror_mismatches,
-        )?;
+        );
 
         // Enumerate the device's dev-extents from the DEV_TREE, in ascending
         // physical order.  This is the drive set for the physical-order
@@ -138,8 +146,8 @@ impl BtrfsScrub {
         // without re-opening the device.  `dev_tree_root` is always present
         // on a real filesystem; `expect` keeps the contract tight.
         //
-        // As with build_csum_map above, a corrupted DEV_TREE leaf (no good
-        // mirror copy) would make the walk skip that branch, enumerate
+        // As with the lazy csum walk above, a corrupted DEV_TREE leaf (no
+        // good mirror copy) would make the walk skip that branch, enumerate
         // fewer/no dev-extents, and the scrub would run with an effectively
         // empty drive set and report 0 mismatches with exit 0.  Count it as
         // metadata_header_errors / metadata_mirror_mismatches so the gap
@@ -159,7 +167,7 @@ impl BtrfsScrub {
         Ok(Self {
             reader,
             chunk_map,
-            csum_map,
+            csum_provider,
             dev_extents,
             strategy,
             superblock,
@@ -234,11 +242,21 @@ impl BtrfsScrub {
         &self.superblock
     }
 
-    /// Number of checksummed data sectors the CSUM tree advertised — useful
-    /// for the caller's progress log.  This is the deduplicated, exhaustive
-    /// scrub set (covers all subvolumes/snapshots).
+    /// Upper bound on the number of data sectors that *could* be scrubbed
+    /// — the sum of every DATA dev-extent's length divided by the sector
+    /// size.  This over-counts free space inside allocated chunks (the
+    /// scrub walks only the subset of those sectors actually covered by
+    /// a CSUM tree entry), but is a useful, bounded progress-log estimate
+    /// computed without materialising the lazy csum provider.  The previous
+    /// eager-map exposed the *exact* count; the lazy provider keeps that
+    /// data off the heap until the scrub loop asks for it, so we return an
+    /// upper bound here.  The sum is bounded by `dev_extents.len()` so the
+    /// computation stays cheap regardless of disk size.
     pub fn num_sectors(&self) -> usize {
-        self.csum_map.len()
+        self.dev_extents
+            .iter()
+            .map(|e| (e.length / self.strategy.sector_size) as usize)
+            .sum()
     }
 
     /// Human-readable name of the filesystem's checksum algorithm (e.g.
@@ -247,10 +265,11 @@ impl BtrfsScrub {
         self.strategy.name
     }
 
-    /// Total bytes of checksummed data sectors — useful for the caller's
-    /// progress log.
+    /// Upper bound on the bytes of checksummed data — `num_sectors()` *
+    /// sector_size.  See [`Self::num_sectors`] for why this is an upper
+    /// bound rather than an exact count.
     pub fn csum_bytes(&self) -> u64 {
-        self.csum_map.len() as u64 * self.strategy.sector_size
+        self.num_sectors() as u64 * self.strategy.sector_size
     }
 
     /// Number of dev-extents the DEV_TREE walk enumerated — useful for the
@@ -334,7 +353,7 @@ impl BtrfsScrub {
         let local = scrub_dev_tree(
             &mut self.reader,
             &self.chunk_map,
-            &self.csum_map,
+            &mut self.csum_provider,
             &self.dev_extents,
             &self.strategy,
             self.recover_batch,
@@ -348,11 +367,14 @@ impl BtrfsScrub {
         // propagated via the explicit `io::Result` return.
         //
         // `metadata_header_errors` comes from the chunk/root-tree walks in
-        // `open.rs` (DUP metadata nodes with no good copy).  It is a
-        // distinct failure class from data-sector mismatches: a non-zero
-        // value means the scrub could not trust metadata it needed to
-        // traverse, so some data may have been silently skipped.  main.rs
-        // treats it as a hard error (non-zero → non-zero exit).
+        // `open.rs` (DUP metadata nodes with no good copy) PLUS any
+        // CSUM_TREE nodes the lazy csum provider had to skip during the
+        // scrub (it folds its own per-walk counter via
+        // [`LazyCsumProvider::metadata_errors`]).  Both classes signal that
+        // the scrub could not trust metadata it needed, so some data may
+        // have been silently skipped — surfaced here as a single combined
+        // counter so main.rs treats it as a hard error (non-zero →
+        // non-zero exit).
         Ok(ScrubStats {
             sectors_checked: local.sectors_checked,
             sectors_ok: local.sectors_ok,
@@ -361,7 +383,8 @@ impl BtrfsScrub {
             sectors_read_error: local.sectors_read_error,
             sectors_stale: local.sectors_stale,
             bytes_checked: local.bytes_checked,
-            metadata_header_errors: self.metadata_header_errors,
+            metadata_header_errors: self.metadata_header_errors
+                + self.csum_provider.metadata_errors(),
             metadata_mirror_mismatches: self.metadata_mirror_mismatches,
         })
     }

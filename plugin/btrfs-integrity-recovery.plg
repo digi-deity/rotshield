@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.07.19a">
-<!ENTITY bundleversion "2026.07.19a">
+<!ENTITY version       "2026.07.19b">
+<!ENTITY bundleversion "2026.07.19b">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,36 @@
 
 <CHANGES>
 ##&name;
+
+###2026.07.19b
+- Throughput overhaul:
+  - Fix OOM-kill (rc=137) on multi-TB disks: replace the eager
+    BTreeMap<u64, Vec<u8>> of every CSUM-tree entry with a lazy,
+    bounded-memory `LazyCsumProvider` that walks the CSUM tree on demand
+    per dev-extent. Peak RAM bounded by the largest single dev-extent's
+    csum span + one leaf buffer, independent of disk size. A separate
+    open-time header-only sweep counts metadata-header errors once per
+    bad leaf (preserves undercoverage semantics).
+  - Reader thread: decouple the bulk disk read from the CPU checksum
+    work via a dedicated thread on a dup'd file handle (own seek
+    position). Main thread coalesces runs and sends ReadCmds; reader
+    does one read_at per run and ships bytes back on a depth-1 channel.
+    While the main thread rayon-checksums run N, the reader is already
+    reading run N+1 from disk — fully overlaps CPU work with disk I/O
+    (closes the 1-MiB fadvise prefetch ceiling: a 64-MiB SHA256 run
+    takes ~4 s of CPU, far longer than the disk takes to read 1 MiB).
+  - Parallel checksum via rayon for every algorithm (crc32c / xxhash /
+    sha256 / blake2): one code path, no per-algo dispatch. Runs of ≥2
+    sectors go through par_iter; smaller runs stay serial.
+  - Kernel read-ahead via posix_fadvise(POSIX_FADV_SEQUENTIAL) at
+    FsReader::new stays as an advisory hint on the reader-side.
+- Read order preserved: DEV_TREE-driven ascending-physical walk
+  unchanged by the reader thread (FIFO sync_channel), so disk access
+  stays sequential within each contiguous run.
+- Verified: matrix TOTAL=30 PASS=27 FAIL=0 SKIPPED(unverified)=3,
+  byte-for-byte parity with btrfs check on case 12b, all 3 live
+  concurrent-churn scenarios (false-positive clean, true-positive
+  1 mismatch matching bytenr, dup-one-copy 1 mismatch matching bytenr).
 
 ###2026.07.19a
 - Fix plugin install hook: bundle scripts (install.sh / uninstall.sh /
