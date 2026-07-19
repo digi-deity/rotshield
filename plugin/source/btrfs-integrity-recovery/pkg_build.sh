@@ -27,7 +27,12 @@ cd "$tmpdir"
 find . -type f \( -iname '*.sh' -o -iname '*.page' -o -iname '*.plg' -o -iname 'rc.*' \) -exec sed -i 's/\r//g' {} +
 chmod -R +x ./
 # Fixed bundle name so the .plg's bundleURL (releases/latest/download/...) stays stable.
-tar cfJCo "${archive}/${plugin}-x86_64-1.txz" "$tmpdir" . --owner=0 --group=0 --mode="a=r,u+w,a+X"
+# NOTE: do NOT pass --mode here. The --mode="a=r,u+w,a+X" form strips the
+# execute bit from every file (including scripts/install.sh and
+# scripts/uninstall.sh), which makes the .plg install/remove hooks fail with
+# exit 126 ("/bin/bash returned 126"). The chmod -R +x above already set the
+# correct perms, so we preserve them by omitting --mode entirely.
+tar cfJCo "${archive}/${plugin}-x86_64-1.txz" "$tmpdir" . --owner=0 --group=0
 rm -rf "$tmpdir"
 
 echo "Built ${archive}/${plugin}-x86_64-1.txz"

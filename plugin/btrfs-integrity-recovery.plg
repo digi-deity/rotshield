@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.07.19">
-<!ENTITY bundleversion "2026.07.19">
+<!ENTITY version       "2026.07.19a">
+<!ENTITY bundleversion "2026.07.19a">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,11 @@
 
 <CHANGES>
 ##&name;
+
+###2026.07.19a
+- Fix plugin install hook: bundle scripts (install.sh / uninstall.sh /
+  rc script) were packaged without the execute bit, causing the .plg
+  install step to fail with "/bin/bash returned 126".
 
 ###2026.07.19
 - Initial release: ships the scrub-rs + craft-corrupt binaries and a
