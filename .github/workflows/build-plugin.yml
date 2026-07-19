@@ -1,0 +1,92 @@
+name: Build unRAID Plugin
+
+# Builds the scrub-rs + craft-corrupt binaries (static musl for portability
+# on unRAID's older glibc) and packages them into the unRAID plugin .txz
+# bundle. The Rust test suite lives in scrub-rs-tests.yml; this workflow is
+# intentionally independent so a packaging change can't be blocked by the
+# (slower) integration tests, but it runs the unit tests itself as a cheap
+# gate before shipping.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-plugin:
+    runs-on: ubuntu-latest
+    name: Build binaries + package plugin
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (+ musl target)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Install musl build deps
+        run: |
+          sudo apt update
+          sudo apt install -y musl-tools
+
+      - name: Unit tests (cheap gate before packaging)
+        run: |
+          cd scrub-rs
+          cargo test --release --target x86_64-unknown-linux-musl
+
+      - name: Build scrub-rs (static, musl)
+        run: |
+          cd scrub-rs
+          cargo build --release --target x86_64-unknown-linux-musl
+          ls -l target/x86_64-unknown-linux-musl/release/scrub-rs \
+                 target/x86_64-unknown-linux-musl/release/craft-corrupt
+
+      - name: Stage binaries into plugin tree
+        run: |
+          BIN_DIR="plugin/source/btrfs-integrity-recovery/usr/local/emhttp/plugins/btrfs-integrity-recovery/bin"
+          mkdir -p "$BIN_DIR"
+          cp scrub-rs/target/x86_64-unknown-linux-musl/release/scrub-rs    "$BIN_DIR/"
+          cp scrub-rs/target/x86_64-unknown-linux-musl/release/craft-corrupt "$BIN_DIR/"
+          chmod 755 "$BIN_DIR/scrub-rs" "$BIN_DIR/craft-corrupt"
+          file "$BIN_DIR/scrub-rs"
+
+      - name: Package bundle (.txz)
+        run: |
+          cd plugin/source/btrfs-integrity-recovery
+          bash pkg_build.sh
+          ls -l ../../../archive/
+
+      - name: Compute md5 and inject into .plg
+        run: |
+          TXZ="plugin/archive/btrfs-integrity-recovery-x86_64-1.txz"
+          MD5=$(md5sum "$TXZ" | awk '{print $1}')
+          echo "bundle md5: $MD5"
+          # The .plg uses a releases/latest/download URL, so no md5 entity is
+          # required; if you switch to a committed archive, set md5bundle here:
+          # sed -i "s/<!ENTITY md5bundle.*>/<!ENTITY md5bundle \"$MD5\">/" plugin/btrfs-integrity-recovery.plg
+          echo "MD5=$MD5" >> "$GITHUB_ENV"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-integrity-recovery-bundle
+          path: plugin/archive/btrfs-integrity-recovery-x86_64-1.txz
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: plugin/archive/btrfs-integrity-recovery-x86_64-1.txz
+          # Auto-generate release notes from the conventional commits since
+          # the last release; the bundle filename is stable so the .plg's
+          # bundleURL (releases/latest/download/...) keeps resolving.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

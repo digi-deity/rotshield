@@ -1,6 +1,6 @@
 //! Batched, two-stage recovery pipeline.
 //!
-//! When scrub-rs runs with `--recover --write`, recovery is split into two
+//! When scrub-rs runs with `--repair`, recovery is split into two
 //! cooperating threads connected by single-depth channels, so the two
 //! stages overlap and each provides backpressure to the one before it:
 //!

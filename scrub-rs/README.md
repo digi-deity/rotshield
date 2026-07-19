@@ -1,0 +1,64 @@
+# scrub-rs
+
+A standalone, read-only btrfs scrub tool plus a NonRAID/Unraid parity-aware
+recovery utility. It reads btrfs on-disk metadata directly from a block device
+(or a regular file image) and verifies the checksum of every data sector, then
+uses the array's P/Q parity to recover single-disk corruption that btrfs
+itself cannot self-heal.
+
+## Layout
+
+```
+scrub-rs/
+├── Cargo.toml            # crate manifest (lib + scrub-rs + craft-corrupt bins)
+├── src/                  # Rust source
+│   ├── lib.rs            # library crate root (scrub_rs)
+│   ├── main.rs           # `scrub-rs` binary (CLI entry point)
+│   ├── bin/
+│   │   └── craft_corrupt.rs   # `craft-corrupt` binary (injects test corruptions)
+│   ├── array/            # parity-array layer (P/Q, stripes, config) — btrfs-agnostic
+│   ├── btrfs/            # raw btrfs parser (superblock, trees, csum, scrub) — array-agnostic
+│   ├── recovery/         # GF(2^8) Reed-Solomon / parity recovery engine
+│   ├── batch_recover.rs  # batch recovery driver
+│   ├── freeze.rs         # snapshot-freeze helpers
+│   └── fs.rs             # filesystem helpers
+├── tests/
+│   └── integration/      # shell-based integration harness (sourced by CI)
+│       ├── btrfs_test_lib.sh        # shared mkfs/mount/corruption primitives
+│       ├── btrfs_test_matrix.sh     # generate the single-device image matrix
+│       ├── run_matrix.sh            # run scrub-rs over the matrix vs expectations.tsv
+│       ├── cmp_utilities.sh         # 3-way compare: scrub-rs vs btrfs check vs btrfs scrub
+│       ├── btrfs_live_scrub_test.sh # concurrent-churn + live scrub scenarios
+│       └── btrfs_live_workload.sh   # standalone write/delete/snapshot churn generator
+├── docs/                 # design & handoff notes
+│   ├── OPTIMIZE_PLAN.md
+│   ├── POST_IMPLEMENTATION.md
+│   └── PROGRESS.md
+└── target/               # cargo build output (git-ignored)
+```
+
+Unit tests live inline in the source files (`#[cfg(test)]` modules under
+`src/array`, `src/recovery`, …) and run with `cargo test`.
+
+## Build
+
+```sh
+cargo build --release
+# binaries: target/release/scrub-rs, target/release/craft-corrupt
+```
+
+## Test
+
+```sh
+# Rust unit tests
+cargo test
+
+# Integration matrix (requires root + btrfs-progs + loop devices)
+sudo tests/integration/btrfs_test_matrix.sh ./btrfs_test_images
+sudo -E tests/integration/run_matrix.sh \
+    --scrub-cmd "$PWD/target/release/scrub-rs {DEVICE}" ./btrfs_test_images
+```
+
+The full CI pipeline (array recovery tests + btrfs matrix + cmpUtilities +
+live simulation) is defined at the repo root in
+`.github/workflows/scrub-rs-tests.yml`.

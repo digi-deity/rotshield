@@ -1,0 +1,171 @@
+Menu="Utilities"
+Title="btrfs-integrity-recovery"
+Icon="btrfs-integrity-recovery.png"
+---
+<?php
+/* btrfs-integrity-recovery settings page
+ * Served by emhttp. Lets the user pick the device/array partition, set a
+ * schedule, trigger a scrub on demand, and view per-run logs. The actual
+ * work is done by scripts/scrub.sh (backgrounded) so the UI never blocks.
+ * "Run Scrub Now" and the scheduled cron job both call `scrub.sh run`, so
+ * manual and scheduled runs are logged identically and appear the same way
+ * in the View Logs panel.
+ */
+$plugin      = "btrfs-integrity-recovery";
+$plugin_dir  = "/usr/local/emhttp/plugins/$plugin";
+$config_dir  = "/boot/config/plugins/$plugin";
+$config_file = "$config_dir/config.cfg";
+$status_file = "$config_dir/lastrun.json";
+$runs_dir    = "$config_dir/runs";
+$log_file    = "/var/log/$plugin.log";
+
+if (!is_file($config_file)) {
+    @mkdir($config_dir, 0777, true);
+    file_put_contents($config_file, "DEVICES=/dev/nmd1p1\nDEVICE=/dev/nmd1p1\nSCHEDULE=disabled\nRECOVER=1\nWRITE=0\nFREEZE_MOUNT=\nNO_FREEZE=0\nBATCH_MAX=\nBATCH_IDLE=\nEXTRA_OPTIONS=\n");
+}
+$config = parse_ini_file($config_file);
+
+// Discover the array's btrfs data-disk partitions from /proc/nmdstat|mdstat.
+$devices = array_filter(array_map('trim', explode("\n", trim(exec("$plugin_dir/scripts/scrub.sh devices 2>/dev/null")))));
+if (empty($devices)) {
+    $devices = ['/dev/nmd1p1'];   // fallback if the array isn't up yet
+}
+
+$message = "";
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // devices[] is a multi-select; keep only entries that are real array
+    // data-disk partitions, in the order presented.
+    $sel = $_POST['devices'] ?? [];
+    $sel = is_array($sel) ? $sel : [$sel];
+    $sel = array_values(array_filter(array_map('trim', $sel), fn($d) => in_array($d, $devices, true)));
+    if (empty($sel)) { $sel = [$devices[0]]; }
+    $devices_csv = implode(' ', $sel);
+    $schedule = trim($_POST['schedule'] ?? 'disabled');
+    $schedule = in_array($schedule, ['disabled','daily','weekly']) ? $schedule : 'disabled';
+    $recover  = isset($_POST['recover'])  ? 1 : 0;
+    $write    = isset($_POST['write'])    ? 1 : 0;
+    $no_freeze= isset($_POST['no_freeze'])? 1 : 0;
+    $batch_max= escapeshellarg(trim($_POST['batch_max']   ?? ''));
+    $batch_idle=escapeshellarg(trim($_POST['batch_idle']  ?? ''));
+    $extra    = escapeshellarg(trim($_POST['extra_options'] ?? ''));
+    file_put_contents($config_file,
+        "DEVICES=$devices_csv\n" .
+        "DEVICE={$sel[0]}\n" .
+        "SCHEDULE=$schedule\n" .
+        "RECOVER=$recover\n" .
+        "WRITE=$write\n" .
+        "NO_FREEZE=$no_freeze\n" .
+        "BATCH_MAX=$batch_max\n" .
+        "BATCH_IDLE=$batch_idle\n" .
+        "EXTRA_OPTIONS=$extra\n");
+    exec("/etc/rc.d/rc.$plugin restart 2>&1");
+    if (isset($_POST['run'])) {
+        exec("nohup $plugin_dir/scripts/scrub.sh run >/dev/null 2>&1 &");
+        $message = "Scrub started in the background.";
+    } else {
+        $message = "Settings saved.";
+    }
+    $config = parse_ini_file($config_file);
+}
+
+// View Logs: ?view=1 shows the latest run's log; ?log=<file> shows a specific
+// historical run. Both manual and scheduled runs are listed here.
+$view_log = "";
+$view_title = "Latest run log";
+if (isset($_GET['log'])) {
+    $want = basename($_GET['log']);                 // guard against path traversal
+    $candidate = "$runs_dir/$want";
+    if (is_file($candidate)) { $view_log = file_get_contents($candidate); $view_title = "Log: $want"; }
+} elseif (isset($_GET['view'])) {
+    $last = trim(exec("$plugin_dir/scripts/scrub.sh lastlog 2>/dev/null"));
+    if ($last && is_file($last)) { $view_log = file_get_contents($last); $view_title = "Latest run log"; }
+}
+
+// Build the list of past run logs (newest first) for the history dropdown.
+$run_logs = [];
+if (is_dir($runs_dir)) {
+    foreach (glob("$runs_dir/run-*.log") ?: [] as $f) {
+        $run_logs[basename($f)] = filemtime($f);
+    }
+    arsort($run_logs);
+    $run_logs = array_keys($run_logs);
+}
+
+$status    = is_file($status_file) ? file_get_contents($status_file) : '{"status": "never run", "running": false}';
+$st        = json_decode($status, true) ?: [];
+$schedule_label = ['disabled' => 'Disabled', 'daily' => 'Daily (03:00)', 'weekly' => 'Weekly (Sun 03:00)'][$config['SCHEDULE'] ?? 'disabled'] ?? 'Disabled';
+$cron_active = is_file("/etc/cron.d/$plugin");
+?>
+<h1 style="margin:0 0 12px">btrfs Integrity Recovery</h1>
+<?php if ($message): ?><div class="notice"><?=htmlspecialchars($message)?></div><?php endif; ?>
+
+<form method="post">
+  <table class="settings">
+    <tr><td>Schedule</td>
+        <td><select name="schedule">
+            <option value="disabled" <?=($config['SCHEDULE'] ?? 'disabled') === 'disabled' ? 'selected' : ''?>>Disabled</option>
+            <option value="daily"    <?=($config['SCHEDULE'] ?? '') === 'daily'    ? 'selected' : ''?>>Daily (03:00)</option>
+            <option value="weekly"   <?=($config['SCHEDULE'] ?? '') === 'weekly'   ? 'selected' : ''?>>Weekly (Sun 03:00)</option>
+          </select>
+            <span class="label">Current: <b><?=htmlspecialchars($schedule_label)?></b>
+            <?= $cron_active ? '(cron active)' : '(no cron entry)' ?></span></td></tr>
+    <tr><td>Target disk(s)</td>
+        <td><select name="devices[]" multiple size="<?=max(4, min(12, count($devices)))?>" style="min-width:160px">
+            <?php
+            $selected = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '/dev/nmd1p1'));
+            foreach ($devices as $d): ?>
+            <option value="<?=htmlspecialchars($d)?>" <?=in_array($d, $selected, true) ? 'selected' : ''?>><?=htmlspecialchars($d)?></option>
+            <?php endforeach; ?>
+          </select>
+            <span class="label">Raw array data disks (e.g. /dev/sdX, /dev/nvmeXnY, /dev/loopX) — scrubbed sequentially. The partition offset is auto-applied from /proc/nmdstat; parity disks are excluded.</span></td></tr>
+    <tr><td>Repair disk</td>
+        <td><label><input type="checkbox" name="write" value="1" <?=($config['WRITE'] ?? 0) ? 'checked' : ''?>> write reconstructed blocks back (--repair; default is dry-run assessment only)</label></td></tr>
+    <tr><td>Disable freeze</td>
+        <td><label><input type="checkbox" name="no_freeze" value="1" <?=($config['NO_FREEZE'] ?? 0) ? 'checked' : ''?>> --no-freeze (unsafe with write on a live FS)</label></td></tr>
+    <tr><td>Batch max</td>
+        <td><input type="text" name="batch_max" size="10" value="<?=htmlspecialchars($config['BATCH_MAX'] ?? '')?>" placeholder="64">
+            <span class="label">max candidates per recovery batch</span></td></tr>
+    <tr><td>Batch idle (s)</td>
+        <td><input type="text" name="batch_idle" size="10" value="<?=htmlspecialchars($config['BATCH_IDLE'] ?? '')?>" placeholder="5.0">
+            <span class="label">flush a batch after this many idle seconds</span></td></tr>
+    <tr><td>Extra options</td>
+        <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>" placeholder="--dump-array">
+            <span class="label">advanced: appended verbatim to the scrub-rs command</span></td></tr>
+  </table>
+  <p>
+    <input type="submit" name="save" value="Save Settings">
+    <input type="submit" name="run"  value="Run Scrub Now">
+    <a class="button" href="?plugin=<?=htmlspecialchars($plugin)?>&view=1">View Logs</a>
+  </p>
+</form>
+
+<h2>Last run</h2>
+<?php if (!empty($st)): ?>
+<p>
+  <b>Status:</b> <?=htmlspecialchars($st['status'] ?? '?')?>
+  <?php if (!empty($st['running'])): ?>
+    &nbsp;·&nbsp; <b>Progress:</b> <?=htmlspecialchars($st['progress'] ?? '')?>
+    &nbsp;·&nbsp; <b>Current:</b> <?=htmlspecialchars($st['current'] ?? '')?>
+  <?php endif; ?>
+  &nbsp;·&nbsp; <b>Disks:</b> <?=htmlspecialchars($st['devices'] ?? '')?>
+</p>
+<?php endif; ?>
+<pre><?=htmlspecialchars(json_encode($st, JSON_PRETTY_PRINT))?></pre>
+
+<?php if ($view_log !== "" || isset($_GET['view']) || isset($_GET['log'])): ?>
+<h2><?=htmlspecialchars($view_title)?></h2>
+<?php if ($run_logs): ?>
+<form method="get" style="margin-bottom:8px">
+  <input type="hidden" name="plugin" value="<?=htmlspecialchars($plugin)?>">
+  <label>History:
+    <select name="log" onchange="this.form.submit()">
+      <option value="">— latest —</option>
+      <?php foreach ($run_logs as $rl): ?>
+      <option value="<?=htmlspecialchars($rl)?>" <?=(isset($_GET['log']) && $_GET['log'] === $rl) ? 'selected' : ''?>><?=htmlspecialchars($rl)?></option>
+      <?php endforeach; ?>
+    </select>
+  </label>
+</form>
+<?php endif; ?>
+<pre><?=htmlspecialchars($view_log !== "" ? $view_log : "(no log yet)")?></pre>
+<?php endif; ?>

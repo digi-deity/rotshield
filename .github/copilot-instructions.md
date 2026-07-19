@@ -27,24 +27,19 @@ The merged array device appears as `/dev/nmd1` with partition `/dev/nmd1p1`, whi
 
 ## Scripts
 
-### `setup_disk.sh` — Create virtual disks
-Creates and prepares the virtual disks for the NonRAID array, if not already exist. This includes GPT partition creation, btrfs formatting for data disks and setting up the necessary loop devices and symlinks for `nmdctl`.
+### `nmdctl` — NonRAID array control tool (binary, at repo root)
+The array management CLI. Used directly by CI and the scripts below. Requires
+`/dev/disk/by-id/virtdisk-00X` symlinks pointing to each loop device. Key
+subcommands: `create --force`, `start`, `check`, `mount`, `status`, `umount`,
+`stop`.
 
-### `mk_array.sh` — Assemble and start the NonRAID array
+### `mk_array.sh` — Assemble and start the NonRAID array (at repo root)
 - Uses `nmdctl create --force` with disk assignments: `P:/dev/loop0p1`, `Q:/dev/loop1p1`, `1:/dev/loop2p1`, `2:/dev/loop3p1`.
 - Starts the array with `nmdctl start`.
 - Verifies with `nmdctl check NOCORRECT`.
+- This is the manual counterpart to the array job in `.github/workflows/scrub-rs-tests.yml` (which inlines the same `nmdctl` calls).
 
-### `btrfs_manipulate.sh` — Corrupt a file on-disk and verify
-- Creates a 300 MB file (`/mnt/disk1/bigfile2.bin`) filled with `0xFF` bytes.
-- Resolves the file's **physical byte offset** on the block device by:
-  1. Getting the inode number via `stat`.
-  2. Dumping the BTRFS `FS_TREE` to find the `EXTENT_DATA` entry and its virtual address.
-  3. Dumping the BTRFS `CHUNK` tree to map the virtual address → physical offset (chunk start + chunk physical base + relative offset).
-- Flips the second byte of the file to `0x00` by writing directly to the raw block device (`dd of=$REAL_DEV bs=1 seek=... conv=notrunc`).
-- Drops the OS page cache (`drop_caches`) and verifies the corruption is visible through the filesystem.
-
-### `teardown_disk.sh` — Full teardown (idempotent, safe to re-run)
+### `teardown_disk.sh` — Full teardown (idempotent, safe to re-run, at repo root)
 - Unmounts array disks (`nmdctl -u umount`).
 - Stops the array (`nmdctl -u stop`).
 - Unloads NonRAID kernel modules (`md_nonraid`, `nonraid6_pq`).
@@ -52,6 +47,24 @@ Creates and prepares the virtual disks for the NonRAID array, if not already exi
 - Detaches all loop devices backed by `d[0-9]*` image files and removes their by-id symlinks.
 - Cleans up empty mount-point directories under `/mnt/disk*`.
 - **Preserves** the image files in `nonraid-test/` for reuse.
+
+### `scrub-rs/` — Rust scrub + recovery tool (the main deliverable)
+A Cargo crate providing a read-only btrfs scrubber and parity-aware recovery
+utility. Build with `cargo build --release` (binaries: `scrub-rs`,
+`craft-corrupt`). Unit tests live inline in `src/` and run with `cargo test`.
+
+### `scrub-rs/tests/integration/` — Shell-based integration harness
+Sourced by CI (`.github/workflows/scrub-rs-tests.yml`):
+- `btrfs_test_lib.sh` — shared mkfs/mount/corruption primitives (sourced by the others).
+- `btrfs_test_matrix.sh` — generates the single-device btrfs image matrix + `expectations.tsv`.
+- `run_matrix.sh` — runs `scrub-rs` over the matrix and compares to `expectations.tsv`.
+- `cmp_utilities.sh` — 3-way compare of `scrub-rs` vs `btrfs check` vs `btrfs scrub`.
+- `btrfs_live_scrub_test.sh` / `btrfs_live_workload.sh` — concurrent-churn + live-scrub scenarios.
+
+> Note: the original Python implementation (`setup_disk.sh`, `btrfs_manipulate.sh`,
+> and the `btrfs-recon` Python package) was ported to Rust and the Python sources
+> have been removed. The Rust equivalents are `scrub-rs` + `craft-corrupt` and the
+> `tests/integration/` harness above.
 
 ## Key concepts
 

@@ -228,18 +228,18 @@ recipe_11_corrupted_known_bad() {
     record_expectation "$vb/${label}.img" unverified 0 "corruption attempt failed"
   fi
 
-  # c) single superblock wiped -- should still work
+  # c) single superblock wiped -- primary 64KiB copy gone, 64MiB backup intact
   local vc="$base_destdir/c_single_superblock_wiped"; mkdir -p "$vc"
   cp -a "$pristine" "$vc/${label}.img"
   zero_range "$vc/${label}.img" "$SB_PRIMARY_OFFSET" "$SB_SIZE"
   verify_check_offline "$vc/${label}.img" "$vc/EXPECTED_check_status.txt"
   local rc_c=$?
-  echo "EXPECTED: should still succeed via the 64MiB backup superblock." >> "$vc/EXPECTED_check_status.txt"
+  echo "EXPECTED: scrub-rs falls back to the 64MiB backup superblock and reports the wiped primary as a recoverable metadata divergence (metadata mirror : 1), then continues the scrub (rc=0)." >> "$vc/EXPECTED_check_status.txt"
   if [[ $rc_c -eq 0 ]]; then
-    record_expectation "$vc/${label}.img" clean 0 "primary superblock wiped, backup at 64MiB should cover it"
+    record_expectation "$vc/${label}.img" self_heal_recoverable 1 "primary superblock (64KiB) wiped, backup at 64MiB intact; scrub-rs falls back + reports recoverable metadata divergence (mirror : 1), continues scrub (rc=0)"
   else
     log "WARN: [c_single_superblock_wiped] check FAILED unexpectedly"
-    record_expectation "$vc/${label}.img" unverified 0 "expected clean via backup superblock, check failed"
+    record_expectation "$vc/${label}.img" unverified 0 "expected recoverable via backup superblock, check failed"
   fi
 
   # d) all superblocks wiped -- should fail outright

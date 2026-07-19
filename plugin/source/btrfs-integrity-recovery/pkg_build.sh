@@ -1,0 +1,34 @@
+#!/bin/bash
+# pkg_build.sh — package the plugin source tree into a Slackware .txz bundle.
+#
+# Mirrors the rathole-unraid layout: everything under this directory is
+# copied (preserving relative paths) into a temp tree, tar'd into
+#   ../../archive/<plugin>-x86_64-1.txz
+# and the resulting bundle is what the .plg installs via upgradepkg.
+#
+# Unlike rathole we do NOT download a binary at install time — the
+# scrub-rs / craft-corrupt binaries are copied into
+#   usr/local/emhttp/plugins/btrfs-integrity-recovery/bin/
+# by CI (build-plugin.yml) before this script runs, so they are bundled.
+
+DIR="$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"
+tmpdir=/tmp/tmp.$(( $RANDOM * 19318203981230 + 40 ))
+plugin=$(basename ${DIR})
+archive="$(dirname $(dirname ${DIR}))/archive"
+version=$(date +"%Y.%m.%d")
+
+mkdir -p "$tmpdir" "$archive"
+
+cd "$DIR"
+# Copy every file except the build script and the .gitkeep placeholders.
+cp --parents -f $(find . -type f ! \( -iname "pkg_build.sh" -o -iname ".gitkeep" \) ) "$tmpdir/"
+cd "$tmpdir"
+# Normalise line endings and make scripts executable.
+find . -type f \( -iname '*.sh' -o -iname '*.page' -o -iname '*.plg' -o -iname 'rc.*' \) -exec sed -i 's/\r//g' {} +
+chmod -R +x ./
+# Fixed bundle name so the .plg's bundleURL (releases/latest/download/...) stays stable.
+tar cfJCo "${archive}/${plugin}-x86_64-1.txz" "$tmpdir" . --owner=0 --group=0 --mode="a=r,u+w,a+X"
+rm -rf "$tmpdir"
+
+echo "Built ${archive}/${plugin}-x86_64-1.txz"
+md5sum "${archive}/${plugin}-x86_64-1.txz"

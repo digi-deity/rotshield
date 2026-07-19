@@ -1,0 +1,57 @@
+#!/bin/bash
+# /etc/rc.d/rc.btrfs-integrity-recovery
+#
+# This plugin is an on-demand tool (not a long-running daemon), so this
+# rc script only manages the optional schedule: it installs/removes a
+# cron.d entry based on SCHEDULE in the config file. `start` applies the
+# schedule, `stop` clears it, `restart` re-applies.
+
+PLUGIN="btrfs-integrity-recovery"
+PLUGIN_DIR="/usr/local/emhttp/plugins/${PLUGIN}"
+CONFIG_DIR="/boot/config/plugins/${PLUGIN}"
+CONFIG_FILE="${CONFIG_DIR}/config.cfg"
+CRON_FILE="/etc/cron.d/${PLUGIN}"
+
+install_cron() {
+  [ -f "${CONFIG_FILE}" ] && . "${CONFIG_FILE}"
+  rm -f "${CRON_FILE}"
+  case "${SCHEDULE:-disabled}" in
+    daily)
+      # scrub.sh writes ONLY a compact summary to /var/log/$PLUGIN.log
+      # itself; the full per-run detail lives in the run file (viewable on
+      # demand).  So the cron entry just invokes the run, no redirection.
+      echo "0 3 * * * root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
+      ;;
+    weekly)
+      echo "0 3 * * 0 root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
+      ;;
+    *)
+      # disabled — no cron entry
+      ;;
+  esac
+  chmod 644 "${CRON_FILE}" 2>/dev/null
+}
+
+remove_cron() {
+  rm -f "${CRON_FILE}"
+}
+
+start() {
+  install_cron
+}
+
+stop() {
+  remove_cron
+}
+
+restart() {
+  stop
+  start
+}
+
+case "$1" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) restart ;;
+  *) echo "usage $0 start|stop|restart" ;;
+esac

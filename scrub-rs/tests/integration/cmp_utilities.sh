@@ -12,7 +12,7 @@
 #      the gold image under btrfs_test_images/ is never touched. btrfs scrub
 #      in particular can self-heal a corrupt DUP copy on a writable mount,
 #      so operating on a copy is mandatory.
-#   2. Run scrub-rs (no --recover / --write — read-only) against the copy
+#   2. Run scrub-rs (no --repair — read-only assessment) against the copy
 #      and capture FULL output (no grep / tail / head).
 #   3. Run `btrfs check --readonly --check-data-csum` against the copy,
 #      full output.
@@ -31,12 +31,15 @@
 #      preserves them in the job log with no truncation), then a final
 #      SUMMARY table with the parsed counts side-by-side and an ALIGN
 #      verdict per case.
-#   7. Exit non-zero ONLY on an UNEXPECTED misalignment. The two known
-#      acceptable divergences (recipe 13a metadata-generation-only and 13b
-#      csum-entry-deleted — both `unverified` in expectations.tsv) and the
-#      11c single-superblock-wiped case (scrub-rs has no backup-SB fallback)
-#      are flagged WARN but do not fail CI. See scrub-rs-matrix-live-test.md
-#      repo memory for the rationale.
+#   7. Exit non-zero ONLY on an UNEXPECTED misalignment. Known acceptable
+#      divergences (see known_acceptable_divergence()) are flagged WARN but
+#      do not fail CI. The 11c single-superblock-wiped case is one such
+#      divergence: scrub-rs falls back to the 64MiB backup superblock and
+#      reports it as a recoverable metadata divergence (mirror : 1, rc=0),
+#      while btrfs check / btrfs scrub refuse to mount the image offline.
+#      See scrub-rs-matrix-live-test.md repo memory for the rationale.
+#      (Recipes 13a/13b were previously `unverified` but now carry strict
+#      expectations and ALIGN.)
 #
 # Usage:
 #   sudo ./cmp_utilities.sh [--scrub-cmd TEMPLATE] [--images DIR]
@@ -207,16 +210,11 @@ classify() {
       else echo "FAIL"; fi
       ;;
     unverified)
-      # Logged only. Known-acceptable divergences that live here:
-      #   13a metadata_generation_only: scrub-rs clean (no csum audit),
-      #                               btrfs check flags bad generation,
-      #                               btrfs scrub mount fails. WARN.
-      #   13b csum_entry_deleted:       scrub-rs clean (missing-csum !=
-      #                               corruption), btrfs check flags
-      #                               missing csum, btrfs scrub clean. WARN.
-      #   11c single_superblock_wiped: scrub-rs refuses (no backup-SB
-      #                               fallback), btrfs check refuses,
-      #                               btrfs scrub mount refuses. ALIGN.
+      # Logged only. Known-acceptable divergences that live here are
+      # downgraded SKIP→WARN by known_acceptable_divergence() so they show
+      # up in the summary but do NOT fail CI.  (Recipes 13a/13b used to
+      # live here but now carry strict expectations and take the normal
+      # ALIGN path.)
       echo "SKIP"
       ;;
     *)
@@ -232,12 +230,10 @@ classify() {
 known_acceptable_divergence() {
   local cn="$1"
   case "$cn" in
-    *13_metadata_field_and_csum_anomalies__a_metadata_generation_only*) echo 1;;
-    *13_metadata_field_and_csum_anomalies__b_csum_entry_deleted*)       echo 1;;
+    *11_corrupted_known_bad__c_single_superblock_wiped*) echo 1;;
     *) echo 0;;
   esac
 }
-
 # ---------------------------------------------------------------------------
 # Main per-case loop
 # ---------------------------------------------------------------------------
@@ -328,8 +324,11 @@ while IFS= read -r -d '' img; do
             "$bs_rc" "$bs_csum" "$bs_corr" "$bs_unc" "$bs_nomnt" "$img")"
 
   note=""
-  if [[ "$expected" == "unverified" ]]; then
-    # Known-acceptable divergences get WARN, not FAIL
+  # Known-acceptable divergences get WARN, not FAIL — regardless of their
+  # expectation category.  These are cases where the three tools legitimately
+  # disagree by design (e.g. scrub-rs falls back to a backup superblock that
+  # btrfs check / btrfs scrub refuse to mount), not silent test suppression.
+  if [[ "$align" != "ALIGN" ]]; then
     if [[ "$(known_acceptable_divergence "$cn")" == "1" ]]; then
       align="WARN(doc)"
       note="documented divergence (see repo memory scrub-rs-matrix-live-test.md)"

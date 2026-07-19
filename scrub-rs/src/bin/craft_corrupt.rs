@@ -534,7 +534,7 @@ fn corrupt_cmd(dev: &str, file_path: &str, opts: &Opts) -> io::Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     println!("\nnow run:");
-    println!("  scrub-rs /dev/{dev_name} --offset +64 --recover");
+    println!("  scrub-rs /dev/{dev_name} --offset +64");
     let expected = match opts.targets {
         Targets::Data => "RECOVERED via P (or Q — both work)",
         Targets::BakeP => "FAILED via P (ParityBakedIn), RECOVERED via Q",

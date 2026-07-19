@@ -182,12 +182,12 @@ jobs:
           sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd1p1 /testA --targets data --backup /tmp/backupA.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --repair 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via P" || { echo "::error::expected RECOVERED via P"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk1 still has mismatches after recovery"; exit 1; }
 
@@ -203,12 +203,12 @@ jobs:
           sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd2p1 /testB --targets bake-p --backup /tmp/backupB.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop3 --offset +65536 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop3 --offset +65536 --repair 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via Q" || { echo "::error::expected RECOVERED via Q"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop3 --offset +65536 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop3 --offset +65536 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk2 still has mismatches after recovery"; exit 1; }
 
@@ -229,12 +229,12 @@ jobs:
           sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd3p1 /testC --targets bake-q --backup /tmp/backupC.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop4 --offset +131072 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop4 --offset +131072 --repair 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via P" || { echo "::error::expected RECOVERED via P"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop4 --offset +131072 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop4 --offset +131072 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk3 still has mismatches after recovery"; exit 1; }
 
@@ -259,7 +259,7 @@ jobs:
           sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd4p1 /testD --targets bake-both --backup /tmp/backupD.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop5 --offset +196608 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop5 --offset +196608 --repair 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "AllPathsFailed" || { echo "::error::expected AllPathsFailed (this is the known-unverified case — see repo memory)"; exit 1; }
 
@@ -286,12 +286,12 @@ jobs:
           sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd1p1 /testE --targets two-disk --partner 2 --backup /tmp/backupE.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --repair 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via PQ(partner=slot 2)" || { echo "::error::expected RECOVERED via PQ(partner=slot 2) (known-unverified case)"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk1 still has mismatches after PQ recovery"; exit 1; }
 
@@ -322,12 +322,12 @@ jobs:
           sudo "$SCRUB_RS_DIR/craft-corrupt" /dev/nmd1p1 /testF --sector "$SECTOR" --targets bake-p --backup /tmp/backupF.bin
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 
-          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover --write 2>&1) || true
+          out=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --repair 2>&1) || true
           echo "$out"
           echo "$out" | grep -F "RECOVERED via Q" || { echo "::error::expected RECOVERED via Q (known-unverified zero-pad case)"; exit 1; }
 
           sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
-          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 --recover 2>&1)
+          verify=$(sudo "$SCRUB_RS_DIR/scrub-rs" /dev/loop2 --offset +64 2>&1)
           echo "$verify"
           echo "$verify" | grep -F "sectors mismatch   : 0" || { echo "::error::disk1 still has mismatches after zero-pad recovery"; exit 1; }
 
@@ -438,7 +438,7 @@ jobs:
           # Generate the image matrix (loop-backed, single-device btrfs)
           # plus the machine-readable expectations.tsv. Capture FULL output
           # (no tail) so version-dependent corruption decisions are visible.
-          sudo ./btrfs_test_matrix.sh ./btrfs_test_images 2>&1 | tee /tmp/matrix_gen.log
+          sudo ./tests/integration/btrfs_test_matrix.sh ./btrfs_test_images 2>&1 | tee /tmp/matrix_gen.log
           echo "=== matrix build.log (corruption decisions / verify_check rc) ==="
           sudo cat ./btrfs_test_images/build.log || true
           # Run scrub-rs over every image and compare to expectations.tsv.
@@ -446,7 +446,7 @@ jobs:
           # comparison (scrub-rs vs btrfs check vs btrfs scrub, with full
           # logs + parsed stat counts) is the cmpUtilities step below —
           # don't duplicate that diagnostic work here.
-          sudo -E ./run_matrix.sh --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" ./btrfs_test_images 2>&1 | tee /tmp/matrix_run.log
+          sudo -E ./tests/integration/run_matrix.sh --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" ./btrfs_test_images 2>&1 | tee /tmp/matrix_run.log
           echo "--- matrix summary ---"
           cat ./btrfs_test_images/matrix_results.tsv
           if grep -qE '^TOTAL=[0-9]+ PASS=[0-9]+ FAIL=0 ' ./btrfs_test_images/matrix_results.tsv; then
@@ -486,7 +486,7 @@ jobs:
         if: ${{ always() }}
         run: |
           cd scrub-rs
-          sudo -E ./cmp_utilities.sh \
+          sudo -E ./tests/integration/cmp_utilities.sh \
             --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" \
             --images "$PWD/btrfs_test_images" 2>&1 | tee /tmp/cmp_utilities.log
 
@@ -505,6 +505,7 @@ jobs:
             scrub-rs/btrfs_test_images/matrix_results.tsv
             scrub-rs/btrfs_test_images/cmp_utilities_summary.tsv
             scrub-rs/btrfs_test_images/cmp_utilities_logs/
+            scrub-rs/tests/integration/
           if-no-files-found: warn
 
       - name: btrfs live simulation — concurrent churn + scrub
@@ -514,7 +515,7 @@ jobs:
           # Read-only scrub alongside concurrent churn (no array active, so
           # --recover is not used). Covers false-positive, true-positive,
           # and true-positive-dup-one-copy scenarios.
-          sudo ./btrfs_live_scrub_test.sh \
+          sudo ./tests/integration/btrfs_live_scrub_test.sh \
             --scrub-cmd "$SCRUB_RS_DIR/scrub-rs {DEVICE}" \
             --mode all --duration 60 --warmup 10 --intensity med
           echo "--- live-sim summaries ---"

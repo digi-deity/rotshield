@@ -104,6 +104,29 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         )
     })?;
 
+    // Detect a wiped/primary-superblock-with-intact-backup situation.  The
+    // main `read` above transparently fell back to a backup copy (64 MiB /
+    // 256 GiB / 1 TiB) when the primary (64 KiB) was unusable, so the scrub
+    // can still proceed — but a bad primary copy is itself a metadata
+    // divergence the operator should know about (exactly the self-heal-
+    // recoverable shape of a DUP metadata node with one bad mirror).  We
+    // probe the primary copy on its own; if it fails but we already have a
+    // good backup, count it as a recoverable metadata mirror mismatch and
+    // continue the scrub.  This is deliberately NOT fatal: the filesystem
+    // is fully readable via the backup, so the data result is trustworthy.
+    let primary_ok = Superblock::read_primary(&mut fp, base_offset).is_ok();
+    // Recoverable-metadata counter, declared up front so the primary-SB
+    // divergence check below (and the tree walks later) can accumulate into
+    // the same field.
+    let mut metadata_mirror_mismatches: u64 = 0;
+    if !primary_ok {
+        eprintln!(
+            "note: primary superblock (64 KiB) unreadable; fell back to an \
+             intact backup copy — recoverable metadata divergence (rc unaffected)"
+        );
+        metadata_mirror_mismatches += 1;
+    }
+
     // Sanity-check the device is large enough to actually hold the
     // filesystem the superblock describes.  A truncated image (or a
     // short/partial device) still has a valid primary superblock at
@@ -157,7 +180,6 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
 
     let mut chunk_records: Vec<ChunkRecord> = Vec::new();
     let mut metadata_header_errors: u64 = 0;
-    let mut metadata_mirror_mismatches: u64 = 0;
     walk_leaves(
         &mut reader,
         &chunk_map,

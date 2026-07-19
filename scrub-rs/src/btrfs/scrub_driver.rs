@@ -76,7 +76,7 @@ pub struct BtrfsScrub {
     /// re-confirming them inline.  The caller is expected to drive
     /// batched reconfirmation + recovery (typically on a separate writer
     /// thread that owns the live-filesystem freeze).  Used only in
-    /// `--recover --write` mode; plain scrubs keep the inline reconfirm so
+    /// `--repair` mode; plain scrubs keep the inline reconfirm so
     /// their mismatch/stale accounting is unchanged.
     recover_batch: bool,
 }

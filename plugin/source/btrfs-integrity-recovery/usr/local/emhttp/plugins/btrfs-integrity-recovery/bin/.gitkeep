@@ -1,0 +1,4 @@
+# Placeholder so the bin/ directory is tracked in git.
+# The actual scrub-rs and craft-corrupt binaries are copied here by
+# CI (build-plugin.yml) before pkg_build.sh packages the bundle, and are
+# git-ignored (see repo .gitignore).

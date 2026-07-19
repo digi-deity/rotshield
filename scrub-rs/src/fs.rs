@@ -204,7 +204,7 @@ pub trait ScrubCallbacks {
 ///    a future `--fstype` flag chooses between `BtrfsScrub` and
 ///    `ZfsScrub`);
 /// 2. resolve the NonRAID slot the backing store belongs to, load the
-///    array config if `--recover` is set;
+///    array config if an array is present;
 /// 3. call `scrub.run(&mut callbacks)` where `callbacks` routes log
 ///    lines to `eprintln!` and recovery events through the array +
 ///    recovery glue.

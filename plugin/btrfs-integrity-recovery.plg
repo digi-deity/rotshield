@@ -1,0 +1,42 @@
+<?xml version='1.0' standalone='yes'?>
+
+<!DOCTYPE PLUGIN [
+<!ENTITY name          "btrfs-integrity-recovery">
+<!ENTITY author        "iiLaurens">
+<!ENTITY version       "2026.07.19">
+<!ENTITY bundleversion "2026.07.19">
+<!ENTITY launch        "Settings/btrfs-integrity-recovery">
+<!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
+<!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
+]>
+
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;">
+
+<CHANGES>
+##&name;
+
+###2026.07.19
+- Initial release: ships the scrub-rs + craft-corrupt binaries and a
+  Settings page to run / schedule btrfs integrity scrubs.
+</CHANGES>
+
+<!--
+Install the bundle. It already contains the prebuilt binaries
+(scrub-rs, craft-corrupt) plus all plugin files, so there is NO
+binary download at install time (we build & ship it ourselves).
+-->
+<FILE Name="/boot/config/plugins/btrfs-integrity-recovery/install/btrfs-integrity-recovery-x86_64-1.txz" Run="upgradepkg --install-new">
+<URL>&bundleURL;</URL>
+</FILE>
+
+<!-- Run install logic (binaries are already in place from the bundle). -->
+<FILE Run="/bin/bash" Method="install">
+<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh</INLINE>
+</FILE>
+
+<!-- Uninstall logic. -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/uninstall.sh</INLINE>
+</FILE>
+
+</PLUGIN>
