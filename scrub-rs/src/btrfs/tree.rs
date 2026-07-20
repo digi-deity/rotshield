@@ -143,7 +143,39 @@ where
                 // generation comes from the parent's key pointer, its level
                 // must be one below the parent's, and its owner must match
                 // the parent's tree id.
-                for ptr in internal.ptrs.iter().rev() {
+                //
+                // Pre-issue `POSIX_FADV_WILLNEED` for every child as it is
+                // queued, so the disk starts prefetching the next-to-visit
+                // metadata block while we are still processing *this*
+                // internal node's siblings.  On HDD the bulk-data sweep is
+                // already sequential (the DEV-tree-driven walk + the
+                // `POSIX_FADV_SEQUENTIAL` hint cover it); the seek-dominated
+                // part of a multi-TB scrub's idle time is these scattered
+                // metadata reads.  Each `WILLNEED` is a single `nodesize`
+                // block (≤64 KiB), well inside the kernel's 1-MiB hint cap.
+                // For DUP / RAID1 chunks `prefetch_logical` issues a hint
+                // for every stripe, so the mirror cross-check in
+                // `read_node` later has both copies ready by the time it
+                // asks.  Hints are advisory: ignored where unsupported and
+                // simply wasted where the chunk map can't resolve `logical`
+                // (the subsequent `read_node` will fail loudly anyway).
+                let n = internal.ptrs.len();
+                for (idx, ptr) in internal.ptrs.iter().rev().enumerate() {
+                    // Prefetch only the *next* one or two children — not
+                    // the whole level, which would queue tens of MiB of
+                    // hints on a wide metadata leaf before we even get to
+                    // visit them (and could blow the kernel's readahead
+                    // window, evicting the cache for *this* walk's own
+                    // earlier pages).  Two-deep ahead keeps the seek stall
+                    // at most one node on HDD without spamming the disk:
+                    //   pop() -> child #1 already prefetched and in cache
+                    //   parse  -> child #2 prefetch issues now
+                    //   pop()  -> child #2 cached, child #3 prefetch issued
+                    //   ...
+                    // Top two in reverse == the *next two* in pop order.
+                    if idx < 2 || n <= 4 {
+                        reader.prefetch_logical(chunk_map, ptr.blockptr, reader.node_size());
+                    }
                     queue.push(NodeRef {
                         logical: ptr.blockptr,
                         exp_gen: Some(ptr.generation),

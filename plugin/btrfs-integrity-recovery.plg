@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.07.19b">
-<!ENTITY bundleversion "2026.07.19b">
+<!ENTITY version       "2026.07.20">
+<!ENTITY bundleversion "2026.07.20">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,47 @@
 
 <CHANGES>
 ##&name;
+
+###2026.07.20
+- HDD read-prefetch overhaul (additive on top of 2026.07.19b's
+  reader-thread + parallel-checksum pipeline):
+  - Metadata-walk prefetch: `walk_leaves` now issues
+    `posix_fadvise(POSIX_FADV_WILLNEED)` for the next 2 child pointers
+    queued (chunk-map-aware, all DUP/RAID1 metadata stripes hinted)
+    before pop()'ing each node. Single hook back-propagates to ALL
+    metadata walks (open-time CHUNK/ROOT/DEV sweeps, the once-only
+    CSUM-tree header sweep, every per-dev-extent `LazyCsumProvider::range`
+    streaming call, and the EXTENT_TREE reconfirm walk). On HDD the
+    bulk-data DEV-tree sweep was already sequential; the seek-dominated
+    remaining cost was the scattered metadata reads — each `WILLNEED`
+    hint is one nodesize block (<=64 KiB), well inside the kernel's 1-MiB
+    readahead cap, so the disk starts fetching the next leaf while we
+    parse + cross-check the current one.
+  - Reader-thread prefetch + page-cache hygiene: the bulk-read reader
+    thread (which bypasses `FsReader::read_physical`) now issues
+    `advise_willneed(off + len, min(len, 64 MiB))` before each `read_at`
+    (restoring the prefetch behaviour `read_physical` has on the inline
+    path) and `advise_dontneed(off, len)` after each read, so a multi-TiB
+    one-pass scrub does not progressively evict every other cached page
+    behind itself as it walks.
+  - Cross-dev-extent lookahead: `scrub_dev_tree`'s outer dev-extent loop
+    prefetches the first run of dev-extent N+1 before streaming chunk
+    N's csum-tree entries — closes the gap where a long BLAKE2/SHA256
+    checksum window crosses a chunk boundary into a new `dext` and the
+    previous in-chunk prefetch hint has been consumed.
+  - `FsReader` exposes `prefetch_logical(&ChunkMap, logical, len)` and
+    `evict_physical_range(phys, len)`, plus `pub(crate)` fns
+    `advise_willneed` / `advise_dontneed` so the reader thread's own
+    dup'd `File` (which does not go through `FsReader::read_physical`)
+    can hint / no-op the kernel directly. All hints are advisory,
+    gated `#[cfg(unix)]`.
+- Memory invariants unchanged: depth-1 channels + MAX_RUN_SECTORS = 64
+  MiB per run, peak RAM still <= 2 x 64 MiB = 128 MiB at default cap,
+  independent of disk size. Prefetch hints are page-cache effects only,
+  not user-space allocations.
+- Verified: matrix TOTAL=30 PASS=27 FAIL=0 SKIPPED(unverified)=3,
+  byte-for-byte parity with `btrfs check --readonly --check-data-csum`
+  preserved.
 
 ###2026.07.19b
 - Throughput overhaul:

@@ -33,7 +33,7 @@ use super::util::read_at;
 #[cfg(unix)]
 fn advise_sequential(file: &File) {
     use std::os::fd::AsRawFd;
-    // nix 0.29 exposes POSIX_FADV_SEQUENTIAL / WILLNEED.
+    // nix 0.29 exposes POSIX_FADV_SEQUENTIAL / WILLNEED / DONTNEED.
     let _ = nix::fcntl::posix_fadvise(
         file.as_raw_fd(),
         0,
@@ -46,10 +46,19 @@ fn advise_sequential(file: &File) {
 /// read — tells the kernel to start fetching it asynchronously while
 /// we checksum the previous run.  `offset`/`len` are in bytes from the
 /// start of the backing store (BEFORE `base_offset`; the caller has
-/// already added `base_offset` if needed).  Used only by the bulk data
-/// scrub loop; never per-sector.
+/// already added `base_offset` if needed).  Used by the bulk data scrub
+/// loop's [`crate::btrfs::reader::FsReader::read_physical`] and by the
+/// scrub-reader thread (see `scrub.rs`); never per-sector.
+///
+/// `pub(crate)` so the scrub-reader thread (in `scrub.rs`, owns its own
+/// dup'd `File` that does not go through `FsReader::read_physical`) can
+/// issue the same read-ahead hint.  This restores the prefetch behaviour
+/// on the pipelined path — without it the reader thread's `read_at`
+/// (the free function in `util.rs`) doesn't hint the kernel at all, and
+/// at 200 MB/s HDD + multi-second SHA256/BLAKE2 checksum windows the disk
+/// sits idle for ~99% of the checksum window between runs.
 #[cfg(unix)]
-fn advise_willneed(file: &File, offset: u64, len: u64) {
+pub(crate) fn advise_willneed(file: &File, offset: u64, len: u64) {
     use std::os::fd::AsRawFd;
     if len == 0 {
         return;
@@ -61,6 +70,42 @@ fn advise_willneed(file: &File, offset: u64, len: u64) {
         nix::fcntl::PosixFadviseAdvice::POSIX_FADV_WILLNEED,
     );
 }
+
+/// Issue `POSIX_FADV_DONTNEED` for the byte range the scrub has finished
+/// with — tells the kernel it can evict those pages from the page cache
+/// immediately, so a long single-pass scrub (front-to-back over a multi-
+/// TiB disk) does NOT displace every other cached page behind itself as
+/// it walks.  `offset`/`len` are in bytes from the start of the backing
+/// store (BEFORE `base_offset`; the caller has already added `base_offset`
+/// if needed).  Particularly valuable on HDDs where a one-pass scrub of a
+/// full disk would otherwise push the entire page cache through random
+/// disk-backed pages — a tiny `DONTNEED` for each run as we finish it
+/// keeps the cache warm for the unrelated system workloads running during
+/// a long scrub.  No-op on platforms without `posix_fadvise`.
+/// `pub(crate)` so the scrub-reader thread can drop the pages it just
+/// finished issuing back to the main thread (the main `FsReader` is not
+/// the file handle the read came from — only the reader thread's dup'd
+/// fd actually has those pages mapped under it).
+#[cfg(unix)]
+pub(crate) fn advise_dontneed(file: &File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return;
+    }
+    let _ = nix::fcntl::posix_fadvise(
+        file.as_raw_fd(),
+        offset as i64,
+        len as i64,
+        nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    );
+}
+
+#[cfg(not(unix))]
+fn advise_sequential(_file: &File) {}
+#[cfg(not(unix))]
+fn advise_willneed(_file: &File, _offset: u64, _len: u64) {}
+#[cfg(not(unix))]
+fn advise_dontneed(_file: &File, _offset: u64, _len: u64) {}
 
 /// Sentinel `expected_generation` meaning "do not generation-check".  Passed
 /// by callers that do not yet know the correct generation (e.g. the
@@ -319,6 +364,63 @@ impl FsReader {
     /// (callers verify the header checksum themselves).
     pub fn read_physical_raw(&mut self, phys: u64, n: usize) -> std::io::Result<Vec<u8>> {
         read_at(&mut self.fp, self.base_offset + phys, n)
+    }
+
+    /// Hint the kernel to asynchronously prefetch the metadata block at
+    /// `logical`, *before* a subsequent [`FsReader::read_node`] call asks
+    /// for it synchronously.  Issues `POSIX_FADV_WILLNEED` for **every
+    /// stripe** of the chunk the block lies in (so a DUP / RAID1 metadata
+    /// chunk asks the kernel to fetch all mirror copies in parallel —
+    /// `read_node`'s mirror cross-check then reads whichever validates,
+    /// without paying the seek for the first copy first).  No-op where
+    /// `posix_fadvise` is unavailable, and no-op if `logical` is not covered
+    /// by any recorded chunk (silently — the caller will fail on the
+    /// subsequent `read_node` anyway, and we don't want to mask that).
+    ///
+    /// This is the single hook the metadata-tree walker calls one step
+    /// ahead of its actual read.  On HDDs the bulk-data DEV-tree-driven
+    /// sweep is already sequential (the kernel's `POSIX_FADV_SEQUENTIAL`
+    /// read-ahead handles that), so the seek-dominated part of a multi-TB
+    /// scrub's *idle* time is the scattered metadata walks — CHUNK/DEV/
+    /// CSUM/EXTENT/ROOT trees, each node up to `nodesize` (≤64 KiB).  One
+    /// `WILLNEED` per child pointer issued before parsing the parent's
+    /// siblings gives the disk a one-step-ahead command queue: while we
+    /// parse + cross-check stripe K, stripes K+1, K+2, … are already
+    /// being pulled into the page cache.  The 1-MiB cap on `WILLNEED`'s
+    /// effective read-ahead window is irrelevant here — each `nodesize`
+    /// block fits well inside it (a single 64 KiB hint is fully served).
+    pub fn prefetch_logical(&self, chunk_map: &ChunkMap, logical: u64, len: usize) {
+        let Some(stripes) = chunk_map.lookup_stripes(logical) else {
+            return;
+        };
+        let len = len as u64;
+        for (_devid, phys) in stripes {
+            let off = self.base_offset.saturating_add(phys);
+            // Cap the hint to the chunk's actual physical extent (a
+            // metadata chunk's stripes are all `chunk.len` long, so length
+            // == min(requested, chunk.len - log_offset)) — `lookup_stripes`
+            // already added `log_offset` to each stripe's start.
+            advise_willneed(&self.fp, off, len);
+        }
+    }
+
+    /// Hint the kernel to drop the page-cache pages backing the bulk-data
+    /// range the scrub has just finished checksumming, so a long single-pass
+    /// scrub of a multi-TiB disk does not progressively evict every other
+    /// cached page behind itself as it walks.  The reader thread in
+    /// `scrub_dev_tree` calls this with `(phys, len)` in **partition space**
+    /// (the same coordinate as the `ReadCmd`; `base_offset` is added here).
+    ///
+    /// `POSIX_FADV_DONTNEED` is a hint, not a flush — pages that are still
+    /// mapped/dirty stay put; we only ask the kernel to demote clean,
+    /// read-only bulk-data pages.  Safe against the reconfirm path, which
+    /// re-reads *metadata* trees (different ranges), not the data ranges
+    /// we just hinted away.
+    ///
+    /// No-op on platforms without `posix_fadvise`.
+    pub fn evict_physical_range(&self, phys: u64, len: usize) {
+        let off = self.base_offset.saturating_add(phys);
+        advise_dontneed(&self.fp, off, len as u64);
     }
 
     /// Borrow the checksum strategy (algorithm + sector size) this reader

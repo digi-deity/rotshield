@@ -290,6 +290,14 @@ where
         .name("scrub-reader".into())
         .spawn(move || {
             let mut f = reader_file;
+            // Read-ahead hint cap.  Matches `MAX_RUN_SECTORS × sector_size`
+            // (64 MiB at 4 KiB sectors) — the same cap `read_physical`
+            // uses.  Larger than that and the kernel's readahead queue
+            // would either spill pages or stall on its own internal
+            // limit; smaller and a long checksum window (BLAKE2/SHA256
+            // over 64 MiB takes seconds on a single core) would let the
+            // disk go idle before the next run is dispatched.
+            const READAHEAD_CAP: u64 = 64 << 20; // 64 MiB
             while let Ok(cmd) = cmd_rx.recv() {
                 // `read_at` does seek+read_exact; the offset is in bytes
                 // from the start of the backing store, so we add
@@ -297,6 +305,28 @@ where
                 // here — same as `FsReader::read_physical` does.  `phys`
                 // in `ReadCmd` is already in array-partition space.
                 let off = base_offset.saturating_add(cmd.phys);
+
+                // Prefetch the NEXT contiguous range — the bytes
+                // immediately after this run.  On HDD this keeps the disk
+                // busy during the long CPU-bound checksum window that
+                // will follow on the main thread.  The kernel's readahead
+                // cap is ~1 MiB, but the hint is per-call: it instructs
+                // the kernel to keep extending its readahead window for
+                // the duration of this hint, which the page-cache layer
+                // uses to size the elevator.  The hint is a no-op where
+                // `posix_fadvise` is unavailable.  We hint immediately
+                // `off + len` onward (the byte right after we finish),
+                // capped to READAHEAD_CAP — same pattern the inline
+                // `FsReader::read_physical` uses, so the pipelined path
+                // (which calls `util::read_at` directly) does not lose the
+                // prefetch it previously got implicitly via `read_physical`.
+                let readahead = (cmd.len as u64).min(READAHEAD_CAP);
+                crate::btrfs::reader::advise_willneed(
+                    &f,
+                    off.saturating_add(cmd.len as u64),
+                    readahead,
+                );
+
                 let rsp = match read_at(&mut f, off, cmd.len) {
                     Ok(buf) => ReadRsp::Ok {
                         buf,
@@ -309,6 +339,19 @@ where
                         err: e,
                     },
                 };
+                // Now that we have the bytes in user space, drop the page-
+                // cache backing we just consumed.  The bytes are about to
+                // be checksummed on the main thread and won't be re-read
+                // by anything else during this scrub pass — the data is
+                // physically front-to-back, the NEXT read starts at `off
+                // + len`, so we never re-visit.  Hinting DONTNEED here
+                // keeps a multi-TiB scrub from displacing every other
+                // cached page behind itself (the reconfirm path's
+                // metadata reads, the OS's filesystem cache for other
+                // workloads, etc.).  No-op where `posix_fadvise` is
+                // unavailable.
+                crate::btrfs::reader::advise_dontneed(&f, off, cmd.len as u64);
+
                 if rsp_tx.send(rsp).is_err() {
                     break;
                 }
@@ -323,7 +366,7 @@ where
     // very first flush has no previous result to process.
     let mut pending: Option<ReadRsp> = None;
 
-    for dext in dev_extents {
+    for (dev_extent_idx, dext) in dev_extents.iter().enumerate() {
         // Resolve the owning chunk.  Every dev-extent must have a matching
         // chunk item; if not, the chunk map is inconsistent with the dev
         // tree and we cannot map this extent — bail loudly rather than
@@ -339,6 +382,14 @@ where
             }
         };
 
+        // Index of this dev-extent in `dev_extents`, used by the
+        // look-ahead prefetch below to find the *next* dev-extent's
+        // physical start so we can `WILLNEED` it before the long
+        // checksum window of this chunk's runs lets the disk go idle.
+        // `iter().position(|d| ...)` would re-walk; carrying the index
+        // via enumerate is O(1) and keeps the prefetch lookahead tight.
+        let current_dev_extent_idx = dev_extent_idx;
+
         // Only scrub DATA chunks here (metadata/system handled elsewhere,
         // and they carry no csum-tree entries anyway).
         if chunk.flags & bg_flag::DATA == 0 {
@@ -347,6 +398,47 @@ where
 
         let logical_lo = dext.chunk_offset;
         let logical_hi = dext.chunk_offset + dext.length;
+
+        // Look-ahead prefetch: hint the kernel to start pulling the *next*
+        // dev-extent's first sector while we're still streaming the csum
+        // entries (and issuing run reads) for the current one.  On HDD the
+        // checksum window for a 64-MiB BLAKE2 run is multiple seconds, and
+        // Step 3's `advise_willneed(off + len, ...)` only prefetches the
+        // next contiguous range *within this chunk* — once we cross the
+        // chunk boundary into a different `dext`, the previous hint does
+        // not cover the new physical start.  Hinting the next dev-extent's
+        // first run here means the disk has its first pages cached before
+        // the reader thread ever issues the read for it.  The kernel's
+        // `WILLNEED` cap (~1 MiB) is plenty for a single first-run hint;
+        // for the long-tail of subsequent runs inside that chunk, Step 3's
+        // `advise_willneed(off + len, ...)` keeps the read-ahead going.
+        //
+        // The hint is bounded: we only prefetch the first `MAX_RUN_SECTORS
+        // × sector_size` (64 MiB at the default cap) of the next dev-extent
+        // — exactly one run's worth, matching `MAX_RUN_SECTORS`.  Memory
+        // budget unchanged: the prefetch fills page-cache pages, which the
+        // reader thread will immediately `advise_dontneed` after it
+        // consumes them, so steady-state RAM stays at the same 2×
+        // MAX_RUN_SECTORS bound.  We skip the hint when the next dev-extent
+        // is the *same* physical run (no gap to bridge) or when there is
+        // no next dev-extent (last one — nothing to prefetch).
+        let next_idx = current_dev_extent_idx + 1;
+        if next_idx < dev_extents.len() {
+            let next = &dev_extents[next_idx];
+            // Only DATA chunks carry bulk reads, so only hint DATA
+            // dev-extents.  Resolving the chunk flag here is the same
+            // `chunk_map.info` call the next loop iteration will do
+            // anyway, so we're not paying for a metadata walk that
+            // wouldn't otherwise happen — we're just shifting it earlier.
+            if let Some(next_chunk) = chunk_map.info(next.chunk_offset)
+                && next_chunk.flags & bg_flag::DATA != 0
+            {
+                let hint_len = (next.length as usize)
+                    .min(MAX_RUN_SECTORS * sz)
+                    .max(strategy.sector_size as usize);
+                reader.prefetch_logical(chunk_map, next.chunk_offset, hint_len);
+            }
+        }
 
         // Run-coalescing state.  Consecutive csum entries that are
         // physically contiguous (`next_logical == sector_logical +
@@ -390,8 +482,14 @@ where
             //    the reader reads the just-sent cmd from disk.
             if let Some(rsp) = pending.take() {
                 process_rsp(
-                    rsp, reader, chunk_map, strategy, batch, &mut freeze,
-                    &mut on_sector, &mut stats,
+                    rsp,
+                    reader,
+                    chunk_map,
+                    strategy,
+                    batch,
+                    &mut freeze,
+                    &mut on_sector,
+                    &mut stats,
                 );
             }
             // 3. Pull the just-sent cmd's response — block until reader done.
@@ -423,8 +521,14 @@ where
     // thread sees channel close and exits cleanly.
     if let Some(rsp) = pending.take() {
         process_rsp(
-            rsp, reader, chunk_map, strategy, batch, &mut freeze,
-            &mut on_sector, &mut stats,
+            rsp,
+            reader,
+            chunk_map,
+            strategy,
+            batch,
+            &mut freeze,
+            &mut on_sector,
+            &mut stats,
         );
     }
     drop(cmd_tx);
@@ -484,8 +588,16 @@ where
             let run_len = run.len() * sz;
             match reader.read_physical(dext.devid, run_phys, run_len) {
                 Ok(buf) => process_buf(
-                    &buf, run, dext, strategy, batch, &mut freeze,
-                    reader, chunk_map, &mut on_sector, &mut stats,
+                    &buf,
+                    run,
+                    dext,
+                    strategy,
+                    batch,
+                    &mut freeze,
+                    reader,
+                    chunk_map,
+                    &mut on_sector,
+                    &mut stats,
                 ),
                 Err(e) => {
                     for (sector_logical, _stored) in run.iter() {
@@ -548,8 +660,7 @@ fn process_buf(
     // algorithm (no per-algo dispatch, per the design call) so the code
     // stays one path.
     let actuals: Vec<Vec<u8>> = if run.len() >= PARALLEL_MIN_SECTORS {
-        let slices: Vec<(usize, usize)> =
-            (0..run.len()).map(|i| (i * sz, (i + 1) * sz)).collect();
+        let slices: Vec<(usize, usize)> = (0..run.len()).map(|i| (i * sz, (i + 1) * sz)).collect();
         slices
             .par_iter()
             .map(|&(s, e)| strategy.compute(&buf[s..e]))
@@ -596,15 +707,22 @@ fn process_buf(
             // reconfirm+write window.
             let _freeze_guard = freeze.as_mut().and_then(|fc| fc.guard());
             let is_corruption = match crate::btrfs::open::live_data_tree_roots(
-                reader, chunk_map, reader.base_offset(),
+                reader,
+                chunk_map,
+                reader.base_offset(),
             ) {
                 Some((ext_root, csum_root)) => {
                     use crate::btrfs::extent::reconfirm_mismatch;
                     matches!(
                         reconfirm_mismatch(
-                            reader, chunk_map, ext_root, csum_root,
-                            *sector_logical, stored,
-                            strategy.hash_len, strategy.sector_size,
+                            reader,
+                            chunk_map,
+                            ext_root,
+                            csum_root,
+                            *sector_logical,
+                            stored,
+                            strategy.hash_len,
+                            strategy.sector_size,
                         ),
                         crate::btrfs::extent::Reconfirm::Corruption
                     )
@@ -651,8 +769,7 @@ fn process_rsp(
     match rsp {
         ReadRsp::Ok { buf, dext, entries } => {
             process_buf(
-                &buf, &entries, &dext, strategy, batch, freeze,
-                reader, chunk_map, on_sector, stats,
+                &buf, &entries, &dext, strategy, batch, freeze, reader, chunk_map, on_sector, stats,
             );
         }
         ReadRsp::Err { dext, entries, err } => {
