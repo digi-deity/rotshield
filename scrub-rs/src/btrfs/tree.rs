@@ -6,6 +6,7 @@
 //! interest.
 
 use super::chunk::ChunkMap;
+use super::key::Key;
 use super::node::{Leaf, Node};
 use super::reader::FsReader;
 
@@ -75,6 +76,76 @@ pub fn walk_leaves<F, E, M>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
+    f: F,
+    on_metadata_error: E,
+    on_mirror_mismatch: M,
+) -> std::io::Result<()>
+where
+    F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
+    E: FnMut(u64),
+    M: FnMut(u64),
+{
+    walk_leaves_impl(
+        reader,
+        chunk_map,
+        root_logical,
+        None,
+        f,
+        on_metadata_error,
+        on_mirror_mismatch,
+    )
+}
+
+/// Like [`walk_leaves`], but prunes any subtree whose key range cannot
+/// overlap the half-open window `[key_lo, key_hi)`.
+///
+/// Internal nodes store key pointers in ascending key order (a btrfs
+/// invariant), so child `i`'s key range is `[ptrs[i].key, ptrs[i+1].key)`
+/// (or `[ptrs[i].key, +inf)` for the last child). A child is skipped —
+/// not queued, not read, not prefetched — when its range cannot possibly
+/// overlap `[key_lo, key_hi)`.
+///
+/// This exists because a naive `walk_leaves` call re-walks the **entire**
+/// tree from the root every time — fine for a once-per-open walk (CHUNK/
+/// ROOT/DEV trees), but ruinous for [`crate::btrfs::csum::LazyCsumProvider::range`],
+/// which is called once per dev-extent: on a fragmented filesystem with N
+/// dev-extents, an unbounded walk costs O(N × tree_size) — the entire
+/// CSUM_TREE gets re-read and re-parsed N times, dwarfing the actual data
+/// read/checksum work and pinning a single CPU core in tree-parsing for
+/// the whole scrub. Bounding the descent to the requested key window
+/// turns each call into O(range_size + log(tree_size)), independent of N.
+#[allow(clippy::too_many_arguments)]
+pub fn walk_leaves_range<F, E, M>(
+    reader: &mut FsReader,
+    chunk_map: &ChunkMap,
+    root_logical: u64,
+    key_lo: Key,
+    key_hi: Key,
+    f: F,
+    on_metadata_error: E,
+    on_mirror_mismatch: M,
+) -> std::io::Result<()>
+where
+    F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
+    E: FnMut(u64),
+    M: FnMut(u64),
+{
+    walk_leaves_impl(
+        reader,
+        chunk_map,
+        root_logical,
+        Some((key_lo, key_hi)),
+        f,
+        on_metadata_error,
+        on_mirror_mismatch,
+    )
+}
+
+fn walk_leaves_impl<F, E, M>(
+    reader: &mut FsReader,
+    chunk_map: &ChunkMap,
+    root_logical: u64,
+    bounds: Option<(Key, Key)>,
     mut f: F,
     mut on_metadata_error: E,
     mut on_mirror_mismatch: M,
@@ -160,19 +231,28 @@ where
                 // simply wasted where the chunk map can't resolve `logical`
                 // (the subsequent `read_node` will fail loudly anyway).
                 let n = internal.ptrs.len();
-                for (idx, ptr) in internal.ptrs.iter().rev().enumerate() {
+                for (idx, ptr) in internal.ptrs.iter().enumerate().rev() {
+                    // Bounded walk: skip any child whose key range cannot
+                    // overlap the requested `[key_lo, key_hi)` window.
+                    // Children are stored in ascending key order, so child
+                    // `idx`'s range is `[ptr.key, next_ptr.key)` (or
+                    // `[ptr.key, +inf)` for the last child).
+                    if let Some((key_lo, key_hi)) = bounds {
+                        let child_lo = ptr.key;
+                        let child_hi = internal.ptrs.get(idx + 1).map(|p| p.key);
+                        let below = child_hi.is_some_and(|hi| hi <= key_lo);
+                        let above = child_lo >= key_hi;
+                        if below || above {
+                            continue;
+                        }
+                    }
                     // Prefetch only the *next* one or two children — not
                     // the whole level, which would queue tens of MiB of
                     // hints on a wide metadata leaf before we even get to
                     // visit them (and could blow the kernel's readahead
                     // window, evicting the cache for *this* walk's own
                     // earlier pages).  Two-deep ahead keeps the seek stall
-                    // at most one node on HDD without spamming the disk:
-                    //   pop() -> child #1 already prefetched and in cache
-                    //   parse  -> child #2 prefetch issues now
-                    //   pop()  -> child #2 cached, child #3 prefetch issued
-                    //   ...
-                    // Top two in reverse == the *next two* in pop order.
+                    // at most one node on HDD without spamming the disk.
                     if idx < 2 || n <= 4 {
                         reader.prefetch_logical(chunk_map, ptr.blockptr, reader.node_size());
                     }

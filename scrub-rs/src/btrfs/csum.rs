@@ -39,9 +39,9 @@ use std::collections::BTreeMap;
 
 use super::chunk::ChunkMap;
 use super::csum_strategy::CsumStrategy;
-use super::key::key_type;
+use super::key::{Key, key_type, objectid};
 use super::reader::FsReader;
-use super::tree::walk_leaves;
+use super::tree::{walk_leaves, walk_leaves_range};
 
 /// Map from sector-aligned logical address → stored checksum bytes.
 ///
@@ -275,6 +275,20 @@ impl LazyCsumProvider {
     /// an `Iterator`) sidesteps the lifetime gymnastics that an owning
     /// iterator over a `&mut FsReader` would require, and matches the
     /// existing [`walk_leaves`] callback convention.
+    ///
+    /// **Bounded, not a full-tree walk.**  Uses [`walk_leaves_range`] rather
+    /// than [`walk_leaves`] to prune any CSUM_TREE subtree whose key range
+    /// cannot contain an item overlapping `[logical_lo, logical_hi)` — a
+    /// plain `walk_leaves` call here would re-read and re-parse the
+    /// **entire** CSUM_TREE on every single dev-extent, i.e. O(dev_extents
+    /// × tree_size) total work, which dominates the scrub's wall time on
+    /// any filesystem with more than a handful of dev-extents and pins one
+    /// CPU core in tree-parsing for the whole run. The lower bound is
+    /// widened by `max_item_span` (the largest number of sectors a single
+    /// EXTENT_CSUM item can cover, bounded by `node_size / hash_len`) so an
+    /// item that starts before `logical_lo` but extends into the range is
+    /// never pruned away — see [`walk_leaves_range`] for the pruning
+    /// contract.
     pub fn range<F>(&mut self, logical_lo: u64, logical_hi: u64, mut emit: F)
     where
         F: FnMut(CsumEntry),
@@ -282,11 +296,32 @@ impl LazyCsumProvider {
         let hash_len = self.strategy.hash_len;
         let sector_size = self.strategy.sector_size;
         let csum_root = self.csum_root;
+        // Widen the lower bound by the largest number of bytes a single
+        // EXTENT_CSUM item can cover, so an item that starts before
+        // `logical_lo` but extends into the requested range is never
+        // pruned away by `walk_leaves_range`'s key-based descent (see that
+        // function's doc comment for the pruning contract). An item's
+        // packed csum payload can't exceed one node's worth of bytes, so
+        // `node_size / hash_len` sectors is a safe (if slightly generous)
+        // upper bound on its span.
+        let max_item_span = (self.reader.node_size() as u64 / hash_len as u64) * sector_size;
+        let key_lo = Key::new(
+            objectid::EXTENT_CSUM_OBJECTID,
+            key_type::EXTENT_CSUM,
+            logical_lo.saturating_sub(max_item_span),
+        );
+        let key_hi = Key::new(
+            objectid::EXTENT_CSUM_OBJECTID,
+            key_type::EXTENT_CSUM,
+            logical_hi,
+        );
         let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
-        let res = walk_leaves(
+        let res = walk_leaves_range(
             &mut self.reader,
             &self.chunk_map,
             csum_root,
+            key_lo,
+            key_hi,
             |_r, leaf, _leaf_logical| {
                 for i in 0..leaf.slots.len() {
                     let slot = leaf.slots[i];

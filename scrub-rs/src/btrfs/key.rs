@@ -60,7 +60,14 @@ pub mod bg_flag {
 }
 
 /// A btrfs disk key: (objectid, type, offset).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Ord`/`PartialOrd` compare lexicographically on `(objectid, ty, offset)`
+/// — the same ordering btrfs itself uses to sort items within a node and
+/// key pointers within an internal node. This lets tree walkers prune
+/// subtrees whose key range cannot overlap a requested `[key_lo, key_hi)`
+/// window (see [`super::tree::walk_leaves_range`]) without needing to know
+/// anything about a specific tree's item layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Key {
     pub objectid: u64,
     pub ty: u8,
