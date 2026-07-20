@@ -97,6 +97,7 @@
 //! fix a botched recovery.  This mirrors the Python `recover.py`, which
 //! opens the raw rdev directly for the same reason.
 
+pub mod canary;
 pub mod config;
 pub mod parity;
 pub mod resolve;

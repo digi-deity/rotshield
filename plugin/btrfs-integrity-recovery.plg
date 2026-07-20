@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.07.20c">
-<!ENTITY bundleversion "2026.07.20c">
+<!ENTITY version       "2026.07.20d">
+<!ENTITY bundleversion "2026.07.20d">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,24 @@
 
 <CHANGES>
 ##&name;
+
+###2026.07.20d
+- Plugin: replace the custom inline help popovers with the standard unRAID/
+  Dynamix help system. Every Settings option now uses a `<div class="help">`
+  block toggled by the built-in unRAID **Help** button (no custom CSS/JS).
+- Plugin: change Target disk(s) from a multi-select dropdown to per-disk
+  checkboxes (more intuitive; same `devices[]` POST handling).
+- Plugin: revert run-log naming to `run-<timestamp>.log` (no disk-set suffix);
+  each run is one combined log covering all selected disks, so the suffix
+  added noise without value.
+- Plugin: fix a stray premature `</table>` on the Settings page that had
+  orphaned the lower option rows outside the table.
+- scrub-rs: add an advisory **parity canary** check at scrub start. Before the
+  full scrub, scrub-rs reconstructs the target disk's superblock block from the
+  other data disks + primary parity (the same machinery recovery depends on)
+  and verifies the btrfs magic. A mismatch warns loudly that the array
+  config/slot/parity may be misconfigured, but does not abort the run — the
+  scrub still proceeds so the operator sees the actual data state.
 
 ###2026.07.20c
 - Plugin: schedule rework. Removed the `daily` preset (a scrub can take

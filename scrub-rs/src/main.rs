@@ -309,6 +309,60 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             }
         }
     };
+
+    // Early canary: before committing to a full scrub + recovery pass, prove
+    // the array config is actually sound.  We reconstruct the target disk's
+    // superblock block from the *other* data disks + primary parity (the
+    // exact machinery recovery depends on) and check whether the result
+    // carries the btrfs magic.  A match means the slot, offsets, and parity
+    // are all consistent — if they weren't, every later recovery attempt
+    // would be built on a misconfigured array.  This is a cheap, early
+    // smoke test of the environment/config, not a correctness guarantee of
+    // the data itself (the real scrub still runs in full when the canary
+    // passes).  It is FATAL: a failure means the array config, slot, or
+    // parity is misconfigured, so any recovery we attempt later would be
+    // built on sand — we abort with EXIT_RUNTIME_ERROR rather than produce
+    // misleading results.  Only runs when we have an array config and a
+    // recognized data-disk slot (otherwise there's nothing to reconstruct
+    // against, and a single-disk/offline run is allowed to proceed).
+    if let (Some(cfg), slot) = (cfg.as_ref(), scrub_slot)
+        && slot != 0
+    {
+        const SB_BLOCK: usize = 4096;
+        match array::canary::reconstruct_block(
+            cfg,
+            slot,
+            btrfs::superblock::SUPERBLOCK_OFFSET,
+            SB_BLOCK,
+        ) {
+            Ok(block) => {
+                if btrfs::superblock::has_magic_at(&block, btrfs::superblock::OFF_MAGIC) {
+                    println!(
+                        "\ncanary         : OK — parity reconstructed the target \
+                         superblock and it carries the btrfs magic (array config sound)"
+                    );
+                } else {
+                    eprintln!(
+                        "\n[CANARY FATAL] parity reconstructed the target superblock \
+                         block but it does NOT carry the btrfs magic. The array config, \
+                         slot, or parity is misconfigured (stale/out-of-sync parity, \
+                         wrong rdevOffset, or wrong disk). Aborting: any recovery would \
+                         be built on a broken array config."
+                    );
+                    return ExitCode::from(EXIT_RUNTIME_ERROR);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "\n[CANARY FATAL] could not reconstruct the target superblock from \
+                     parity ({e}). The array config or parity is misconfigured. \
+                     Aborting: any recovery would be built on a broken array config."
+                );
+                return ExitCode::from(EXIT_RUNTIME_ERROR);
+            }
+        }
+    }
+
     println!(
         "\nscrubbing{}:",
         if dry_run {

@@ -27,6 +27,20 @@ pub const SUPERBLOCK_BACKUP_OFFSETS: &[u64] = &[
 ];
 /// btrfs magic bytes.
 pub const BTRFS_MAGIC: [u8; 8] = *b"_BHRfS_M";
+
+/// Check whether `buf` contains the btrfs magic at `offset`.
+///
+/// Filesystem-agnostic callers (e.g. the array-side startup canary, which
+/// reconstructs a block from parity and needs to know whether the result
+/// looks like a real btrfs superblock) use this instead of reaching into
+/// the superblock parser.  The magic bytes live in the `btrfs/` module
+/// because they are filesystem-format knowledge; the array layer never
+/// imports them directly — it returns raw bytes and lets the caller decide
+/// what "valid" means.
+pub fn has_magic_at(buf: &[u8], offset: usize) -> bool {
+    buf.len() >= offset + BTRFS_MAGIC.len()
+        && buf[offset..offset + BTRFS_MAGIC.len()] == BTRFS_MAGIC
+}
 /// Bytes of CRC32C stored at the start of a metadata/superblock header.
 pub const BTRFS_CSUM_SIZE: usize = 32;
 /// Size of a btrfs data sector (checksum granularity).
@@ -95,7 +109,10 @@ pub struct Superblock {
 //   +199 chunk_root_level u8
 const OFF_FSID: usize = 32;
 const OFF_BYTENR: usize = 48;
-const OFF_MAGIC: usize = 64;
+/// Offset of the magic field inside the superblock block.  Public so
+/// filesystem-agnostic callers (e.g. the array-side startup canary) can
+/// locate the magic after reconstructing a block from parity.
+pub const OFF_MAGIC: usize = 64;
 const OFF_GENERATION: usize = 72;
 const OFF_ROOT: usize = 80;
 const OFF_CHUNK_ROOT: usize = 88;
