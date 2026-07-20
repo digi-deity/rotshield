@@ -10,6 +10,35 @@ pub fn read_at<R: Read + Seek>(fp: &mut R, offset: u64, n: usize) -> io::Result<
     Ok(buf)
 }
 
+/// Read `n` bytes at `offset` from `fp` using a **positional** read
+/// (`pread`), which does not consult or mutate the file's cursor.
+///
+/// This matters because `File::try_clone` (used to hand the scrub reader
+/// thread its own file handle — see `scrub::scrub_dev_tree`) dupes the fd
+/// but — per `std::fs::File::try_clone`'s documented behaviour — the
+/// clone **shares the same underlying open-file-description, including the
+/// seek position**, with the original.  [`read_at`] above is seek-based
+/// (`seek` + `read_exact`), so if the main thread and the reader thread
+/// both call it concurrently on their respective handles to the *same*
+/// open file description, one thread's `seek` can land between the other
+/// thread's `seek` and `read_exact`, silently reading the wrong bytes —
+/// producing spurious checksum mismatches that go away at low pipeline
+/// depth (where the two threads happen not to overlap) and reappear as
+/// pipeline depth increases. `pread` reads at an explicit offset without
+/// touching the shared cursor, so concurrent callers never race each
+/// other. Every read that can run concurrently with the scrub reader
+/// thread (i.e. anything through [`crate::btrfs::reader::FsReader`] and
+/// the reader-thread's own reads in `scrub::scrub_dev_tree`) must use
+/// this instead of [`read_at`]. Unix-only (`pread` has no portable
+/// cross-platform equivalent in `std`); this crate targets Linux.
+#[cfg(unix)]
+pub fn pread_at(fp: &std::fs::File, offset: u64, n: usize) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; n];
+    fp.read_exact_at(&mut buf, offset)?;
+    Ok(buf)
+}
+
 pub fn le_u16(buf: &[u8], pos: usize) -> u16 {
     u16::from_le_bytes([buf[pos], buf[pos + 1]])
 }

@@ -24,7 +24,7 @@ use std::fs::File;
 use super::chunk::ChunkMap;
 use super::csum_strategy::CsumStrategy;
 use super::node::Node;
-use super::util::read_at;
+use super::util::pread_at;
 
 /// Issue `POSIX_FADV_SEQUENTIAL` on the reader's backing store so the
 /// kernel's read-ahead window grows.  Cheap and safe on both regular
@@ -304,9 +304,10 @@ impl FsReader {
                 format!("no chunk mapping for logical 0x{logical:x}"),
             )
         })?;
-        // The single point where file-vs-device is irrelevant: `read_at` is
-        // just seek+read on a `std::fs::File`, which works on either.
-        read_at(&mut self.fp, self.base_offset + phys, n)
+        // Positional `pread` — not seek-based — so this never races the
+        // scrub reader thread's concurrent reads on its `try_clone`d
+        // handle to the same open-file-description (see `util::pread_at`).
+        pread_at(&self.fp, self.base_offset + phys, n)
     }
 
     /// Read `n` bytes at **physical** offset `phys` on device `devid`,
@@ -350,7 +351,7 @@ impl FsReader {
             let start = self.base_offset + phys + n as u64;
             advise_willneed(&self.fp, start, readahead);
         }
-        read_at(&mut self.fp, self.base_offset + phys, n)
+        pread_at(&self.fp, self.base_offset + phys, n)
     }
 
     /// Read `n` raw bytes at physical offset `phys` (relative to the
@@ -363,7 +364,7 @@ impl FsReader {
     /// would only add noise.  The bytes returned are the raw on-disk node
     /// (callers verify the header checksum themselves).
     pub fn read_physical_raw(&mut self, phys: u64, n: usize) -> std::io::Result<Vec<u8>> {
-        read_at(&mut self.fp, self.base_offset + phys, n)
+        pread_at(&self.fp, self.base_offset + phys, n)
     }
 
     /// Hint the kernel to asynchronously prefetch the metadata block at
@@ -518,7 +519,7 @@ impl FsReader {
         // valid copies and recording the best buffer, without early exit.
         let mut valid_count: usize = 0;
         for (_devid, phys) in &stripes {
-            let buf = match read_at(&mut self.fp, self.base_offset + phys, self.node_size) {
+            let buf = match pread_at(&self.fp, self.base_offset + phys, self.node_size) {
                 Ok(b) => b,
                 Err(_) => continue,
             };

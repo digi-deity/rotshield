@@ -17,21 +17,28 @@
 //! dedicated **reader thread**: the main thread coalesces contiguous
 //! sectors into runs (bounded by [`MAX_RUN_SECTORS`]), sends each run's
 //! `(devid, phys, len, Vec<(logical, csum)>)` to the reader thread via a
-//! depth-1 command channel, and the reader thread (which owns its own
-//! dup'd `File` handle so its seek position never races the main
-//! reader's metadata walks) issues one `read_at` syscall per run and
-//! sends the bytes back on a depth-1 result channel.  While the main
-//! thread's rayon workers checksum run N (CPU-bound), the reader thread
-//! is already reading run N+1 from the disk (I/O-bound) — the two are
-//! fully decoupled, so the disk stays busy for the whole checksum
-//! window, not just for a 1-MiB `POSIX_FADV_WILLNEED` window as in the
-//! previous kernel-mediated design.  This bridges the gap between
-//! 200 MB/s HDD (1 MiB consumed in ~5 ms) and multi-second SHA256/BLAKE2
-//! checksum windows where the previous design left the disk idle.
-//! Memory stays bounded: depth-1 channels mean at most one run is in
-//! flight on the disk while one is being checksummed in main-thread
-//! memory — peak RAM is ≤ 2 × `MAX_RUN_SECTORS` × `sector_size`
-//! (128 MiB at the default cap), independent of disk size.
+//! bounded command channel (depth [`PREFETCH_DEPTH_FAST`] /
+//! [`PREFETCH_DEPTH_SLOW`], see `prefetch_depth_for`), and the reader
+//! thread (which owns its own dup'd `File` handle so its seek position
+//! never races the main reader's metadata walks — reads on both handles
+//! use `pread`/`util::pread_at`, a *positional* read, never `seek`, since
+//! `try_clone` shares the underlying open-file-description's seek
+//! position with the original) issues one positional read syscall per
+//! run and sends the bytes back on a same-depth result channel.  The main
+//! thread lets up to `prefetch_depth` cmds be outstanding before it
+//! blocks on the oldest response (FIFO order, always via blocking `recv`
+//! — never `try_recv`, which was tried and broke correctness, see
+//! `docs/PROGRESS_HDD_BURST.md`), so the reader thread can race several
+//! runs ahead of the main thread's CPU-bound checksum work instead of a
+//! strict 1:1 lockstep.  This is what keeps the disk busy across the
+//! *whole* multi-second BLAKE2/SHA256 checksum window on HDDs, rather
+//! than just for a single run's `POSIX_FADV_WILLNEED` window (200 MB/s
+//! HDD: 64 MiB run consumed in ~320 ms, checksummed in ~4 s — a depth-1
+//! lockstep leaves the disk idle for ~90% of that window). Memory stays
+//! bounded: at most `prefetch_depth` runs are in flight at once, so peak
+//! RAM is ≤ 2 × `prefetch_depth` × `MAX_RUN_SECTORS` × `sector_size`
+//! (512 MiB at depth 4 / the default `MAX_RUN_SECTORS` cap), independent
+//! of disk size.
 
 use std::sync::mpsc;
 use std::thread;
@@ -44,7 +51,7 @@ use crate::btrfs::csum_strategy::CsumStrategy;
 use crate::btrfs::dev_extent::DevExtent;
 use crate::btrfs::key::bg_flag;
 use crate::btrfs::reader::FsReader;
-use crate::btrfs::util::read_at;
+use crate::btrfs::util::pread_at;
 
 /// Minimum run size (in sectors) before parallel checksumming kicks in.
 /// Below this the per-thread dispatch overhead exceeds the savings, so
@@ -58,6 +65,45 @@ const PARALLEL_MIN_SECTORS: usize = 2;
 /// ~128 MiB at the default cap, independent of disk size.  See
 /// [`scrub_dev_tree`] for the pipeline's bounded-memory invariant.
 const MAX_RUN_SECTORS: usize = 16384; // 16384 * 4096 = 64 MiB at default sector size
+
+/// Pipeline depth (number of in-flight `ReadCmd`s / `ReadRsp`s on each
+/// side of the scrub reader thread).  Greater than 1 lets the reader
+/// thread issue several `read_at`s back-to-back without waiting for the
+/// main thread to finish checksumming the previous run — the key
+/// throughput lever on HDDs where a single 64 MiB BLAKE2/SHA256 run
+/// takes seconds of CPU while a 200 MB/s HDD reads it in ~320 ms, leaving
+/// the disk otherwise idle for ~99% of the checksum window with depth-1
+/// channels (the 2026-07-19 implementation).  Higher depth keeps more
+/// runs pre-buffered in the page cache so the disk stays busy for the
+/// whole checksum window instead of saw-toothing between 240 MB/s bursts
+/// and 0-idle valleys.
+///
+/// Sized per-algorithm to bound memory:
+/// * Slow hashes (sha256, blake2): the checksum window is multi-second,
+///   so the disk needs ~4× the per-run bytes pre-buffered to ride out
+///   one CPU window → depth 4.  Peak RAM: 2 × 4 × 64 MiB = 512 MiB at
+///   default `MAX_RUN_SECTORS`, still bounded and independent of disk
+///   size.
+/// * Fast hashes (crc32c, xxhash): the disk is the bottleneck, so
+///   prefetch buffering > 1 just dirties the cache without throughput
+///   benefit.  Depth 2 gives one run in flight on disk + one ready in
+///   the result queue so the main thread never blocks on the disk head,
+///   without piling up redundancy.  Peak RAM: 2 × 2 × 64 MiB = 256 MiB.
+///
+/// The depth is selected from the strategy at the start of `scrub_dev_tree`
+/// and moved into the channel constructors.  Changing this constant is
+/// the single knob for tuning the throughput-vs-RAM curve.
+const PREFETCH_DEPTH_FAST: usize = 2; // crc32c, xxhash
+const PREFETCH_DEPTH_SLOW: usize = 4; // sha256, blake2
+
+fn prefetch_depth_for(strategy: &CsumStrategy) -> usize {
+    match strategy.name {
+        "sha256" | "blake2" => PREFETCH_DEPTH_SLOW,
+        // crc32c, xxhash, and any future fast hash default to the small
+        // depth — disk-bound algorithms don't benefit from buffering.
+        _ => PREFETCH_DEPTH_FAST,
+    }
+}
 
 /// Command sent to the reader thread: read `len` bytes at `phys` on
 /// `devid`, attached to which dev-extent (`dext_idx`, `dext`) for the
@@ -234,33 +280,46 @@ where
 
     // ----- Reader thread ---------------------------------------------------
     //
-    // Spawn a dedicated reader thread that owns a dup'd `File` (so its
-    // seek position never races the main `FsReader`'s metadata walks —
-    // the reconfirm path on the main thread keeps using `reader`, and the
-    // reader thread keeps using its own dup'd handle).  The main thread
-    // emits a `ReadCmd` per coalesced run on a depth-1 command channel;
-    // the reader issues one `read_at` per run and ships the bytes back on
-    // a depth-1 result channel.
+    // Spawn a dedicated reader thread that owns a dup'd `File`. `try_clone`
+    // shares the same underlying open-file-description (and thus seek
+    // position) with the original — so both this thread's reads and the
+    // main thread's reconfirm reads via `reader` use *positional* reads
+    // (`util::pread_at` / `FsReader::read_physical`, never `seek`) to avoid
+    // racing each other's cursor.  The main thread emits a `ReadCmd` per
+    // coalesced run on a `prefetch_depth`-deep command channel; the reader
+    // issues one positional read per run and ships the bytes back on a
+    // same-depth result channel.
     //
     // Pipeline ordering (the *whole point* of this reader thread):
     //
     //   flush(run_N):
-    //     1. cmd_tx.send(cmd_N)         — reader starts reading cmd_N from disk
-    //     2. process pending(rsp_N-1)  — rayon checksum + reconfirm + emit
-    //     3. pending = rsp_rx.recv()    — block until reader finishes cmd_N
+    //     1. cmd_tx.send(cmd_N)           — reader starts reading cmd_N from disk
+    //     2. if inflight >= prefetch_depth:
+    //          process the OLDEST outstanding response (rayon checksum +
+    //          reconfirm + emit), blocking on `rsp_rx.recv()` if needed
     //
-    // Step 2 runs in parallel with the reader's disk read for cmd_N.  In the
-    // previous design the read and the checksum were serial in user space
-    // (the kernel's 1-MiB `POSIX_FADV_WILLNEED` was the only overlap, and
-    // at 200 MB/s / GB/s disk rates a 1-MiB prefetch window is exhausted
-    // in milliseconds while a 64-MiB SHA256 checksum run takes seconds —
-    // the disk sat idle for ~99% of the checksum window).  The depth-1
-    // channels bound memory so this overlap stays bounded: at most one
-    // run is in flight on the disk while one run is being checksummed +
-    // verified on the main thread.  Peak RAM is
-    // ~2 × `MAX_RUN_SECTORS` × `sector_size` (128 MiB at the default cap),
-    // independent of disk size.
+    // Because responses are consumed strictly FIFO (never `try_recv`, see
+    // `docs/PROGRESS_HDD_BURST.md`), correctness does not depend on depth —
+    // but letting up to `prefetch_depth` cmds accumulate before the first
+    // blocking receive lets the reader thread's disk reads run several
+    // runs ahead of the main thread's CPU-bound checksum work, instead of
+    // stalling on a strict 1:1 send/recv lockstep. In the previous design
+    // the read and the checksum were serial in user space (the kernel's
+    // 1-MiB `POSIX_FADV_WILLNEED` was the only overlap, and at 200 MB/s /
+    // GB/s disk rates a 1-MiB prefetch window is exhausted in milliseconds
+    // while a 64-MiB SHA256 checksum run takes seconds — the disk sat idle
+    // for ~99% of the checksum window, and even a depth-1 pipelined
+    // lockstep still leaves the disk idle between runs once the CPU window
+    // exceeds the disk's per-run read time).  Peak RAM is bounded to
+    // ~2 × `prefetch_depth` × `MAX_RUN_SECTORS` × `sector_size`
+    // (512 MiB at depth 4 / the default cap), independent of disk size.
     let base_offset = reader.base_offset();
+    // Channel depth: tunes the throughput-vs-RAM curve.  Slow hashes
+    // (sha256, blake2) pre-buffer multiple runs so the disk stays busy
+    // during the long CPU checksum window on HDDs; fast hashes (crc32c,
+    // xxhash) keep the depth small because the disk is the bottleneck
+    // and deeper prefetch just dirties cache.  See `prefetch_depth_for`.
+    let prefetch_depth = prefetch_depth_for(strategy);
     let reader_file = match reader.reopen() {
         Ok(f) => f,
         Err(e) => {
@@ -284,26 +343,50 @@ where
             );
         }
     };
-    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<ReadCmd>(1);
-    let (rsp_tx, rsp_rx) = mpsc::sync_channel::<ReadRsp>(1);
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<ReadCmd>(prefetch_depth);
+    let (rsp_tx, rsp_rx) = mpsc::sync_channel::<ReadRsp>(prefetch_depth);
     let reader_handle = thread::Builder::new()
         .name("scrub-reader".into())
         .spawn(move || {
-            let mut f = reader_file;
+            let f = reader_file;
             // Read-ahead hint cap.  Matches `MAX_RUN_SECTORS × sector_size`
             // (64 MiB at 4 KiB sectors) — the same cap `read_physical`
-            // uses.  Larger than that and the kernel's readahead queue
-            // would either spill pages or stall on its own internal
-            // limit; smaller and a long checksum window (BLAKE2/SHA256
-            // over 64 MiB takes seconds on a single core) would let the
-            // disk go idle before the next run is dispatched.
+            // uses.  `POSIX_FADV_WILLNEED` is per-call: each hint asks
+            // the kernel to prefetch `len` bytes starting at `off`.  The
+            // kernel's internal read-ahead window per hint is ~1 MiB but
+            // it services the hint asynchronously, pulling pages from
+            // disk in its own elevator-sized chunks — so a single 64-MiB
+            // hint becomes ~64 disk-sized fetches spread out in time,
+            // exactly what we want to fill a multi-second checksum window.
+            //
+            // The pipelined path now uses `PREFETCH_DEPTH` (multiple
+            // in-flight commands) instead of depth-1.  This lets the
+            // reader thread issue several `read_at`s back-to-back without
+            // waiting for the main thread to finish processing each
+            // result, which is what keeps the disk busy during the long
+            // BLAKE2/SHA256 checksum window on HDDs — previously the
+            // disk went idle for ~99% of the checksum window between
+            // depth-1 runs.  Memory bound unchanged in steady-state: at
+            // any time at most `PREFETCH_DEPTH` runs are in flight (one
+            // per channel slot × 2 channels), where each run is ≤
+            // `MAX_RUN_SECTORS × sector_size` (64 MiB).  The caller-side
+            // `pending` queue holds at most one *processed-but-not-yet-
+            // consumed* response, so peak RAM stays bounded.
             const READAHEAD_CAP: u64 = 64 << 20; // 64 MiB
             while let Ok(cmd) = cmd_rx.recv() {
-                // `read_at` does seek+read_exact; the offset is in bytes
-                // from the start of the backing store, so we add
-                // `base_offset` (the partition start inside the image/rdev)
-                // here — same as `FsReader::read_physical` does.  `phys`
-                // in `ReadCmd` is already in array-partition space.
+                // `pread_at` is a positional read (no seek) — required
+                // here because this handle is a `try_clone` of the main
+                // reader's `File`, which *shares the same underlying
+                // open-file-description and seek position* with the
+                // original. A seek-based read here would race any
+                // concurrent seek-based read the main thread issues via
+                // `FsReader` (e.g. a reconfirm read on mismatch), silently
+                // reading the wrong bytes. See `util::pread_at` for
+                // details.  The offset is in bytes from the start of the
+                // backing store, so we add `base_offset` (the partition
+                // start inside the image/rdev) here — same as
+                // `FsReader::read_physical` does.  `phys` in `ReadCmd` is
+                // already in array-partition space.
                 let off = base_offset.saturating_add(cmd.phys);
 
                 // Prefetch the NEXT contiguous range — the bytes
@@ -318,7 +401,7 @@ where
                 // `off + len` onward (the byte right after we finish),
                 // capped to READAHEAD_CAP — same pattern the inline
                 // `FsReader::read_physical` uses, so the pipelined path
-                // (which calls `util::read_at` directly) does not lose the
+                // (which calls `util::pread_at` directly) does not lose the
                 // prefetch it previously got implicitly via `read_physical`.
                 let readahead = (cmd.len as u64).min(READAHEAD_CAP);
                 crate::btrfs::reader::advise_willneed(
@@ -327,7 +410,7 @@ where
                     readahead,
                 );
 
-                let rsp = match read_at(&mut f, off, cmd.len) {
+                let rsp = match pread_at(&f, off, cmd.len) {
                     Ok(buf) => ReadRsp::Ok {
                         buf,
                         dext: cmd.dext,
@@ -339,19 +422,24 @@ where
                         err: e,
                     },
                 };
-                // Now that we have the bytes in user space, drop the page-
-                // cache backing we just consumed.  The bytes are about to
-                // be checksummed on the main thread and won't be re-read
-                // by anything else during this scrub pass — the data is
-                // physically front-to-back, the NEXT read starts at `off
-                // + len`, so we never re-visit.  Hinting DONTNEED here
-                // keeps a multi-TiB scrub from displacing every other
-                // cached page behind itself (the reconfirm path's
-                // metadata reads, the OS's filesystem cache for other
-                // workloads, etc.).  No-op where `posix_fadvise` is
-                // unavailable.
-                crate::btrfs::reader::advise_dontneed(&f, off, cmd.len as u64);
-
+                // Skip `POSIX_FADV_DONTNEED` here.  An earlier version
+                // dropped pages immediately after read so a multi-TiB one-
+                // pass scrub would not evict every other cached page
+                // behind itself, but with `PREFETCH_DEPTH > 1` the next
+                // run's `advise_willneed(off + len, …)` is already
+                // fetching into the page cache moments later and racing
+                // the eviction for the SAME range (the prefetch hint
+                // starts at `off + len`, but the eviction drops `off` —
+                // on a contiguous data track the two ranges touch and the
+                // kernel sometimes evicts pages it just prefetched,
+                // producing a saw-tooth throughput pattern).  The one-
+                // pass nature of the scrub (front-to-back, never revisits)
+                // means the kernel's own LRU eviction will reclaim those
+                // pages naturally as the prefetch head advances; an
+                // explicit `DONTNEED` here only fights the prefetch we
+                // want.  Re-enable only behind a `--cache-purge` flag for
+                // users who explicitly want to free cache during the
+                // scrub; the default behaviour is now no eviction.
                 if rsp_tx.send(rsp).is_err() {
                     break;
                 }
@@ -359,12 +447,23 @@ where
         })
         .expect("spawn scrub-reader thread");
 
-    // The most recent reader response, received but not yet processed.
-    // Drained at the start of the *next* flush so the CPU work overlaps
-    // with the reader's disk read for the just-dispatched run (see the
-    // pipeline ordering comment above).  Initial value `None` because the
-    // very first flush has no previous result to process.
-    let mut pending: Option<ReadRsp> = None;
+    // Number of `ReadCmd`s sent to the reader thread that have not yet
+    // had their `ReadRsp` received and processed.  Bounded by
+    // `prefetch_depth`: once `inflight` reaches the depth we block on
+    // `rsp_rx.recv()` (FIFO, so always the oldest outstanding response)
+    // before sending the next cmd.  This lets the reader thread race up
+    // to `prefetch_depth` runs ahead of the main thread's CPU-bound
+    // checksum work — the fix for the HDD saw-tooth: a depth-1 lockstep
+    // (send cmd, process previous, block-recv the one just sent) only
+    // ever overlaps a single run's disk read with the *previous* run's
+    // checksum, so once the read finishes (fast on HDD) the reader sits
+    // idle waiting for the next cmd, which only arrives after the much
+    // longer checksum window completes.  Buffering multiple cmds ahead
+    // (still drained via blocking `recv`, never `try_recv` — see
+    // `docs/PROGRESS_HDD_BURST.md` for why `try_recv` broke correctness)
+    // keeps the reader busy across the whole checksum window while
+    // preserving strict FIFO response ordering.
+    let mut inflight: usize = 0;
 
     for (dev_extent_idx, dext) in dev_extents.iter().enumerate() {
         // Resolve the owning chunk.  Every dev-extent must have a matching
@@ -453,9 +552,11 @@ where
         let mut prev_logical: Option<u64> = None;
 
         // `flush` drives the pipelined reader thread: send the run's
-        // ReadCmd to the reader (so the disk read starts), process the
-        // PREVIOUS run's response (rayon checksum + reconfirm + on_sector),
-        // then block on the just-sent cmd's response.  Captures all the
+        // ReadCmd to the reader thread (letting up to `prefetch_depth`
+        // cmds be outstanding at once so the reader can race ahead of the
+        // main thread's checksum work), then — only once `inflight`
+        // reaches `prefetch_depth` — block-receive and process the
+        // *oldest* outstanding response to make room.  Captures all the
         // borrows the inner processing path needs — `reader` for the
         // reconfirm walk, `freeze` for the live-mount freeze guard,
         // `on_sector` for the mismatch emit, `stats` for counters, plus
@@ -473,14 +574,21 @@ where
                 dext: *dext,
                 entries: std::mem::take(run),
             };
-            // 1. Send the next cmd FIRST so the reader can start reading it
-            //    while we process the previous result below.
+            // 1. Send the cmd.  The command channel itself is bounded to
+            //    `prefetch_depth` slots, so this blocks only if the
+            //    reader thread is already that far behind.
             if cmd_tx.send(cmd).is_err() {
                 return;
             }
-            // 2. Process the previous response (CPU-bound rayon work) WHILE
-            //    the reader reads the just-sent cmd from disk.
-            if let Some(rsp) = pending.take() {
+            inflight += 1;
+            // 2. Only block for a response once we've let `prefetch_depth`
+            //    cmds accumulate — this is what lets the reader thread
+            //    read several runs ahead of the checksum work instead of
+            //    stalling on a 1:1 send/recv lockstep.
+            if inflight >= prefetch_depth
+                && let Ok(rsp) = rsp_rx.recv()
+            {
+                inflight -= 1;
                 process_rsp(
                     rsp,
                     reader,
@@ -492,8 +600,6 @@ where
                     &mut stats,
                 );
             }
-            // 3. Pull the just-sent cmd's response — block until reader done.
-            pending = rsp_rx.recv().ok();
         };
 
         // The csum-provider callback drives the run coalescer: it streams
@@ -515,23 +621,29 @@ where
         flush(&mut run);
     }
 
-    // Drain the pipeline: the last `flush` left one response in `pending`
-    // (the run we sent but never processed because no subsequent flush
-    // ran).  Process it now.  Then drop the command sender so the reader
-    // thread sees channel close and exits cleanly.
-    if let Some(rsp) = pending.take() {
-        process_rsp(
-            rsp,
-            reader,
-            chunk_map,
-            strategy,
-            batch,
-            &mut freeze,
-            &mut on_sector,
-            &mut stats,
-        );
-    }
+    // Drain the pipeline: close the command channel so the reader thread
+    // knows no more cmds are coming, then block-receive (in strict FIFO
+    // order — never `try_recv`, see `docs/PROGRESS_HDD_BURST.md`) every
+    // remaining outstanding response before joining the reader thread.
     drop(cmd_tx);
+    while inflight > 0 {
+        match rsp_rx.recv() {
+            Ok(rsp) => {
+                inflight -= 1;
+                process_rsp(
+                    rsp,
+                    reader,
+                    chunk_map,
+                    strategy,
+                    batch,
+                    &mut freeze,
+                    &mut on_sector,
+                    &mut stats,
+                );
+            }
+            Err(_) => break,
+        }
+    }
     let _ = reader_handle.join();
 
     stats
