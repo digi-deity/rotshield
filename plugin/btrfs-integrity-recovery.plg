@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.07.20">
-<!ENTITY bundleversion "2026.07.20">
+<!ENTITY version       "2026.07.20c">
+<!ENTITY bundleversion "2026.07.20c">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,20 @@
 
 <CHANGES>
 ##&name;
+
+###2026.07.20c
+- Plugin: schedule rework. Removed the `daily` preset (a scrub can take
+  multiple days and would overlap its own previous run). Added `monthly`
+  (03:00 on the 1st) and a `custom` option that accepts a validated 5-field
+  cron time spec (`CRON` config key), so operators can set any sane interval.
+- Plugin: add `Stop Scrub` button + `scrub.sh stop` command to terminate a
+  running scrub (kills the runner process group and any scrub-rs children).
+- Plugin: fix Settings page device discovery — use `shell_exec()` instead of
+  `exec()` so multi-disk arrays are no longer truncated to the last disk.
+- Plugin: fix uninstall to remove the exact Slackware package name
+  (`btrfs-integrity-recovery-x86_64-1`) instead of a no-op glob, and stop the
+  schedule before removing the plugin tree.
+- Plugin: add inline help popovers to the Settings page.
 
 ###2026.07.20
 - HDD read-prefetch overhaul (additive on top of 2026.07.19b's
@@ -55,6 +69,10 @@
 - Verified: matrix TOTAL=30 PASS=27 FAIL=0 SKIPPED(unverified)=3,
   byte-for-byte parity with `btrfs check --readonly --check-data-csum`
   preserved.
+- Plugin: schedule rework. Removed the `daily` preset (a scrub can take
+  multiple days and would overlap its own previous run). Added `monthly`
+  (03:00 on the 1st) and a `custom` option that accepts a validated 5-field
+  cron time spec (`CRON` config key), so operators can set any sane interval.
 
 ###2026.07.19b
 - Throughput overhaul:

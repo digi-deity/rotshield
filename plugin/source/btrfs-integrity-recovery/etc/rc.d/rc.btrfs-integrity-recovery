@@ -16,14 +16,22 @@ install_cron() {
   [ -f "${CONFIG_FILE}" ] && . "${CONFIG_FILE}"
   rm -f "${CRON_FILE}"
   case "${SCHEDULE:-disabled}" in
-    daily)
+    weekly)
       # scrub.sh writes ONLY a compact summary to /var/log/$PLUGIN.log
       # itself; the full per-run detail lives in the run file (viewable on
       # demand).  So the cron entry just invokes the run, no redirection.
-      echo "0 3 * * * root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
-      ;;
-    weekly)
       echo "0 3 * * 0 root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
+      ;;
+    monthly)
+      # A scrub can take days, so monthly is a sane preset for large arrays.
+      # Runs at 03:00 on the 1st of each month.
+      echo "0 3 1 * * root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
+      ;;
+    custom)
+      # CRON holds a validated 5-field time spec from the Settings page.
+      if [ -n "${CRON:-}" ]; then
+        echo "${CRON} root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
+      fi
       ;;
     *)
       # disabled — no cron entry

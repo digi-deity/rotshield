@@ -27,6 +27,7 @@ if [ ! -f "${CONFIG_FILE}" ]; then
 DEVICES=/dev/loop2
 DEVICE=/dev/loop2
 SCHEDULE=disabled
+CRON=
 RECOVER=1
 WRITE=0
 NO_FREEZE=0

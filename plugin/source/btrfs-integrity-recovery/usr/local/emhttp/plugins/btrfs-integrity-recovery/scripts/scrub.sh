@@ -10,6 +10,7 @@
 #                     Refuses to start if a run is already in progress.
 #   scrub.sh status   print the last-run status JSON.
 #   scrub.sh lastlog  print the path of the most recent run's log file.
+#   scrub.sh stop     terminate a running scrub (kills the runner + scrub-rs).
 #
 # Both the "Run Scrub Now" button and the scheduled cron job call `run`, so
 # manual and scheduled runs are logged identically and show up the same way
@@ -321,10 +322,51 @@ offset_for() {
   done < "$stat"
 }
 
+stop() {
+  if [ ! -f "${PID_FILE}" ]; then
+    echo "No scrub is currently running."
+    return 0
+  fi
+  local pid; pid="$(cat "${PID_FILE}" 2>/dev/null)"
+  if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
+    # Stale pid file — nothing actually running. Clean it up.
+    rm -f "${PID_FILE}"
+    echo "No scrub is currently running (stale pid file removed)."
+    return 0
+  fi
+  # Kill the runner process group (the bash script) and any scrub-rs
+  # children it spawned. The negative pid targets the whole group so a
+  # long-running scrub-rs invocation is terminated too.
+  kill -TERM -"${pid}" 2>/dev/null
+  # Fallback: make sure no scrub-rs binary is left behind.
+  pkill -TERM -f "${SCRUB}" 2>/dev/null
+  # Give it a moment, then escalate to KILL if still alive.
+  local i
+  for i in 1 2 3 4 5; do
+    kill -0 "${pid}" 2>/dev/null || break
+    sleep 0.5
+  done
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL -"${pid}" 2>/dev/null
+    pkill -KILL -f "${SCRUB}" 2>/dev/null
+  fi
+  rm -f "${PID_FILE}"
+  # Reflect the interruption in the status file so the UI stops polling a
+  # run that is no longer alive. Preserve the existing log path if present.
+  FINISH_TS="$(date '+%Y-%m-%d %H:%M:%S')"
+  local prev_log=""
+  if [ -f "${STATUS_FILE}" ]; then
+    prev_log="$(grep -oP '"log"\s*:\s*"\K[^"]+' "${STATUS_FILE}" 2>/dev/null)"
+  fi
+  write_status 0 "STOPPED" 130 "${prev_log}" "" "0/0" "0"
+  echo "Scrub stopped."
+}
+
 case "${1:-status}" in
   run)     run ;;
   status)  status ;;
   lastlog) lastlog ;;
   devices) devices ;;
-  *) echo "usage: $0 run|status|lastlog|devices" ;;
+  stop)    stop ;;
+  *) echo "usage: $0 run|status|lastlog|devices|stop" ;;
 esac

@@ -121,7 +121,8 @@ fallback, because without a valid offset recovery is impossible anyway.
 | `BATCH_MAX` | max candidates per recovery batch | `--batch-max` |
 | `BATCH_IDLE` | idle-seconds flush threshold | `--batch-idle` |
 | `EXTRA_OPTIONS` | appended verbatim (advanced) | — |
-| `SCHEDULE` | `disabled` / `daily` / `weekly` | (cron) |
+| `SCHEDULE` | `disabled` / `weekly` / `monthly` / `custom` | (cron) |
+| `CRON` | 5-field cron time spec (`min hour day month weekday`), used only when `SCHEDULE=custom` (e.g. `0 4 1 * *` = 04:00 on the 1st). `daily` is intentionally not offered — a scrub can take days and would overlap its own previous run. | (cron) |
 
 ## Releasing
 
