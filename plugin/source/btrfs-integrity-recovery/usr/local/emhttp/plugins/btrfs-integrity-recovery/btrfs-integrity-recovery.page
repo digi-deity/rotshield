@@ -139,9 +139,36 @@ $cron_active = is_file("/etc/cron.d/$plugin");
 <h1 style="margin:0 0 12px">btrfs Integrity Recovery</h1>
 <?php if ($message): ?><div class="notice"><?=htmlspecialchars($message)?></div><?php endif; ?>
 
+<style>
+.help-block { position: relative; display: inline-block; }
+.help-block .fa-question-circle { cursor: help; color: #6c757d; margin-left: 6px; vertical-align: middle; }
+.help-block .help-content {
+  display: none;
+  position: absolute;
+  left: 0;
+  top: 1.5em;
+  z-index: 200;
+  width: 380px;
+  max-width: 85vw;
+  padding: 10px 12px;
+  background: #fffef5;
+  border: 1px solid #d6c98b;
+  border-radius: 4px;
+  box-shadow: 0 3px 10px rgba(0,0,0,.18);
+  font-weight: normal;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #333;
+  text-align: left;
+  white-space: normal;
+}
+.help-block:hover .help-content,
+.help-block:focus-within .help-content { display: block; }
+</style>
+
 <form method="post">
   <table class="settings">
-    <tr><td>Schedule</td>
+    <tr><td>Schedule <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">How often an automatic scrub runs. <b>Disabled</b> = manual only; <b>Weekly</b> = Sundays 03:00; <b>Monthly</b> = 1st of month 03:00; <b>Custom</b> = your own 5-field cron. Daily is deliberately omitted because a full scrub can take days and would overlap its own previous run. The schedule is written to /etc/cron.d by the plugin's rc script; "Run Scrub Now" always works regardless of this setting.</span></span></td>
         <td><select name="schedule">
             <option value="disabled" <?=($config['SCHEDULE'] ?? 'disabled') === 'disabled' ? 'selected' : ''?>>Disabled</option>
             <option value="weekly"   <?=($config['SCHEDULE'] ?? '') === 'weekly'   ? 'selected' : ''?>>Weekly (Sun 03:00)</option>
@@ -150,17 +177,17 @@ $cron_active = is_file("/etc/cron.d/$plugin");
           </select>
             <span class="label">Current: <b><?=htmlspecialchars($schedule_label)?></b>
             <?= $cron_active ? '(cron active)' : '(no cron entry)' ?></span>
-          <div class="help">How often an automatic scrub runs. <b>Disabled</b> = manual only; <b>Weekly</b> = Sundays 03:00; <b>Monthly</b> = 1st of month 03:00; <b>Custom</b> = your own 5-field cron. Daily is deliberately omitted because a full scrub can take days and would overlap its own previous run. The schedule is written to /etc/cron.d by the plugin's rc script; "Run Scrub Now" always works regardless of this setting.</div></td></tr>
-    <tr id="cron-row" style="<?=($config['SCHEDULE'] ?? 'disabled') === 'custom' ? '' : 'display:none'?>"><td>Custom cron</td>
+</td></tr>
+    <tr id="cron-row" style="<?=($config['SCHEDULE'] ?? 'disabled') === 'custom' ? '' : 'display:none'?>"><td>Custom cron <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">5-field cron time spec (minute hour day-of-month month day-of-week), used only when Schedule = Custom cron — e.g. <code>0 4 1 * *</code> runs at 04:00 on the 1st of each month. The value is strictly validated (only digits and *, ?, /, ,, - allowed) before saving, so an invalid entry is rejected and the schedule left disabled rather than injected. Leave blank to disable the custom schedule.</span></span></td>
         <td><input type="text" name="cron" size="22" value="<?=htmlspecialchars($config['CRON'] ?? '')?>" placeholder="0 4 1 * *">
             <span class="label">5-field cron time spec (min hour day month weekday), used only when Schedule = Custom cron. A scrub can take days, so daily is not offered. Example <code>0 4 1 * *</code> = 04:00 on the 1st of each month.</span>
-          <div class="help">5-field cron time spec (minute hour day-of-month month day-of-week), used only when Schedule = Custom cron — e.g. <code>0 4 1 * *</code> runs at 04:00 on the 1st of each month. The value is strictly validated (only digits and *, ?, /, ,, - allowed) before saving, so an invalid entry is rejected and the schedule left disabled rather than injected. Leave blank to disable the custom schedule.</div></td></tr>
+</td></tr>
   <script>
   document.querySelector('select[name="schedule"]').addEventListener('change', function () {
       document.getElementById('cron-row').style.display = (this.value === 'custom') ? '' : 'none';
   });
   </script>
-    <tr><td>Target disk(s)</td>
+    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, each with its own log. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/nmd1p1 or /dev/sdX). Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job.</span></span></td>
         <td><div class="devices-list">
             <?php
             $selected = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '/dev/nmd1p1'));
@@ -169,25 +196,25 @@ $cron_active = is_file("/etc/cron.d/$plugin");
             <?php endforeach; ?>
           </div>
             <span class="label">Raw array data disks (e.g. /dev/sdX, /dev/nvmeXnY, /dev/loopX) — scrubbed sequentially. The partition offset is auto-applied from /proc/nmdstat; parity disks are excluded.</span>
-          <div class="help">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, each with its own log. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/nmd1p1 or /dev/sdX). Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job.</div></td></tr>
-    <tr><td>Repair disk</td>
+</td></tr>
+    <tr><td>Repair disk <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Writes reconstructed blocks back to the disk (scrub-rs --repair). By default the tool runs in SAFE dry-run mode: it still reads every checksum, flags mismatches, and rebuilds the correct data from parity to tell you whether the corruption is recoverable — but it never touches the disk. Tick this only when you actually want the recovered blocks written back. The batch and freeze settings below only take effect in this repair mode; in the default dry-run they do nothing.</span></span></td>
         <td><label><input type="checkbox" name="write" value="1" <?=($config['WRITE'] ?? 0) ? 'checked' : ''?>> write reconstructed blocks back (--repair; default is dry-run assessment only)</label>
-          <div class="help">Writes reconstructed blocks back to the disk (scrub-rs --repair). By default the tool runs in SAFE dry-run mode: it still reads every checksum, flags mismatches, and rebuilds the correct data from parity to tell you whether the corruption is recoverable — but it never touches the disk. Tick this only when you actually want the recovered blocks written back. The batch and freeze settings below only take effect in this repair mode; in the default dry-run they do nothing.</div></td></tr>
-    <tr><td>Disable freeze</td>
+</td></tr>
+    <tr><td>Disable freeze <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Controls the filesystem freeze that makes repair writes safe. When Repair disk is enabled and the target is a live mounted filesystem, scrub-rs freezes the mount (FIFREEZE) around each recovery batch so the live FS cannot alter a block between re-confirmation and write-back, then thaws it. This is ON by default and only engages during repair on a mounted FS; unmounted images are never frozen. Only tick Disable freeze if the disk is not mounted/active — leaving it disabled during a live repair is unsafe. No effect in dry-run mode.</span></span></td>
         <td><label><input type="checkbox" name="no_freeze" value="1" <?=($config['NO_FREEZE'] ?? 0) ? 'checked' : ''?>> --no-freeze (unsafe with write on a live FS)</label>
-          <div class="help">Controls the filesystem freeze that makes repair writes safe. When Repair disk is enabled and the target is a live mounted filesystem, scrub-rs freezes the mount (FIFREEZE) around each recovery batch so the live FS cannot alter a block between re-confirmation and write-back, then thaws it. This is ON by default and only engages during repair on a mounted FS; unmounted images are never frozen. Only tick Disable freeze if the disk is not mounted/active — leaving it disabled during a live repair is unsafe. No effect in dry-run mode.</div></td></tr>
-    <tr><td>Batch max</td>
+</td></tr>
+    <tr><td>Batch max <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Max corruption candidates gathered into one recovery batch before it is written (scrub-rs --batch-max, default 64). Batching means one freeze/thaw cycle per burst instead of one per sector, and re-confirmation is deferred to write time so only still-corrupt blocks get written. Because corruption is rare on a healthy array, this rarely matters — it only becomes relevant under serious corruption during a repair run. Leave at the default unless you have a specific throughput reason to change it.</span></span></td>
         <td><input type="text" name="batch_max" size="10" value="<?=htmlspecialchars($config['BATCH_MAX'] ?? '')?>" placeholder="64">
             <span class="label">max candidates per recovery batch</span>
-          <div class="help">Max corruption candidates gathered into one recovery batch before it is written (scrub-rs --batch-max, default 64). Batching means one freeze/thaw cycle per burst instead of one per sector, and re-confirmation is deferred to write time so only still-corrupt blocks get written. Because corruption is rare on a healthy array, this rarely matters — it only becomes relevant under serious corruption during a repair run. Leave at the default unless you have a specific throughput reason to change it.</div></td></tr>
-    <tr><td>Batch idle (s)</td>
+</td></tr>
+    <tr><td>Batch idle (s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Idle seconds to wait before flushing a partially-filled recovery batch (scrub-rs --batch-idle, default 5.0). Guarantees a single isolated corruption still flushes promptly instead of waiting for the batch to fill. Like Batch max, this applies only during repair mode and is inconsequential for the usual rare, isolated corruption. Leave at the default in almost all cases.</span></span></td>
         <td><input type="text" name="batch_idle" size="10" value="<?=htmlspecialchars($config['BATCH_IDLE'] ?? '')?>" placeholder="5.0">
             <span class="label">flush a batch after this many idle seconds</span>
-          <div class="help">Idle seconds to wait before flushing a partially-filled recovery batch (scrub-rs --batch-idle, default 5.0). Guarantees a single isolated corruption still flushes promptly instead of waiting for the batch to fill. Like Batch max, this applies only during repair mode and is inconsequential for the usual rare, isolated corruption. Leave at the default in almost all cases.</div></td></tr>
-    <tr><td>Extra options</td>
-        <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>" placeholder="--dump-array">
+</td></tr>
+    <tr><td>Extra options <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Advanced: extra arguments appended verbatim to the scrub-rs command line (e.g. --dump-array or --resolve for debugging). Anything you type is passed through unmodified, so invalid flags will make the scrub fail with a usage error. Most users should leave this empty.</span></span></td>
+        <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>">
             <span class="label">advanced: appended verbatim to the scrub-rs command</span>
-          <div class="help">Advanced: extra arguments appended verbatim to the scrub-rs command line (e.g. --dump-array or --resolve for debugging). Anything you type is passed through unmodified, so invalid flags will make the scrub fail with a usage error. Most users should leave this empty.</div></td></tr>
+</td></tr>
   </table>
   <p>
     <input type="submit" name="save" value="Save Settings">

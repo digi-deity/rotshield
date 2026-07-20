@@ -98,6 +98,12 @@ write_summary() {
     ' "${run_log}"
     # Also pull the final finished line for a one-glance outcome.
     grep -E "^\[.*\] finished:" "${run_log}" | tail -1
+    # Surface the early parity canary result (array-config sanity check)
+    # in the compact stream too — it's the first signal of whether the
+    # array/parity is wired correctly, and otherwise only lives in the
+    # full per-run log.  Matches both the success line ("canary") and
+    # the fatal abort lines ("[CANARY FATAL]").
+    grep -E "^canary|^\[CANARY FATAL\]" "${run_log}" | head -1
     echo ""
   } >> "${LOG}"
 }
@@ -160,8 +166,15 @@ run() {
         fi
       fi
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) scrubbing ${device}"
-      # Capture output so we can tell a *successful* run that found issues
-      # apart from a run that errored out (no "scrub complete:" line).
+      # Stream scrub-rs output DIRECTLY into the run log (via tee) instead
+      # of capturing it into a shell variable.  This makes every line —
+      # including the early parity canary check — appear in the log the
+      # moment scrub-rs prints it, so "View Logs" / refresh shows live
+      # progress instead of a single dump at the very end.  We still need
+      # the exit code and a completion check, so we run the pipeline in a
+      # subshell that records $? to a temp file and tee's stdout+stderr
+      # to the log; afterwards we read the log (not a variable) for the
+      # "scrub complete:" marker and map the exit code to a human label.
       # scrub-rs exit-code contract (mode-independent — same disk => same
       # code regardless of flags):
       #   0 clean | 1 runtime/setup error | 2 usage error
@@ -170,10 +183,13 @@ run() {
       #   5 issues found, SOME unrecoverable
       #   6 METADATA FATAL — a metadata node had NO good copy; unmount +
       #     run `btrfs check --repair` offline (highest-priority non-clean)
-      local dev_out; dev_out="$("${SCRUB}" "${device}" ${dev_opts} 2>&1)"
-      local rc=$?
-      echo "${dev_out}"
-      if echo "${dev_out}" | grep -q "scrub complete:"; then
+      local rc_file; rc_file="$(mktemp)"
+      (
+        "${SCRUB}" "${device}" ${dev_opts} 2>&1
+        echo "${?}" > "${rc_file}"
+      ) | tee -a "${run_log}"
+      local rc; rc="$(cat "${rc_file}"; rm -f "${rc_file}")"
+      if grep -q "scrub complete:" "${run_log}"; then
         # Tool ran to completion. Map the exit code to a human label.
         case "${rc}" in
           0) echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: OK (clean)" ;;

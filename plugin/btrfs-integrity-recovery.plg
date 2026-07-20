@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.07.20d">
-<!ENTITY bundleversion "2026.07.20d">
+<!ENTITY version       "2026.07.20e">
+<!ENTITY bundleversion "2026.07.20e">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,14 @@
 
 <CHANGES>
 ##&name;
+
+###2026.07.20e
+- Plugin: revert Settings help from the standard unRAID/Dynamix `<div
+  class="help">` block (which only toggles via the global Help button and
+  did not surface per-option) back to the inline `?` help popovers. The
+  popover is now triggered on **hover** (CSS `:hover` + `:focus-within` for
+  keyboard), not click, so it shows while the pointer is over the `?` and
+  hides on mouse-out — no click-to-toggle state to get stuck.
 
 ###2026.07.20d
 - Plugin: replace the custom inline help popovers with the standard unRAID/
