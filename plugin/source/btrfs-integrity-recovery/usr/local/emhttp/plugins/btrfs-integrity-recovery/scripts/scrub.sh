@@ -57,6 +57,59 @@ freeze_mount_for() {
   findmnt -n -o TARGET -S "$dev" 2>/dev/null | head -1
 }
 
+notify_scrub() {
+  local event="$1" subject="$2" description="$3" severity="$4"
+  command -v notify >/dev/null 2>&1 || return 0
+  notify -e "$event" -s "$subject" -d "$description" -i "$severity"
+}
+
+notify_scrub_started() {
+  local device="$1" idx="$2" total="$3"
+  notify_scrub \
+    "${PLUGIN}_scrub_started" \
+    "Scrub started" \
+    "${device} (${idx}/${total})" \
+    "normal"
+}
+
+notify_scrub_finished() {
+  local device="$1" idx="$2" total="$3" rc="$4" completed="$5"
+  local severity="normal"
+  local subject="Scrub finished"
+  local description="${device} (${idx}/${total}): ${completed}"
+
+  case "$rc" in
+    0)
+      ;;
+    3|4)
+      severity="warning"
+      ;;
+    *)
+      severity="alert"
+      ;;
+  esac
+
+  notify_scrub \
+    "${PLUGIN}_scrub_finished" \
+    "$subject" \
+    "$description" \
+    "$severity"
+}
+
+recovery_note_for_log() {
+  local device_log="$1"
+  local recovered
+
+  recovered="$(awk -F: '/^  recovered[[:space:]]*:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}' "$device_log")"
+  [ -z "$recovered" ] && return 0
+
+  if [ "${WRITE:-0}" = "1" ]; then
+    echo "; recovered ${recovered}"
+  else
+    echo "; recoverable ${recovered}"
+  fi
+}
+
 write_status() {
   # $1=running(0/1) $2=status $3=exit_code $4=run_log
   # $5=current device $6=index $7=total
@@ -76,36 +129,6 @@ write_status() {
   "log": "${run_log}"
 }
 EOF
-}
-
-# Append a COMPACT summary to the persistent log (/var/log/$PLUGIN.log),
-# which is the stream the schedule/cron and syslog consume.  We deliberately
-# do NOT dump the full scrub output here — that stays in the per-run file
-# (viewable on demand).  The summary extracts, per device, the
-# "scrub complete:" stats block and the "recovery summary:" block, plus the
-# final finished line, so an operator scanning the schedule log sees only
-# the outcome numbers, not hundreds of per-sector lines.
-write_summary() {
-  local run_log="$1" rc="$2" end_ts="$3"
-  {
-    echo "===== scrub-rs run ${end_ts} (rc=${rc}) ====="
-    # Each device's summary is bounded by "scrub complete:" ... up to the
-    # next "scrubbing" / "starting sequential" / EOF.  Extract those blocks.
-    awk '
-      /^scrub complete:/ { capture=1 }
-      /^scrubbing |^\[.*\] starting sequential scrub/ { capture=0 }
-      capture { print }
-    ' "${run_log}"
-    # Also pull the final finished line for a one-glance outcome.
-    grep -E "^\[.*\] finished:" "${run_log}" | tail -1
-    # Surface the early parity canary result (array-config sanity check)
-    # in the compact stream too — it's the first signal of whether the
-    # array/parity is wired correctly, and otherwise only lives in the
-    # full per-run log.  Matches both the success line ("canary") and
-    # the fatal abort lines ("[CANARY FATAL]").
-    grep -E "^canary|^\[CANARY FATAL\]" "${run_log}" | head -1
-    echo ""
-  } >> "${LOG}"
 }
 
 run() {
@@ -140,6 +163,7 @@ run() {
     for device in ${devlist}; do
       idx=$((idx + 1))
       write_status 1 "running" 0 "${run_log}" "${device}" "${idx}/${total}" "${total}"
+      notify_scrub_started "${device}" "${idx}" "${total}"
       # Target the RAW rdev: scrub-rs reads the btrfs superblock at the
       # partition offset, so we must pass --offset +<rdevOffset> (sectors)
       # from /proc/nmdstat. If the offset is wrong, scrub-rs rejects the
@@ -184,27 +208,49 @@ run() {
       #   6 METADATA FATAL — a metadata node had NO good copy; unmount +
       #     run `btrfs check --repair` offline (highest-priority non-clean)
       local rc_file; rc_file="$(mktemp)"
+      local device_log; device_log="$(mktemp)"
       (
         "${SCRUB}" "${device}" ${dev_opts} 2>&1
         echo "${?}" > "${rc_file}"
-      ) | tee -a "${run_log}"
+      ) | tee -a "${run_log}" "${device_log}"
       local rc; rc="$(cat "${rc_file}"; rm -f "${rc_file}")"
-      if grep -q "scrub complete:" "${run_log}"; then
+      local recovery_note; recovery_note="$(recovery_note_for_log "${device_log}")"
+      if grep -q "scrub complete:" "${device_log}"; then
         # Tool ran to completion. Map the exit code to a human label.
         case "${rc}" in
-          0) echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: OK (clean)" ;;
-          3) echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND (rc=3)" ;;
-          4) echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND — all recoverable (rc=4)" ;;
-          5) echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND — some UNRECOVERABLE (rc=5)" ;;
-          6) echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: METADATA FATAL — unmount + btrfs check --repair (rc=6)" ;;
-          *) echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND (rc=${rc})" ;;
+          0)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: OK (clean)"
+            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "OK (clean)${recovery_note}"
+            ;;
+          3)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND (rc=3)"
+            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ISSUES FOUND${recovery_note}"
+            ;;
+          4)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND — all recoverable (rc=4)"
+            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ISSUES FOUND - all recoverable${recovery_note}"
+            ;;
+          5)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND — some UNRECOVERABLE (rc=5)"
+            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ISSUES FOUND - some UNRECOVERABLE${recovery_note}"
+            ;;
+          6)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: METADATA FATAL — unmount + btrfs check --repair"
+            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "METADATA FATAL${recovery_note}"
+            ;;
+          *)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND (rc=${rc})"
+            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ISSUES FOUND${recovery_note}"
+            ;;
         esac
       else
         # No completion marker => the tool aborted (bad args, unopenable
         # device, panic). Treat as a real error.
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ERROR(rc=${rc})"
+        notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ERROR (rc=${rc})"
         errored=1
       fi
+      rm -f "${device_log}"
       [ "${rc}" -gt "${overall_rc}" ] && overall_rc=${rc}
     done
     local end_ts; end_ts="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -236,11 +282,9 @@ run() {
     fi
   } > "${run_log}"
 
-  # The full per-device detail lives in the run log (viewable on demand via
-  # the Settings page "View Logs").  The persistent /var/log/$PLUGIN.log (the
-  # schedule/syslog stream) gets ONLY the compact summary stats, not the full
-  # scrub dump — see write_summary().
-  write_summary "${run_log}" "${overall_rc}" "${end_ts}"
+  # Keep the persistent plugin log simple: append the exact run log bytes
+  # instead of deriving a secondary summary format.
+  cat "${run_log}" >> "${LOG}"
 
   rm -f "${PID_FILE}"
 

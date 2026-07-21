@@ -17,9 +17,8 @@ install_cron() {
   rm -f "${CRON_FILE}"
   case "${SCHEDULE:-disabled}" in
     weekly)
-      # scrub.sh writes ONLY a compact summary to /var/log/$PLUGIN.log
-      # itself; the full per-run detail lives in the run file (viewable on
-      # demand).  So the cron entry just invokes the run, no redirection.
+      # scrub.sh appends the full run log to /var/log/$PLUGIN.log itself, so
+      # the cron entry just invokes the run, no redirection.
       echo "0 3 * * 0 root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
       ;;
     monthly)
