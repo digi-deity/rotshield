@@ -9,10 +9,18 @@
 //!
 //! Freezing the mounted filesystem (`FIFREEZE` ioctl) stops the kernel from
 //! issuing any new writes for the duration of the reconfirm+write, so scrub-rs
-//! is the only writer to those bytes.  The freeze is held for the shortest
-//! possible window: from just before reconfirmation through the recovery
-//! write emitted by the `on_event` callback (which runs synchronously inside
-//! the scrub loop), then released.  It is NOT held for the whole scrub run.
+//! is the only writer to those bytes.  The freeze is held for one **batch**
+//! at a time (`batch_recover.rs::flush_batch` acquires a single guard that
+//! covers every candidate's reconfirm + stripe gather + write + read-back
+//! for the whole batch, up to `batch_max` sectors), not per-sector and not
+//! for the whole scrub run.  This is a deliberate choice over freezing
+//! per-sector: toggling `FIFREEZE`/`FITHAW` on and off dozens of times per
+//! batch would flicker the live filesystem frozen/thawed repeatedly, which
+//! is its own source of latency spikes for anything doing I/O against the
+//! mount during recovery — a single bounded freeze per batch is preferred
+//! over frequent on/off flapping. The window is still bounded (never longer
+//! than one batch's worth of work) and released as soon as that batch's
+//! `flush_batch` call returns.
 //!
 //! ## Safety: thaw is guaranteed
 //!
@@ -30,11 +38,12 @@
 //!    operator's peace of mind — see below).
 //! 3. **Operator awareness** — because a truly stuck process (abort, SIGKILL,
 //!    kernel panic) cannot be caught by userspace, the freeze window is kept
-//!    as short as possible (one sector's reconfirm+write, milliseconds) and
-//!    the mountpoint is explicit, so a human can `fsfreeze -u <mnt>` if ever
-//!    needed.  We deliberately do NOT add a watchdog thread: the reconfirm+
-//!    write is trusted to be fast, and a watchdog that force-thaws mid-write
-//!    would defeat the freeze's purpose.
+//!    as short as reasonably possible (bounded to one batch's worth of
+//!    reconfirm+write, not the whole scrub run) and the mountpoint is
+//!    explicit, so a human can `fsfreeze -u <mnt>` if ever needed.  We
+//!    deliberately do NOT add a watchdog thread: the batch's reconfirm+
+//!    write work is trusted to complete promptly, and a watchdog that
+//!    force-thaws mid-write would defeat the freeze's purpose.
 //!
 //! ## No live filesystem?
 //!
@@ -142,8 +151,10 @@ impl Drop for FreezeController {
     }
 }
 
-/// RAII guard: thaws the filesystem when dropped.  Held only for the
-/// reconfirm+write window of a single mismatched sector.
+/// RAII guard: thaws the filesystem when dropped.  Held for the
+/// reconfirm+write window of one batch (`batch_recover.rs::flush_batch`
+/// acquires exactly one guard per batch, not per-sector — see the module
+/// doc for why).
 pub struct FreezeGuard<'a> {
     controller: &'a mut FreezeController,
 }

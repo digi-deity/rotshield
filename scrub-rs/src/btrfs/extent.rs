@@ -240,35 +240,40 @@ fn extent_covers(
         match node {
             crate::btrfs::node::Node::Internal(internal) => {
                 // Find the child whose key is the greatest <= target.
-                let mut chosen: Option<u64> = None;
-                for ptr in &internal.ptrs {
-                    if key_leq(&ptr.key, &target) {
-                        chosen = Some(ptr.blockptr);
-                    } else {
-                        break;
-                    }
-                }
-                match chosen {
-                    Some(b) => node_logical = b,
-                    // All keys > target: descend the leftmost child (covers
-                    // the lowest addresses); if none, the address is below
-                    // the tree -> treat as hole.
-                    None => return ExtentLive::Hole,
+                // Internal `ptrs` are ascending-key-sorted, so binary
+                // search for the first one whose key is > target instead
+                // of a linear scan over every child pointer.
+                let count = internal
+                    .ptrs
+                    .partition_point(|ptr| key_leq(&ptr.key, &target));
+                match count {
+                    0 => return ExtentLive::Hole,
+                    _ => node_logical = internal.ptrs[count - 1].blockptr,
                 }
             }
             crate::btrfs::node::Node::Leaf(leaf) => {
                 // Find the greatest EXTENT_ITEM key <= target and test
-                // coverage.  Leaf slots are stored in ascending key order.
-                // For a regular EXTENT_ITEM (type 168) the key.offset IS the
-                // extent length, so coverage is [objectid, objectid+offset).
+                // coverage.  Leaf slots are stored in ascending key order,
+                // so binary-search (`partition_point`) for the first slot
+                // whose key is > target — everything before that index has
+                // key <= target — instead of the previous linear scan from
+                // the start of the leaf, which was O(leaf size) per lookup.
+                // Other item types (e.g. EXTENT_DATA_REF) can share the
+                // same objectid and sort adjacent to an EXTENT_ITEM, so
+                // after landing at `count - 1` we still walk backward to
+                // the nearest EXTENT_ITEM slot — but that backward walk is
+                // bounded by how many non-EXTENT_ITEM entries share this
+                // one objectid, not by the whole leaf.  For a regular
+                // EXTENT_ITEM (type 168) the key.offset IS the extent
+                // length, so coverage is [objectid, objectid+offset).
+                let count = leaf
+                    .slots
+                    .partition_point(|slot| key_leq(&slot.key, &target));
                 let mut covering: Option<(usize, u64, u64)> = None; // (slot_idx, start, len)
-                for (i, slot) in leaf.slots.iter().enumerate() {
-                    if slot.key.ty != crate::btrfs::key::key_type::EXTENT_ITEM {
-                        continue;
-                    }
-                    if key_leq(&slot.key, &target) {
+                for i in (0..count).rev() {
+                    let slot = &leaf.slots[i];
+                    if slot.key.ty == crate::btrfs::key::key_type::EXTENT_ITEM {
                         covering = Some((i, slot.key.objectid, slot.key.offset));
-                    } else {
                         break;
                     }
                 }
@@ -338,39 +343,43 @@ fn csum_at(
         };
         match node {
             crate::btrfs::node::Node::Internal(internal) => {
-                let mut chosen: Option<u64> = None;
-                for ptr in &internal.ptrs {
-                    if key_leq(&ptr.key, &target) {
-                        chosen = Some(ptr.blockptr);
-                    } else {
-                        break;
-                    }
-                }
-                match chosen {
-                    Some(b) => node_logical = b,
-                    None => return CsumLive::None,
+                // Binary search: `ptrs` is ascending-key-sorted.
+                let count = internal
+                    .ptrs
+                    .partition_point(|ptr| key_leq(&ptr.key, &target));
+                match count {
+                    0 => return CsumLive::None,
+                    _ => node_logical = internal.ptrs[count - 1].blockptr,
                 }
             }
             crate::btrfs::node::Node::Leaf(leaf) => {
                 // Find the EXTENT_CSUM run whose [start, start+len) covers
                 // `sector`.  Runs are keyed by their start logical address,
                 // which lives in `key.offset` (the objectid is always
-                // EXTENT_CSUM_OBJECTID = -10).
-                for (i, slot) in leaf.slots.iter().enumerate() {
-                    if slot.key.ty != crate::btrfs::key::key_type::EXTENT_CSUM {
-                        continue;
-                    }
-                    let run_start = slot.key.offset;
-                    let data = leaf.item_data(i);
-                    if data.len() % hash_len != 0 {
-                        continue;
-                    }
-                    let n = (data.len() / hash_len) as u64;
-                    let run_end = run_start + n * sector_size;
-                    if sector >= run_start && sector < run_end {
-                        let idx = ((sector - run_start) / sector_size) as usize;
-                        let base = idx * hash_len;
-                        return CsumLive::Some(data[base..base + hash_len].to_vec());
+                // EXTENT_CSUM_OBJECTID = -10).  Every slot in a CSUM_TREE
+                // leaf is uniformly `(EXTENT_CSUM_OBJECTID, EXTENT_CSUM, *)`
+                // (unlike EXTENT_TREE leaves, no other item type shares this
+                // objectid), so a plain binary search on `key.offset` lands
+                // exactly on the covering run with no type filter needed —
+                // no linear leaf scan required.
+                let count = leaf
+                    .slots
+                    .partition_point(|slot| key_leq(&slot.key, &target));
+                if count > 0 {
+                    let i = count - 1;
+                    let slot = &leaf.slots[i];
+                    if slot.key.ty == crate::btrfs::key::key_type::EXTENT_CSUM {
+                        let run_start = slot.key.offset;
+                        let data = leaf.item_data(i);
+                        if data.len() % hash_len == 0 {
+                            let n = (data.len() / hash_len) as u64;
+                            let run_end = run_start + n * sector_size;
+                            if sector >= run_start && sector < run_end {
+                                let idx = ((sector - run_start) / sector_size) as usize;
+                                let base = idx * hash_len;
+                                return CsumLive::Some(data[base..base + hash_len].to_vec());
+                            }
+                        }
                     }
                 }
                 return CsumLive::None;

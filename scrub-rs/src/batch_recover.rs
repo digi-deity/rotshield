@@ -330,6 +330,13 @@ fn flush_batch(
     batch.dedup_by(|a, b| a.devid == b.devid && a.array_phys == b.array_phys);
 
     // One freeze for the whole batch's reconfirm + write + read-back.
+    // Deliberately NOT per-candidate: toggling FIFREEZE/FITHAW on and off
+    // for every sector in the batch would flicker the live filesystem
+    // frozen/thawed dozens of times per batch, which is its own source of
+    // stalls/latency spikes for anything doing I/O against the mount
+    // during recovery. A single freeze held for the whole batch is a
+    // bounded, predictable window (at most `batch_max` candidates' worth
+    // of reconfirm + write), preferred over frequent on/off flapping.
     let _freeze_guard = freeze.guard();
 
     for cand in batch.iter() {
@@ -369,9 +376,22 @@ fn flush_batch(
             }
             Reconfirm::Corruption => {}
         }
-        stats.mismatch += 1;
 
-        // Recover via parity.
+        // Read the failing disk's CURRENT bytes now, before counting this
+        // as a confirmed mismatch.  `reconfirm_mismatch` above only checks
+        // tree state (does the live CSUM_TREE still expect `stored_csum`
+        // here?) — it never re-reads the actual on-disk bytes, so it
+        // cannot see a live rewrite that hasn't committed a new csum yet
+        // (e.g. NODATACOW in-place rewrites, or the ordinary lag between a
+        // COW write landing on disk and its transaction committing to the
+        // CSUM_TREE). On a live, actively-written filesystem that gap lets
+        // a purely transient, already-self-healed write race get counted
+        // as `stats.mismatch` and logged as a scary FAILED/RECOVERED line
+        // even though the data was never actually bad by the time we could
+        // act on it. Checking the verifier against a FRESH read here closes
+        // that gap: if the current bytes already pass, treat it exactly
+        // like `Reconfirm::Stale` — no mismatch counted, nothing logged as
+        // corruption, no parity recovery attempted.
         let corrupt_block = match stripe::read_block_or_zeros(
             cfg,
             &cand.failing_dev,
@@ -381,10 +401,19 @@ fn flush_batch(
             Ok(b) => b,
             Err(e) => {
                 eprintln!("  [0x{:x}] read failing disk: {e}", cand.raw_phys);
+                stats.mismatch += 1;
                 stats.failed += 1;
                 continue;
             }
         };
+        if (cand.verify)(&corrupt_block) {
+            // Self-healed since the scan/reconfirm read: the live bytes
+            // now match the stored csum. Benign churn, not corruption.
+            stats.stale += 1;
+            continue;
+        }
+        stats.mismatch += 1;
+
         let stripe_chunks =
             match stripe::gather_stripe(cfg, scrub_slot, cand.array_phys, cand.block_size) {
                 Ok(s) => s,

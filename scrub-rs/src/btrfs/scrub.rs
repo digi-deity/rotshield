@@ -818,7 +818,7 @@ fn process_buf(
             // race the write.  The freeze is held only for this sector's
             // reconfirm+write window.
             let _freeze_guard = freeze.as_mut().and_then(|fc| fc.guard());
-            let is_corruption = match crate::btrfs::open::live_data_tree_roots(
+            let tree_says_corrupt = match crate::btrfs::open::live_data_tree_roots(
                 reader,
                 chunk_map,
                 reader.base_offset(),
@@ -841,9 +841,27 @@ fn process_buf(
                 }
                 None => true,
             };
+            // `reconfirm_mismatch` only checks TREE state (does the live
+            // CSUM_TREE still expect `stored` here?) — it never re-reads
+            // the actual on-disk bytes, so it cannot see a live rewrite
+            // that hasn't committed a new csum yet (NODATACOW in-place
+            // rewrites, or the ordinary lag between a COW write landing on
+            // disk and its transaction committing to the CSUM_TREE). Read
+            // the CURRENT bytes at this physical offset now and only keep
+            // treating this as corruption if they *still* disagree with
+            // `stored` — otherwise it already self-healed since we first
+            // read it, and reporting it would be a scary false positive.
+            let phys = dext.phys_start + (*sector_logical - dext.chunk_offset);
+            let is_corruption = tree_says_corrupt
+                && match reader.read_physical(dext.devid, phys, sz) {
+                    Ok(fresh) => &strategy.compute(&fresh) != stored,
+                    // Couldn't re-read — be conservative, keep the tree's
+                    // verdict rather than silently dropping a possible
+                    // mismatch.
+                    Err(_) => true,
+                };
             if is_corruption {
                 stats.sectors_mismatch += 1;
-                let phys = dext.phys_start + (*sector_logical - dext.chunk_offset);
                 on_sector(&SectorResult {
                     logical: *sector_logical,
                     devid: dext.devid,
