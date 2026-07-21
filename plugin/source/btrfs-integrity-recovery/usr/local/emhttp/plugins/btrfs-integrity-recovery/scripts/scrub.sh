@@ -59,8 +59,9 @@ freeze_mount_for() {
 
 notify_scrub() {
   local event="$1" subject="$2" description="$3" severity="$4"
-  command -v notify >/dev/null 2>&1 || return 0
-  notify -e "$event" -s "$subject" -d "$description" -i "$severity"
+  local notify_cmd="/usr/local/emhttp/webGui/scripts/notify"
+  [ -x "${notify_cmd}" ] || return 0
+  "${notify_cmd}" -e "$event" -s "$subject" -d "$description" -i "$severity"
 }
 
 notify_scrub_started() {
@@ -158,12 +159,12 @@ run() {
   local overall_rc=0
   local errored=0
   local idx=0
+  local notify_dir; notify_dir="$(mktemp -d)"
   {
     echo "[${start_ts}] starting sequential scrub of: ${devlist} ${opts}"
     for device in ${devlist}; do
       idx=$((idx + 1))
       write_status 1 "running" 0 "${run_log}" "${device}" "${idx}/${total}" "${total}"
-      notify_scrub_started "${device}" "${idx}" "${total}"
       # Target the RAW rdev: scrub-rs reads the btrfs superblock at the
       # partition offset, so we must pass --offset +<rdevOffset> (sectors)
       # from /proc/nmdstat. If the offset is wrong, scrub-rs rejects the
@@ -212,44 +213,53 @@ run() {
       (
         "${SCRUB}" "${device}" ${dev_opts} 2>&1
         echo "${?}" > "${rc_file}"
-      ) | tee -a "${run_log}" "${device_log}"
+      ) | tee "${device_log}"
       local rc; rc="$(cat "${rc_file}"; rm -f "${rc_file}")"
       local recovery_note; recovery_note="$(recovery_note_for_log "${device_log}")"
+      local status_msg=""
       if grep -q "scrub complete:" "${device_log}"; then
         # Tool ran to completion. Map the exit code to a human label.
         case "${rc}" in
           0)
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: OK (clean)"
-            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "OK (clean)${recovery_note}"
+            status_msg="OK (clean)${recovery_note}"
             ;;
           3)
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND (rc=3)"
-            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ISSUES FOUND${recovery_note}"
+            status_msg="ISSUES FOUND${recovery_note}"
             ;;
           4)
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND — all recoverable (rc=4)"
-            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ISSUES FOUND - all recoverable${recovery_note}"
+            status_msg="ISSUES FOUND - all recoverable${recovery_note}"
             ;;
           5)
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND — some UNRECOVERABLE (rc=5)"
-            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ISSUES FOUND - some UNRECOVERABLE${recovery_note}"
+            status_msg="ISSUES FOUND - some UNRECOVERABLE${recovery_note}"
             ;;
           6)
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: METADATA FATAL — unmount + btrfs check --repair"
-            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "METADATA FATAL${recovery_note}"
+            status_msg="METADATA FATAL${recovery_note}"
             ;;
           *)
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ISSUES FOUND (rc=${rc})"
-            notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ISSUES FOUND${recovery_note}"
+            status_msg="ISSUES FOUND${recovery_note}"
             ;;
         esac
       else
         # No completion marker => the tool aborted (bad args, unopenable
         # device, panic). Treat as a real error.
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ERROR(rc=${rc})"
-        notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "ERROR (rc=${rc})"
+        status_msg="ERROR (rc=${rc})"
         errored=1
       fi
+      # Store notification info in a temp file to be processed after the block
+      cat > "${notify_dir}/${idx}" <<EOF
+device=${device}
+idx=${idx}
+total=${total}
+rc=${rc}
+status=${status_msg}
+EOF
       rm -f "${device_log}"
       [ "${rc}" -gt "${overall_rc}" ] && overall_rc=${rc}
     done
@@ -281,6 +291,20 @@ run() {
       write_status 0 "OK" 0 "${run_log}" "" "${idx}/${total}" "${total}"
     fi
   } > "${run_log}"
+
+  # Process stored notifications outside the redirected block so they execute properly
+  for i in $(seq 1 ${total}); do
+    local notif_file="${notify_dir}/${i}"
+    if [ -f "${notif_file}" ]; then
+      # Source the notification data
+      source "${notif_file}"
+      # Send the notifications
+      notify_scrub_started "${device}" "${idx}" "${total}"
+      notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "${status}"
+      rm -f "${notif_file}"
+    fi
+  done
+  rm -rf "${notify_dir}"
 
   # Keep the persistent plugin log simple: append the exact run log bytes
   # instead of deriving a secondary summary format.
