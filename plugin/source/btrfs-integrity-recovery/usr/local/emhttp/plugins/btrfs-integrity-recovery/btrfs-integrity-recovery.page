@@ -139,13 +139,6 @@ if (is_dir($runs_dir)) {
 // Live running state, derived purely from the run lock (process check) so it
 // reflects BOTH manual and scheduled runs — no status-file bookkeeping.
 $running = trim(shell_exec("$plugin_dir/scripts/scrub.sh running 2>/dev/null")) === '1';
-$schedule_label = [
-    'disabled' => 'Disabled',
-    'weekly'   => 'Weekly (Sun 03:00)',
-    'monthly'  => 'Monthly (1st 03:00)',
-    'custom'   => 'Custom: ' . ($config['CRON'] ?? '(unset)'),
-][$config['SCHEDULE'] ?? 'disabled'] ?? 'Disabled';
-$cron_active = is_file("/etc/cron.d/$plugin");
 ?>
 <h1 style="margin:0 0 12px">btrfs Integrity Recovery</h1>
 <?php if ($message): ?><div class="notice"><?=htmlspecialchars($message)?></div><?php endif; ?>
@@ -192,8 +185,6 @@ pre { max-width: 100%; overflow-x: auto; }
             <option value="monthly"  <?=($config['SCHEDULE'] ?? '') === 'monthly'  ? 'selected' : ''?>>Monthly (1st 03:00)</option>
             <option value="custom"   <?=($config['SCHEDULE'] ?? '') === 'custom'   ? 'selected' : ''?>>Custom cron</option>
           </select>
-            <span class="label">Current: <b><?=htmlspecialchars($schedule_label)?></b>
-            <?= $cron_active ? '(cron active)' : '(no cron entry)' ?></span>
 </td></tr>
     <tr id="cron-row" style="<?=($config['SCHEDULE'] ?? 'disabled') === 'custom' ? '' : 'display:none'?>"><td>Custom cron <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">5-field cron time spec (minute hour day-of-month month day-of-week), used only when Schedule = Custom cron — e.g. <code>0 4 1 * *</code> runs at 04:00 on the 1st of each month. The value is strictly validated (only digits and *, ?, /, ,, - allowed) before saving, so an invalid entry is rejected and the schedule left disabled rather than injected. Leave blank to disable the custom schedule.</span></span></td>
         <td><input type="text" name="cron" size="22" value="<?=htmlspecialchars($config['CRON'] ?? '')?>" placeholder="0 4 1 * *">
