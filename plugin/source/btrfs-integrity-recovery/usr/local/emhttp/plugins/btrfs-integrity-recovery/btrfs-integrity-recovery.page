@@ -145,10 +145,12 @@ $running = trim(shell_exec("$plugin_dir/scripts/scrub.sh running 2>/dev/null")) 
 
 <style>
 /* Keep the settings form and log view within the page width; long log lines
-   scroll inside the log block instead of widening the whole page. */
-table.settings { width: 100%; table-layout: fixed; }
+   scroll inside the log block instead of widening the whole page. The label
+   column stays a modest fixed width so inputs align right next to their
+   pre-text instead of being pushed far right on wide screens. */
+table.settings { max-width: 100%; }
 table.settings td { overflow-wrap: break-word; word-wrap: break-word; vertical-align: top; }
-table.settings td:first-child { width: 34%; }
+table.settings td:first-child { width: 260px; padding-right: 12px; }
 pre { max-width: 100%; overflow-x: auto; }
 .help-block { position: relative; display: inline-block; }
 .help-block .fa-question-circle { cursor: help; color: #6c757d; margin-left: 6px; vertical-align: middle; }
