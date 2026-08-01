@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.08.01a">
-<!ENTITY bundleversion "2026.08.01a">
+<!ENTITY version       "2026.08.01b">
+<!ENTITY bundleversion "2026.08.01b">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,11 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.01b
+- Settings form: align inputs with their pre-text labels (fixed-width label
+  column, no more whitespace gap on wide screens); removed the redundant
+  "Current: ..." hint behind the schedule dropdown.
 
 ###2026.08.01a
 - Settings page no longer overflows the viewport: the settings table is
