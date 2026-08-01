@@ -57,11 +57,15 @@ freeze_mount_for() {
   findmnt -n -o TARGET -S "$dev" 2>/dev/null | head -1
 }
 
+# Send a notification via the unRAID Dynamix notify script. notify writes
+# its tickets to files / sends mail itself and never needs stdout, so we
+# silence it — this makes it safe to call from inside the run() log-redirected
+# block without polluting the run log.
 notify_scrub() {
   local event="$1" subject="$2" description="$3" severity="$4"
   local notify_cmd="/usr/local/emhttp/webGui/scripts/notify"
   [ -x "${notify_cmd}" ] || return 0
-  "${notify_cmd}" -e "$event" -s "$subject" -d "$description" -i "$severity"
+  "${notify_cmd}" -e "$event" -s "$subject" -d "$description" -i "$severity" >/dev/null 2>&1
 }
 
 notify_scrub_started() {
@@ -95,6 +99,17 @@ notify_scrub_finished() {
     "$subject" \
     "$description" \
     "$severity"
+}
+
+notify_scrub_stopped() {
+  local device="${1:-}"
+  local description="Manual stop requested"
+  [ -n "${device}" ] && description="${device}: ${description}"
+  notify_scrub \
+    "${PLUGIN}_scrub_stopped" \
+    "Scrub stopped" \
+    "${description}" \
+    "warning"
 }
 
 recovery_note_for_log() {
@@ -159,7 +174,6 @@ run() {
   local overall_rc=0
   local errored=0
   local idx=0
-  local notify_dir; notify_dir="$(mktemp -d)"
   {
     echo "[${start_ts}] starting sequential scrub of: ${devlist} ${opts}"
     for device in ${devlist}; do
@@ -191,6 +205,9 @@ run() {
         fi
       fi
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) scrubbing ${device}"
+      # Notify the operator the moment this device's scrub actually starts —
+      # NOT deferred until the whole (possibly multi-day) run finishes.
+      notify_scrub_started "${device}" "${idx}" "${total}"
       # Stream scrub-rs output DIRECTLY into the run log (via tee) instead
       # of capturing it into a shell variable.  This makes every line —
       # including the early parity canary check — appear in the log the
@@ -252,14 +269,10 @@ run() {
         status_msg="ERROR (rc=${rc})"
         errored=1
       fi
-      # Store notification info in a temp file to be processed after the block
-      cat > "${notify_dir}/${idx}" <<EOF
-device=${device}
-idx=${idx}
-total=${total}
-rc=${rc}
-status=${status_msg}
-EOF
+      # Notify the operator as soon as this device's result is known, so the
+      # ticket reflects the real per-device outcome (not a stale "OK" from a
+      # later source() of a temp file).
+      notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "${status_msg}"
       rm -f "${device_log}"
       [ "${rc}" -gt "${overall_rc}" ] && overall_rc=${rc}
     done
@@ -291,20 +304,6 @@ EOF
       write_status 0 "OK" 0 "${run_log}" "" "${idx}/${total}" "${total}"
     fi
   } > "${run_log}"
-
-  # Process stored notifications outside the redirected block so they execute properly
-  for i in $(seq 1 ${total}); do
-    local notif_file="${notify_dir}/${i}"
-    if [ -f "${notif_file}" ]; then
-      # Source the notification data
-      source "${notif_file}"
-      # Send the notifications
-      notify_scrub_started "${device}" "${idx}" "${total}"
-      notify_scrub_finished "${device}" "${idx}" "${total}" "${rc}" "${status}"
-      rm -f "${notif_file}"
-    fi
-  done
-  rm -rf "${notify_dir}"
 
   # Keep the persistent plugin log simple: append the exact run log bytes
   # instead of deriving a secondary summary format.
@@ -439,10 +438,15 @@ stop() {
   # run that is no longer alive. Preserve the existing log path if present.
   FINISH_TS="$(date '+%Y-%m-%d %H:%M:%S')"
   local prev_log=""
+  local prev_current=""
   if [ -f "${STATUS_FILE}" ]; then
     prev_log="$(grep -oP '"log"\s*:\s*"\K[^"]+' "${STATUS_FILE}" 2>/dev/null)"
+    prev_current="$(grep -oP '"current"\s*:\s*"\K[^"]+' "${STATUS_FILE}" 2>/dev/null)"
   fi
   write_status 0 "STOPPED" 130 "${prev_log}" "" "0/0" "0"
+  # A manual stop produces its own notification so the operator knows the
+  # scrub was interrupted rather than completed.
+  notify_scrub_stopped "${prev_current}"
   echo "Scrub stopped."
 }
 
