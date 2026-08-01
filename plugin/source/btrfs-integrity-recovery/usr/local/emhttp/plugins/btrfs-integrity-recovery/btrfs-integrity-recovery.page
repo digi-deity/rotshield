@@ -15,9 +15,7 @@ $plugin      = "btrfs-integrity-recovery";
 $plugin_dir  = "/usr/local/emhttp/plugins/$plugin";
 $config_dir  = "/boot/config/plugins/$plugin";
 $config_file = "$config_dir/config.cfg";
-$status_file = "$config_dir/lastrun.json";
 $runs_dir    = "$config_dir/runs";
-$log_file    = "/var/log/$plugin.log";
 
 // Validate a 5-field cron time spec (min hour day-of-month month day-of-week).
 // Each field must be non-empty and contain only safe cron characters, so a
@@ -33,7 +31,7 @@ function cron_expr_valid($expr) {
 
 if (!is_file($config_file)) {
     @mkdir($config_dir, 0777, true);
-    file_put_contents($config_file, "DEVICES=/dev/nmd1p1\nDEVICE=/dev/nmd1p1\nSCHEDULE=disabled\nCRON=\nRECOVER=1\nWRITE=0\nFREEZE_MOUNT=\nNO_FREEZE=0\nBATCH_MAX=\nBATCH_IDLE=\nEXTRA_OPTIONS=\n");
+    file_put_contents($config_file, "DEVICES='/dev/nmd1p1'\nDEVICE='/dev/nmd1p1'\nSCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nNO_FREEZE=0\nBATCH_MAX=\nBATCH_IDLE=\nEXTRA_OPTIONS=\n");
 }
 $config = parse_ini_file($config_file);
 
@@ -79,11 +77,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $batch_max= escapeshellarg(trim($_POST['batch_max']   ?? ''));
     $batch_idle=escapeshellarg(trim($_POST['batch_idle']  ?? ''));
     $extra    = escapeshellarg(trim($_POST['extra_options'] ?? ''));
+    // Single-quote every string value so the file is valid BOTH as PHP INI
+    // (parse_ini_file strips the quotes) AND as a bash `source`d file. An
+    // unquoted space-separated value — DEVICES with multiple disks, or a
+    // 5-field CRON expression — would otherwise be executed as commands when
+    // scrub.sh / rc.<plugin> source it, silently dropping the setting.
     file_put_contents($config_file,
-        "DEVICES=$devices_csv\n" .
-        "DEVICE={$sel[0]}\n" .
-        "SCHEDULE=$schedule\n" .
-        "CRON=$cron\n" .
+        "DEVICES='$devices_csv'\n" .
+        "DEVICE='{$sel[0]}'\n" .
+        "SCHEDULE='$schedule'\n" .
+        "CRON='$cron'\n" .
         "RECOVER=$recover\n" .
         "WRITE=$write\n" .
         "NO_FREEZE=$no_freeze\n" .
@@ -112,8 +115,15 @@ if (isset($_GET['log'])) {
     $candidate = "$runs_dir/$want";
     if (is_file($candidate)) { $view_log = file_get_contents($candidate); $view_title = "Log: $want"; }
 } elseif (isset($_GET['view'])) {
-    $last = trim(exec("$plugin_dir/scripts/scrub.sh lastlog 2>/dev/null"));
-    if ($last && is_file($last)) { $view_log = file_get_contents($last); $view_title = "Latest run log"; }
+    // Latest run = most recently modified run-*.log (same rotation as the
+    // history dropdown). Shown verbatim, no parsing or special handling.
+    $latest = '';
+    $candidates = glob("$runs_dir/run-*.log") ?: [];
+    if ($candidates) {
+        usort($candidates, fn($a, $b) => filemtime($b) <=> filemtime($a));
+        $latest = $candidates[0];
+    }
+    if ($latest && is_file($latest)) { $view_log = file_get_contents($latest); $view_title = "Latest run log"; }
 }
 
 // Build the list of past run logs (newest first) for the history dropdown.
@@ -126,8 +136,9 @@ if (is_dir($runs_dir)) {
     $run_logs = array_keys($run_logs);
 }
 
-$status    = is_file($status_file) ? file_get_contents($status_file) : '{"status": "never run", "running": false}';
-$st        = json_decode($status, true) ?: [];
+// Live running state, derived purely from the run lock (process check) so it
+// reflects BOTH manual and scheduled runs — no status-file bookkeeping.
+$running = trim(shell_exec("$plugin_dir/scripts/scrub.sh running 2>/dev/null")) === '1';
 $schedule_label = [
     'disabled' => 'Disabled',
     'weekly'   => 'Weekly (Sun 03:00)',
@@ -219,23 +230,13 @@ $cron_active = is_file("/etc/cron.d/$plugin");
   <p>
     <input type="submit" name="save" value="Save Settings">
     <input type="submit" name="run"  value="Run Scrub Now">
-    <input type="submit" name="stop" value="Stop Scrub" <?= !empty($st['running']) ? '' : 'style="display:none"' ?>>
+    <input type="submit" name="stop" value="Stop Scrub" <?= $running ? '' : 'style="display:none"' ?>>
     <a class="button localURL" href="?plugin=<?=htmlspecialchars($plugin)?>&view=1">View Logs</a>
   </p>
 </form>
 
-<h2>Last run</h2>
-<?php if (!empty($st)): ?>
-<p>
-  <b>Status:</b> <?=htmlspecialchars($st['status'] ?? '?')?>
-  <?php if (!empty($st['running'])): ?>
-    &nbsp;·&nbsp; <b>Progress:</b> <?=htmlspecialchars($st['progress'] ?? '')?>
-    &nbsp;·&nbsp; <b>Current:</b> <?=htmlspecialchars($st['current'] ?? '')?>
-  <?php endif; ?>
-  &nbsp;·&nbsp; <b>Disks:</b> <?=htmlspecialchars($st['devices'] ?? '')?>
-</p>
-<?php endif; ?>
-<pre><?=htmlspecialchars(json_encode($st, JSON_PRETTY_PRINT))?></pre>
+<h2>Status</h2>
+<p><b>Scrub:</b> <?= $running ? '<span style="color:#c00">Running</span>' : 'Idle' ?></p>
 
 <?php if ($view_log !== "" || isset($_GET['view']) || isset($_GET['log'])): ?>
 <h2><?=htmlspecialchars($view_title)?></h2>

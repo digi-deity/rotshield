@@ -23,11 +23,13 @@ chmod 755        "${RC}"
 # Default config (INI-style so both bash and PHP can read it unquoted).
 mkdir -p "${CONFIG_DIR}"
 if [ ! -f "${CONFIG_FILE}" ]; then
+  # Defaults written single-quoted for string values so the file parses as
+  # BOTH PHP INI and a bash `source`d file (see the Settings page for why).
   cat > "${CONFIG_FILE}" <<'EOF'
-DEVICES=/dev/loop2
-DEVICE=/dev/loop2
-SCHEDULE=disabled
-CRON=
+DEVICES='/dev/nmd1p1'
+DEVICE='/dev/nmd1p1'
+SCHEDULE='disabled'
+CRON=''
 RECOVER=1
 WRITE=0
 NO_FREEZE=0

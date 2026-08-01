@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.07.20e">
-<!ENTITY bundleversion "2026.07.20e">
+<!ENTITY version       "2026.08.01">
+<!ENTITY bundleversion "2026.08.01">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -15,130 +15,22 @@
 <CHANGES>
 ##&name;
 
-###2026.07.20e
-- Plugin: revert Settings help from the standard unRAID/Dynamix `<div
-  class="help">` block (which only toggles via the global Help button and
-  did not surface per-option) back to the inline `?` help popovers. The
-  popover is now triggered on **hover** (CSS `:hover` + `:focus-within` for
-  keyboard), not click, so it shows while the pointer is over the `?` and
-  hides on mouse-out — no click-to-toggle state to get stuck.
-
-###2026.07.20d
-- Plugin: replace the custom inline help popovers with the standard unRAID/
-  Dynamix help system. Every Settings option now uses a `<div class="help">`
-  block toggled by the built-in unRAID **Help** button (no custom CSS/JS).
-- Plugin: change Target disk(s) from a multi-select dropdown to per-disk
-  checkboxes (more intuitive; same `devices[]` POST handling).
-- Plugin: revert run-log naming to `run-<timestamp>.log` (no disk-set suffix);
-  each run is one combined log covering all selected disks, so the suffix
-  added noise without value.
-- Plugin: fix a stray premature `</table>` on the Settings page that had
-  orphaned the lower option rows outside the table.
-- scrub-rs: add an advisory **parity canary** check at scrub start. Before the
-  full scrub, scrub-rs reconstructs the target disk's superblock block from the
-  other data disks + primary parity (the same machinery recovery depends on)
-  and verifies the btrfs magic. A mismatch warns loudly that the array
-  config/slot/parity may be misconfigured, but does not abort the run — the
-  scrub still proceeds so the operator sees the actual data state.
-
-###2026.07.20c
-- Plugin: schedule rework. Removed the `daily` preset (a scrub can take
-  multiple days and would overlap its own previous run). Added `monthly`
-  (03:00 on the 1st) and a `custom` option that accepts a validated 5-field
-  cron time spec (`CRON` config key), so operators can set any sane interval.
-- Plugin: add `Stop Scrub` button + `scrub.sh stop` command to terminate a
-  running scrub (kills the runner process group and any scrub-rs children).
-- Plugin: fix Settings page device discovery — use `shell_exec()` instead of
-  `exec()` so multi-disk arrays are no longer truncated to the last disk.
-- Plugin: fix uninstall to remove the exact Slackware package name
-  (`btrfs-integrity-recovery-x86_64-1`) instead of a no-op glob, and stop the
-  schedule before removing the plugin tree.
-- Plugin: add inline help popovers to the Settings page.
-
-###2026.07.20
-- HDD read-prefetch overhaul (additive on top of 2026.07.19b's
-  reader-thread + parallel-checksum pipeline):
-  - Metadata-walk prefetch: `walk_leaves` now issues
-    `posix_fadvise(POSIX_FADV_WILLNEED)` for the next 2 child pointers
-    queued (chunk-map-aware, all DUP/RAID1 metadata stripes hinted)
-    before pop()'ing each node. Single hook back-propagates to ALL
-    metadata walks (open-time CHUNK/ROOT/DEV sweeps, the once-only
-    CSUM-tree header sweep, every per-dev-extent `LazyCsumProvider::range`
-    streaming call, and the EXTENT_TREE reconfirm walk). On HDD the
-    bulk-data DEV-tree sweep was already sequential; the seek-dominated
-    remaining cost was the scattered metadata reads — each `WILLNEED`
-    hint is one nodesize block (<=64 KiB), well inside the kernel's 1-MiB
-    readahead cap, so the disk starts fetching the next leaf while we
-    parse + cross-check the current one.
-  - Reader-thread prefetch + page-cache hygiene: the bulk-read reader
-    thread (which bypasses `FsReader::read_physical`) now issues
-    `advise_willneed(off + len, min(len, 64 MiB))` before each `read_at`
-    (restoring the prefetch behaviour `read_physical` has on the inline
-    path) and `advise_dontneed(off, len)` after each read, so a multi-TiB
-    one-pass scrub does not progressively evict every other cached page
-    behind itself as it walks.
-  - Cross-dev-extent lookahead: `scrub_dev_tree`'s outer dev-extent loop
-    prefetches the first run of dev-extent N+1 before streaming chunk
-    N's csum-tree entries — closes the gap where a long BLAKE2/SHA256
-    checksum window crosses a chunk boundary into a new `dext` and the
-    previous in-chunk prefetch hint has been consumed.
-  - `FsReader` exposes `prefetch_logical(&ChunkMap, logical, len)` and
-    `evict_physical_range(phys, len)`, plus `pub(crate)` fns
-    `advise_willneed` / `advise_dontneed` so the reader thread's own
-    dup'd `File` (which does not go through `FsReader::read_physical`)
-    can hint / no-op the kernel directly. All hints are advisory,
-    gated `#[cfg(unix)]`.
-- Memory invariants unchanged: depth-1 channels + MAX_RUN_SECTORS = 64
-  MiB per run, peak RAM still <= 2 x 64 MiB = 128 MiB at default cap,
-  independent of disk size. Prefetch hints are page-cache effects only,
-  not user-space allocations.
-- Verified: matrix TOTAL=30 PASS=27 FAIL=0 SKIPPED(unverified)=3,
-  byte-for-byte parity with `btrfs check --readonly --check-data-csum`
-  preserved.
-- Plugin: schedule rework. Removed the `daily` preset (a scrub can take
-  multiple days and would overlap its own previous run). Added `monthly`
-  (03:00 on the 1st) and a `custom` option that accepts a validated 5-field
-  cron time spec (`CRON` config key), so operators can set any sane interval.
-
-###2026.07.19b
-- Throughput overhaul:
-  - Fix OOM-kill (rc=137) on multi-TB disks: replace the eager
-    BTreeMap<u64, Vec<u8>> of every CSUM-tree entry with a lazy,
-    bounded-memory `LazyCsumProvider` that walks the CSUM tree on demand
-    per dev-extent. Peak RAM bounded by the largest single dev-extent's
-    csum span + one leaf buffer, independent of disk size. A separate
-    open-time header-only sweep counts metadata-header errors once per
-    bad leaf (preserves undercoverage semantics).
-  - Reader thread: decouple the bulk disk read from the CPU checksum
-    work via a dedicated thread on a dup'd file handle (own seek
-    position). Main thread coalesces runs and sends ReadCmds; reader
-    does one read_at per run and ships bytes back on a depth-1 channel.
-    While the main thread rayon-checksums run N, the reader is already
-    reading run N+1 from disk — fully overlaps CPU work with disk I/O
-    (closes the 1-MiB fadvise prefetch ceiling: a 64-MiB SHA256 run
-    takes ~4 s of CPU, far longer than the disk takes to read 1 MiB).
-  - Parallel checksum via rayon for every algorithm (crc32c / xxhash /
-    sha256 / blake2): one code path, no per-algo dispatch. Runs of ≥2
-    sectors go through par_iter; smaller runs stay serial.
-  - Kernel read-ahead via posix_fadvise(POSIX_FADV_SEQUENTIAL) at
-    FsReader::new stays as an advisory hint on the reader-side.
-- Read order preserved: DEV_TREE-driven ascending-physical walk
-  unchanged by the reader thread (FIFO sync_channel), so disk access
-  stays sequential within each contiguous run.
-- Verified: matrix TOTAL=30 PASS=27 FAIL=0 SKIPPED(unverified)=3,
-  byte-for-byte parity with btrfs check on case 12b, all 3 live
-  concurrent-churn scenarios (false-positive clean, true-positive
-  1 mismatch matching bytenr, dup-one-copy 1 mismatch matching bytenr).
-
-###2026.07.19a
-- Fix plugin install hook: bundle scripts (install.sh / uninstall.sh /
-  rc script) were packaged without the execute bit, causing the .plg
-  install step to fail with "/bin/bash returned 126".
-
-###2026.07.19
-- Initial release: ships the scrub-rs + craft-corrupt binaries and a
-  Settings page to run / schedule btrfs integrity scrubs.
+###2026.08.01
+- Log management simplified: past runs are rotated (newest 3 kept), selectable
+  and viewable verbatim from the Settings page; the status JSON file, progress
+  and current-device tracking were removed.
+- Running state is now derived live from a run lock (atomic mkdir), which also
+  prevents a manual and a scheduled scrub from running simultaneously for the
+  same disk(s). Stale locks are reclaimed automatically.
+- Notifications now fire in real time: "Scrub started" when each disk's scrub
+  launches, "Scrub finished" (with severity based on the result) as soon as
+  each disk completes, and "Scrub stopped" on manual stop.
+- Fixed: multi-disk DEVICES and custom CRON values in the config file were
+  unquoted and broke when sourced by bash; they are now quoted and valid for
+  both the PHP and bash config parsers.
+- Added scrub.sh running|devices subcommands; removed status|lastlog.
 </CHANGES>
+
 
 <!--
 Install the bundle. It already contains the prebuilt binaries
