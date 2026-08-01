@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.08.01">
-<!ENTITY bundleversion "2026.08.01">
+<!ENTITY version       "2026.08.01a">
+<!ENTITY bundleversion "2026.08.01a">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,13 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.01a
+- Settings page no longer overflows the viewport: the settings table is
+  constrained to the page width and long log lines scroll inside the log
+  block instead of widening the page.
+- Removed the redundant post-input hint labels (the field name + help bubble
+  already describe each option).
 
 ###2026.08.01
 - Log management simplified: past runs are rotated (newest 3 kept), selectable

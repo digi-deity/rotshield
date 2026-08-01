@@ -151,6 +151,12 @@ $cron_active = is_file("/etc/cron.d/$plugin");
 <?php if ($message): ?><div class="notice"><?=htmlspecialchars($message)?></div><?php endif; ?>
 
 <style>
+/* Keep the settings form and log view within the page width; long log lines
+   scroll inside the log block instead of widening the whole page. */
+table.settings { width: 100%; table-layout: fixed; }
+table.settings td { overflow-wrap: break-word; word-wrap: break-word; vertical-align: top; }
+table.settings td:first-child { width: 34%; }
+pre { max-width: 100%; overflow-x: auto; }
 .help-block { position: relative; display: inline-block; }
 .help-block .fa-question-circle { cursor: help; color: #6c757d; margin-left: 6px; vertical-align: middle; }
 .help-block .help-content {
@@ -191,7 +197,6 @@ $cron_active = is_file("/etc/cron.d/$plugin");
 </td></tr>
     <tr id="cron-row" style="<?=($config['SCHEDULE'] ?? 'disabled') === 'custom' ? '' : 'display:none'?>"><td>Custom cron <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">5-field cron time spec (minute hour day-of-month month day-of-week), used only when Schedule = Custom cron — e.g. <code>0 4 1 * *</code> runs at 04:00 on the 1st of each month. The value is strictly validated (only digits and *, ?, /, ,, - allowed) before saving, so an invalid entry is rejected and the schedule left disabled rather than injected. Leave blank to disable the custom schedule.</span></span></td>
         <td><input type="text" name="cron" size="22" value="<?=htmlspecialchars($config['CRON'] ?? '')?>" placeholder="0 4 1 * *">
-            <span class="label">5-field cron time spec (min hour day month weekday), used only when Schedule = Custom cron. A scrub can take days, so daily is not offered. Example <code>0 4 1 * *</code> = 04:00 on the 1st of each month.</span>
 </td></tr>
   <script>
   document.querySelector('select[name="schedule"]').addEventListener('change', function () {
@@ -206,7 +211,6 @@ $cron_active = is_file("/etc/cron.d/$plugin");
             <label style="display:block"><input type="checkbox" name="devices[]" value="<?=htmlspecialchars($d)?>" <?=in_array($d, $selected, true) ? 'checked' : ''?>><?=htmlspecialchars($d)?></label>
             <?php endforeach; ?>
           </div>
-            <span class="label">Raw array data disks (e.g. /dev/sdX, /dev/nvmeXnY, /dev/loopX) — scrubbed sequentially. The partition offset is auto-applied from /proc/nmdstat; parity disks are excluded.</span>
 </td></tr>
     <tr><td>Repair disk <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Writes reconstructed blocks back to the disk (scrub-rs --repair). By default the tool runs in SAFE dry-run mode: it still reads every checksum, flags mismatches, and rebuilds the correct data from parity to tell you whether the corruption is recoverable — but it never touches the disk. Tick this only when you actually want the recovered blocks written back. The batch and freeze settings below only take effect in this repair mode; in the default dry-run they do nothing.</span></span></td>
         <td><label><input type="checkbox" name="write" value="1" <?=($config['WRITE'] ?? 0) ? 'checked' : ''?>> write reconstructed blocks back (--repair; default is dry-run assessment only)</label>
@@ -216,15 +220,12 @@ $cron_active = is_file("/etc/cron.d/$plugin");
 </td></tr>
     <tr><td>Batch max <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Max corruption candidates gathered into one recovery batch before it is written (scrub-rs --batch-max, default 64). Batching means one freeze/thaw cycle per burst instead of one per sector, and re-confirmation is deferred to write time so only still-corrupt blocks get written. Because corruption is rare on a healthy array, this rarely matters — it only becomes relevant under serious corruption during a repair run. Leave at the default unless you have a specific throughput reason to change it.</span></span></td>
         <td><input type="text" name="batch_max" size="10" value="<?=htmlspecialchars($config['BATCH_MAX'] ?? '')?>" placeholder="64">
-            <span class="label">max candidates per recovery batch</span>
 </td></tr>
     <tr><td>Batch idle (s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Idle seconds to wait before flushing a partially-filled recovery batch (scrub-rs --batch-idle, default 5.0). Guarantees a single isolated corruption still flushes promptly instead of waiting for the batch to fill. Like Batch max, this applies only during repair mode and is inconsequential for the usual rare, isolated corruption. Leave at the default in almost all cases.</span></span></td>
         <td><input type="text" name="batch_idle" size="10" value="<?=htmlspecialchars($config['BATCH_IDLE'] ?? '')?>" placeholder="5.0">
-            <span class="label">flush a batch after this many idle seconds</span>
 </td></tr>
     <tr><td>Extra options <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Advanced: extra arguments appended verbatim to the scrub-rs command line (e.g. --dump-array or --resolve for debugging). Anything you type is passed through unmodified, so invalid flags will make the scrub fail with a usage error. Most users should leave this empty.</span></span></td>
         <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>">
-            <span class="label">advanced: appended verbatim to the scrub-rs command</span>
 </td></tr>
   </table>
   <p>
