@@ -1,4 +1,6 @@
-//! Early environment/config canary for the array.
+//! Early environment/config canary for the array — glue that composes the
+//! array duty (gather) with the recovery duty (P-only reconstruction) and
+//! leaves "what does good look like?" to the caller's filesystem probe.
 //!
 //! Before committing to a full scrub + recovery pass, we want a cheap,
 //! early signal that the array is wired correctly: that the parity disk
@@ -7,16 +9,14 @@
 //! misconfigured array (wrong slot, stale/out-of-sync parity, offset
 //! mismatch) and any recovery we attempt later would be built on sand.
 //!
-//! This module is deliberately filesystem-agnostic: it reconstructs raw
+//! This module is deliberately **filesystem-agnostic**: it reconstructs raw
 //! bytes from parity and returns them.  The caller (main) decides what
-//! "good" means — e.g. checking for a btrfs magic — so no btrfs knowledge
-//! leaks in here.  It reuses [`crate::array::stripe::gather_stripe`] (the
-//! array duty) and [`crate::recovery::engine::recover_via_p`] (the pure
-//! parity math), the same two pieces the real recovery path uses, so the
-//! canary exercises the exact machinery recovery depends on.  It imports
-//! nothing from `btrfs/` or `fs/`, preserving the separation of duties:
-//! the array layer knows how to gather + XOR a stripe; it does not know
-//! what a "valid" block looks like.
+//! "good" means — e.g. checking for a btrfs magic via the filesystem's
+//! `block_has_magic` probe — so no btrfs knowledge leaks in here.  It is
+//! glue by design: it composes [`crate::array::stripe::gather_stripe`]
+//! (the array duty) with [`crate::recovery::engine::recover_via_p`] (the
+//! pure parity math), the same two pieces the real recovery path uses, so
+//! the canary exercises the exact machinery recovery depends on.
 
 use std::io;
 

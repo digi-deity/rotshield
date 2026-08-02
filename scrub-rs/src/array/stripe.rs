@@ -1,12 +1,11 @@
 //! Assemble the aligned chunks of one stripe across all array disks.
 //!
-//! This is the **array duty** in scrub-rs's separation of responsibilities.
 //! Given an array-space byte offset and a block size, gather the
 //! `block_size`-byte chunk sitting at that offset on every data disk (the
 //! failing one excluded, since recovery reconstructs it) plus the P and Q
 //! parity chunks — all in raw-rdev space (each disk's `rdevOffset` is
 //! added internally).  This produces exactly the input the
-//! [`recovery`] engine needs, with no filesystem knowledge leaking in.
+//! [`recovery`] engine needs, with no filesystem knowledge involved.
 //!
 //! # Asymmetric arrays
 //!

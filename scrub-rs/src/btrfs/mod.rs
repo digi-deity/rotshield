@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod chunk;
 pub mod csum;
 pub mod csum_strategy;

@@ -72,18 +72,21 @@ struct NodeRef {
     exp_owner: Option<u64>,
 }
 
-pub fn walk_leaves<F, E, M>(
+#[allow(clippy::too_many_arguments)]
+pub fn walk_leaves<F, E, M, R>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
     f: F,
     on_metadata_error: E,
     on_mirror_mismatch: M,
+    on_read_error: R,
 ) -> std::io::Result<()>
 where
     F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
     E: FnMut(u64),
     M: FnMut(u64),
+    R: FnMut(u64),
 {
     walk_leaves_impl(
         reader,
@@ -93,6 +96,7 @@ where
         f,
         on_metadata_error,
         on_mirror_mismatch,
+        on_read_error,
     )
 }
 
@@ -115,7 +119,7 @@ where
 /// the whole scrub. Bounding the descent to the requested key window
 /// turns each call into O(range_size + log(tree_size)), independent of N.
 #[allow(clippy::too_many_arguments)]
-pub fn walk_leaves_range<F, E, M>(
+pub fn walk_leaves_range<F, E, M, R>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
@@ -124,11 +128,13 @@ pub fn walk_leaves_range<F, E, M>(
     f: F,
     on_metadata_error: E,
     on_mirror_mismatch: M,
+    on_read_error: R,
 ) -> std::io::Result<()>
 where
     F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
     E: FnMut(u64),
     M: FnMut(u64),
+    R: FnMut(u64),
 {
     walk_leaves_impl(
         reader,
@@ -138,10 +144,12 @@ where
         f,
         on_metadata_error,
         on_mirror_mismatch,
+        on_read_error,
     )
 }
 
-fn walk_leaves_impl<F, E, M>(
+#[allow(clippy::too_many_arguments)]
+fn walk_leaves_impl<F, E, M, R>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
@@ -149,11 +157,13 @@ fn walk_leaves_impl<F, E, M>(
     mut f: F,
     mut on_metadata_error: E,
     mut on_mirror_mismatch: M,
+    mut on_read_error: R,
 ) -> std::io::Result<()>
 where
     F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
     E: FnMut(u64),
     M: FnMut(u64),
+    R: FnMut(u64),
 {
     // BFS queue of (logical, expectation) pairs to visit.  We use a Vec as
     // a deque.  The root has no parent, so its expectations are unknown.
@@ -174,13 +184,27 @@ where
         // node we pass the parent's expected generation so `read_node` can
         // reject a stale (freed/reused) block.
         let expected_generation = exp_gen.unwrap_or(super::reader::GEN_DONT_CHECK);
-        let res = reader.read_node(
+        let res = match reader.read_node(
             chunk_map,
             logical,
             expected_generation,
             exp_level,
             exp_owner,
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(_e) => {
+                // A **read (device EIO) error**: the node's bytes could not
+                // be fetched at all.  We cannot trust this branch, so skip
+                // it (do NOT descend, do NOT hand its items to the caller)
+                // and keep walking the rest of the queue — never abort a
+                // whole tree walk on a single unreadable node.  This is a
+                // hardware fault, distinct from a header-checksum failure
+                // (which surfaces via `on_metadata_error`), so it is
+                // counted separately via `on_read_error`.
+                on_read_error(logical);
+                continue;
+            }
+        };
         if res.all_mirrors_failed || res.generation_mismatch {
             // We cannot verify this node's header against any mirror copy,
             // or the only verifiable copy is stale (generation mismatch) — in

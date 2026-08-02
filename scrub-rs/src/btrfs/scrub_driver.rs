@@ -24,14 +24,19 @@
 
 use std::io;
 
+use std::sync::Arc;
+
 use crate::btrfs::chunk::ChunkMap;
 use crate::btrfs::csum::LazyCsumProvider;
 use crate::btrfs::csum_strategy::CsumStrategy;
 use crate::btrfs::dev_extent::build_dev_extents;
+use crate::btrfs::extent::reconfirm_mismatch;
+use crate::btrfs::open::live_data_tree_roots;
 use crate::btrfs::reader::FsReader;
 use crate::btrfs::scrub::scrub_dev_tree;
 use crate::btrfs::superblock::Superblock;
-use crate::fs::{ScrubEvent, ScrubStats, SectorVerifier};
+use crate::fs;
+use crate::fs::{Reconfirm, ReconfirmRequest, Reconfirmer, ScrubEvent, ScrubStats, SectorVerifier};
 
 /// A btrfs filesystem scrub.
 ///
@@ -79,14 +84,14 @@ pub struct BtrfsScrub {
     /// corrupt DUP metadata copy is reported (self-heal-recoverable) rather
     /// than silently healed by the good-copy cross-check.
     metadata_mirror_mismatches: u64,
-    /// When set, the physical-order scrub emits *raw* csum mismatches as
-    /// recovery candidates (via the `on_event` callback) instead of
-    /// re-confirming them inline.  The caller is expected to drive
-    /// batched reconfirmation + recovery (typically on a separate writer
-    /// thread that owns the live-filesystem freeze).  Used only in
-    /// `--repair` mode; plain scrubs keep the inline reconfirm so
-    /// their mismatch/stale accounting is unchanged.
-    recover_batch: bool,
+    /// Metadata nodes that failed with a READ (EIO) error during the
+    /// chunk/root/DEV-tree walks — the bytes could not be fetched at all.
+    /// Folded into the scrub stats so a hardware-faulting metadata node
+    /// surfaces as a hard error rather than a silent skip.
+    metadata_read_errors: u64,
+    /// The device path this filesystem was opened from, for the CLI header
+    /// ([`FilesystemScrub::describe`]).
+    dev: String,
 }
 
 impl BtrfsScrub {
@@ -114,6 +119,7 @@ impl BtrfsScrub {
             strategy,
             mut metadata_header_errors,
             mut metadata_mirror_mismatches,
+            mut metadata_read_errors,
         } = ctx;
 
         // Build the lazy CSUM-tree walker up front (cheap — it owns an
@@ -162,6 +168,7 @@ impl BtrfsScrub {
             superblock.devid,
             &mut metadata_header_errors,
             &mut metadata_mirror_mismatches,
+            &mut metadata_read_errors,
         )?;
 
         Ok(Self {
@@ -173,124 +180,28 @@ impl BtrfsScrub {
             superblock,
             metadata_header_errors,
             metadata_mirror_mismatches,
-            recover_batch: false,
+            metadata_read_errors,
+            dev: dev.to_string(),
         })
     }
 
-    /// Enable batched recovery mode: the physical-order scrub emits raw
-    /// csum mismatches as candidates (via `on_event`) instead of
-    /// re-confirming inline.  The caller drives batched reconfirm +
-    /// recovery (typically a writer thread owning the freeze).  Must be
-    /// set before [`FilesystemScrub::run`].
-    pub fn set_recover_batch(&mut self, on: bool) {
-        self.recover_batch = on;
-    }
+}
 
-    /// The checksum strategy (algorithm + sector size), copied out for a
-    /// writer thread that needs to re-confirm candidates against the live
-    /// trees.
-    pub fn strategy(&self) -> CsumStrategy {
-        self.strategy
-    }
-
-    /// A clone of the populated chunk map, for a writer thread that needs
-    /// to resolve logical→physical during re-confirmation.
-    pub fn chunk_map_clone(&self) -> ChunkMap {
-        self.chunk_map.clone()
-    }
-
-    /// Metadata-header error count, finalised during `open()` (the
-    /// chunk/root-tree walks) — known before the scrub loop starts, so a
-    /// writer thread can refuse writes when the metadata was untrustworthy.
-    pub fn metadata_header_errors(&self) -> u64 {
-        self.metadata_header_errors
-    }
-
-    /// Mirrored-metadata mismatch count, finalised during `open()` (the
-    /// [`crate::btrfs::open::verify_metadata_mirrors`] pass) — known before
-    /// the scrub loop starts.  These are self-heal-recoverable (a good copy
-    /// exists) but are reported so a single corrupt DUP/RAID1 metadata copy
-    /// is not silently healed.
-    pub fn metadata_mirror_mismatches(&self) -> u64 {
-        self.metadata_mirror_mismatches
-    }
-
-    /// The btrfs device id of the opened filesystem.
-    pub fn devid(&self) -> u64 {
-        self.superblock.devid
-    }
-
-    /// The filesystem node size (for constructing a re-confirm reader).
-    pub fn node_size(&self) -> usize {
-        self.superblock.node_size as usize
-    }
-
-    /// The filesystem UUID (for constructing a re-confirm reader).
-    pub fn fsid(&self) -> [u8; 16] {
-        self.superblock.fsid
-    }
-
-    /// The partition byte offset this filesystem was opened at.
-    pub fn base_offset(&self) -> u64 {
-        self.reader.base_offset()
-    }
-
-    /// Borrow the parsed superblock — exposed for diagnostic / `--dump`
-    /// style commands that want to print fs-level info without re-opening
-    /// the device separately.
-    pub fn superblock(&self) -> &Superblock {
-        &self.superblock
-    }
-
-    /// Upper bound on the number of data sectors that *could* be scrubbed
-    /// — the sum of every DATA dev-extent's length divided by the sector
-    /// size.  This over-counts free space inside allocated chunks (the
-    /// scrub walks only the subset of those sectors actually covered by
-    /// a CSUM tree entry), but is a useful, bounded progress-log estimate
-    /// computed without materialising the lazy csum provider.  The previous
-    /// eager-map exposed the *exact* count; the lazy provider keeps that
-    /// data off the heap until the scrub loop asks for it, so we return an
-    /// upper bound here.  The sum is bounded by `dev_extents.len()` so the
-    /// computation stays cheap regardless of disk size.
-    pub fn num_sectors(&self) -> usize {
-        self.dev_extents
-            .iter()
-            .map(|e| (e.length / self.strategy.sector_size) as usize)
-            .sum()
-    }
-
-    /// Human-readable name of the filesystem's checksum algorithm (e.g.
-    /// "crc32c", "xxhash", "sha256", "blake2"), taken from the superblock.
-    pub fn csum_name(&self) -> &'static str {
-        self.strategy.name
-    }
-
-    /// Upper bound on the bytes of checksummed data — `num_sectors()` *
-    /// sector_size.  See [`Self::num_sectors`] for why this is an upper
-    /// bound rather than an exact count.
-    pub fn csum_bytes(&self) -> u64 {
-        self.num_sectors() as u64 * self.strategy.sector_size
-    }
-
-    /// Number of dev-extents the DEV_TREE walk enumerated — useful for the
-    /// caller's progress log when driving the physical-order scrub.
-    pub fn num_dev_extents(&self) -> usize {
-        self.dev_extents.len()
-    }
-
+impl fs::FilesystemScrub for BtrfsScrub {
     /// Run the scrub: drive reads off the DEV_TREE (ascending physical
     /// order) for a single front-to-back pass over the disk, while still
-    /// consulting the CSUM tree (via `csum_map`) for the per-sector
-    /// expected checksum.  This is the sole scrub path — the earlier
-    /// per-inode (`scrub_extents`) and logical-order CSUM-tree
+    /// consulting the CSUM tree (via the lazy csum provider) for the
+    /// per-sector expected checksum.  This is the sole scrub path — the
+    /// earlier per-inode (`scrub_extents`) and logical-order CSUM-tree
     /// (`scrub_csum_tree`) variants were removed.  See
     /// [`crate::btrfs::scrub::scrub_dev_tree`] for the `ScrubStats`
     /// semantics (notably `sectors_no_csum` stays 0 here).
-    pub fn run(
-        &mut self,
-        callbacks: &mut dyn crate::fs::ScrubCallbacks,
-        freeze: Option<&mut crate::freeze::FreezeController>,
-    ) -> io::Result<ScrubStats> {
+    ///
+    /// Whether mismatches are emitted raw (deferred re-confirmation by the
+    /// recovery sink) or re-confirmed inline is decided by
+    /// [`ScrubCallbacks::wants_raw_candidates`].
+    fn run(&mut self, callbacks: &mut dyn crate::fs::ScrubCallbacks) -> io::Result<ScrubStats> {
+        let batch = callbacks.wants_raw_candidates();
         // Adapt btrfs's per-sector `SectorResult` callback into the two
         // contract streams:
         //
@@ -301,15 +212,19 @@ impl BtrfsScrub {
         //                 edonr vs crc32c) without touching the trait.
         //
         //   * `on_event` — only the recovery-correct fields: where on
-        //                  disk + the verifier closure.  No checksum
-        //                  bytes, no algorithm name, no diagnostic
-        //                  context.  This is the stable seam.
+        //                  disk, a verifier closure, and an opaque
+        //                  re-confirm request.  No checksum bytes, no
+        //                  algorithm name, no diagnostic context.  This
+        //                  is the stable seam.
         //
-        // The verifier is built *here* from the btrfs crc32c algorithm
+        // The verifier is built *here* from the btrfs checksum algorithm
         // bound together with the stored bytes, and handed straight to
-        // the caller via the event.  Recovery never learns which
-        // checksum btrfs used — exactly the seam we want for a future
-        // ZFS sha256/blake3 impl, which would build its own closure here.
+        // the caller via the event.  Recovery never learns which checksum
+        // btrfs used — exactly the seam we want for a future ZFS
+        // sha256/blake3 impl, which would build its own closure here.
+        // The re-confirm request is equally opaque: the recovery sink
+        // hands it back to `self.reconfirmer()` at write time, so btrfs's
+        // EXTENT_TREE/CSUM_TREE walk never leaks into the glue.
         let block_size = self.strategy.sector_size as usize;
         let mut emit = |r: &crate::btrfs::scrub::SectorResult| {
             // 1. Log line (btrfs-owned format).
@@ -334,19 +249,34 @@ impl BtrfsScrub {
             //    filesystem's csum strategy (algorithm + hash length) bound
             //    together with the stored bytes — recovery never learns
             //    which checksum btrfs used.  `Arc` so a batched writer
-            //    thread can clone it onto its channel.
-            let verify = r.stored_csum.as_ref().map(|stored| {
-                let stored = stored.clone();
-                let strategy = self.strategy;
-                std::sync::Arc::new(move |b: &[u8]| strategy.compute(b) == stored) as SectorVerifier
-            });
+            //    thread can clone it onto its channel.  The re-confirm
+            //    request carries the logical address + stored csum as an
+            //    opaque pair for the writer's [`Reconfirmer`].
+            let (verify, reconfirm) = match r.stored_csum.as_ref() {
+                None => (None, None),
+                Some(stored) => {
+                    let stored = stored.clone();
+                    let strategy = self.strategy;
+                    let verify = {
+                        let s = stored.clone();
+                        Arc::new(move |b: &[u8]| strategy.compute(b) == s) as SectorVerifier
+                    };
+                    let reconfirm = ReconfirmRequest {
+                        token: r.logical,
+                        stored_csum: stored,
+                    };
+                    (Some(verify), Some(reconfirm))
+                }
+            };
             callbacks.on_event(&ScrubEvent {
                 array_phys: r.array_phys,
                 block_size,
                 verify,
-                logical: r.logical,
-                devid: r.devid,
-                stored_csum: r.stored_csum.clone(),
+                reconfirm,
+                // A sector whose source bytes were unreadable (EIO) is
+                // flagged so the recovery sink skips its self-heal
+                // re-read and uses a zero placeholder instead.
+                unreadable: r.unreadable,
             });
         };
 
@@ -356,8 +286,7 @@ impl BtrfsScrub {
             &mut self.csum_provider,
             &self.dev_extents,
             &self.strategy,
-            self.recover_batch,
-            freeze,
+            batch,
             &mut emit,
         );
 
@@ -386,6 +315,113 @@ impl BtrfsScrub {
             metadata_header_errors: self.metadata_header_errors
                 + self.csum_provider.metadata_errors(),
             metadata_mirror_mismatches: self.metadata_mirror_mismatches,
+            metadata_read_errors: self.metadata_read_errors
+                + self.csum_provider.metadata_read_errors(),
         })
+    }
+
+    fn reconfirmer(&self) -> io::Result<Box<dyn Reconfirmer>> {
+        BtrfsReconfirmer::new(self).map(|r| Box::new(r) as Box<dyn Reconfirmer>)
+    }
+
+    fn describe(&self) -> Vec<String> {
+        let sb = &self.superblock;
+        let strategy = &self.strategy;
+        // Upper bound on checksummed data sectors, computed without
+        // materialising the lazy csum provider (see the old `num_sectors`
+        // doc for why it is an upper bound, not an exact count).
+        let num_sectors: u64 = self
+            .dev_extents
+            .iter()
+            .map(|e| e.length / strategy.sector_size)
+            .sum();
+        vec![
+            format!("device        : {}", self.dev),
+            format!(
+                "base offset   : 0x{:x} ({})",
+                self.reader.base_offset(),
+                self.reader.base_offset()
+            ),
+            format!("magic         : {:?}", sb.magic),
+            format!("fsid          : {}", crate::btrfs::util::hex(&sb.fsid)),
+            format!("bytenr        : 0x{:x}", sb.bytenr),
+            format!("generation   : {}", sb.generation),
+            format!("root          : 0x{:x}", sb.root),
+            format!("chunk_root    : 0x{:x}", sb.chunk_root),
+            format!("total_bytes   : {}", sb.total_bytes),
+            format!("bytes_used    : {}", sb.bytes_used),
+            format!("num_devices   : {}", sb.num_devices),
+            format!("sector_size   : {}", sb.sector_size),
+            format!("node_size     : {}", sb.node_size),
+            format!("stripesize    : {}", sb.stripesize),
+            format!("csum_type     : {} ({})", sb.csum_type, strategy.name),
+            format!(
+                "csum sectors  : {} ({} bytes)",
+                num_sectors,
+                num_sectors * strategy.sector_size
+            ),
+            format!("dev extents   : {}", self.dev_extents.len()),
+        ]
+    }
+
+    fn superblock_offset(&self) -> u64 {
+        crate::btrfs::superblock::SUPERBLOCK_OFFSET
+    }
+
+    fn block_has_magic(&self, block: &[u8]) -> bool {
+        crate::btrfs::superblock::has_magic_at(block, crate::btrfs::superblock::OFF_MAGIC)
+    }
+}
+
+/// btrfs's implementation of the seam's [`Reconfirmer`] — an independent
+/// handle (own `FsReader`, own `ChunkMap`) that re-checks a deferred csum
+/// mismatch against the *live* EXTENT_TREE + CSUM_TREE at write time.
+///
+/// Constructed via [`FilesystemScrub::reconfirmer`] from the scrub's own
+/// reader (a dup'd fd + the already-built chunk map), so the writer thread
+/// never shares the scrub's reader and the two can run concurrently.
+struct BtrfsReconfirmer {
+    reader: FsReader,
+    chunk_map: ChunkMap,
+    strategy: CsumStrategy,
+}
+
+impl BtrfsReconfirmer {
+    fn new(scrub: &BtrfsScrub) -> io::Result<Self> {
+        let f = scrub.reader.reopen()?;
+        let reader = FsReader::new(
+            f,
+            scrub.reader.node_size(),
+            scrub.reader.base_offset(),
+            Some(scrub.strategy),
+        )
+        .with_devid(scrub.superblock.devid)
+        .with_fsid(scrub.superblock.fsid);
+        Ok(Self {
+            reader,
+            chunk_map: scrub.chunk_map.clone(),
+            strategy: scrub.strategy,
+        })
+    }
+}
+
+impl Reconfirmer for BtrfsReconfirmer {
+    fn reconfirm(&mut self, req: &ReconfirmRequest) -> Reconfirm {
+        let base_offset = self.reader.base_offset();
+        match live_data_tree_roots(&mut self.reader, &self.chunk_map, base_offset) {
+            // Couldn't re-read the live trees — be conservative and treat
+            // as real corruption (never hide a possible mismatch).
+            None => Reconfirm::Corruption,
+            Some((ext_root, csum_root)) => reconfirm_mismatch(
+                &mut self.reader,
+                &self.chunk_map,
+                ext_root,
+                csum_root,
+                req.token,
+                &req.stored_csum,
+                self.strategy.hash_len,
+                self.strategy.sector_size,
+            ),
+        }
     }
 }

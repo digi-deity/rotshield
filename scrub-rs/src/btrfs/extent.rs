@@ -14,6 +14,7 @@
 //!        num_bytes    u64  (logical bytes in the file)
 
 use super::util::le_u64;
+use crate::fs::Reconfirm;
 
 pub const TYPE_INLINE: u8 = 0;
 pub const TYPE_REGULAR: u8 = 1;
@@ -84,37 +85,12 @@ pub mod extent_flag {
     pub const NODATASUM: u64 = 1 << 3;
 }
 
-/// Result of re-confirming a csum mismatch against the **live** EXTENT_TREE
+/// Re-confirm a data-sector csum mismatch against the **live** EXTENT_TREE
 /// and CSUM_TREE (see [`crate::btrfs::open::live_data_tree_roots`]).
 ///
-/// The mismatch filter only downgrades a mismatch to "stale" when the live
-/// trees agree the snapshot we scrubbed was out of date — i.e. the sector is
-/// no longer owned by a live extent, or the live csum differs from what we
-/// read (the extent was rewritten under us).  Anything else is treated as a
-/// genuine mismatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reconfirm {
-    /// The live trees confirm this is real corruption: the sector is still
-    /// owned by a live extent AND the live csum matches the (bad) data we
-    /// read.  Report it.
-    Corruption,
-    /// Benign churn: the sector is no longer owned by a live extent (freed /
-    /// orphaned csum entry), or the extent was written `nodatasum`, or the
-    /// live csum differs from what we read (extent rewritten).  Do NOT report
-    /// as corruption.
-    Stale,
-    /// The metadata needed to re-confirm *this specific sector* could not be
-    /// read (the EXTENT_TREE/CSUM_TREE node covering its logical address had
-    /// no good mirror copy).  This is **per-sector**, not global: a metadata
-    /// error elsewhere in the filesystem does NOT make this variant — only a
-    /// metadata error that actually blocks *this sector's* reconfirmation
-    /// does.  The caller should treat it as "cannot verify, skip the write"
-    /// for just this candidate, never as a reason to block unrelated writes.
-    Unverifiable,
-}
-
-/// Re-confirm a data-sector csum mismatch against the live EXTENT_TREE and
-/// CSUM_TREE.
+/// The verdict is [`crate::fs::Reconfirm`] — the seam type shared with the
+/// recovery sink — with btrfs's meaning for each variant described in the
+/// decision logic below.
 ///
 /// `logical` is the sector's logical address; `stored` is the csum our
 /// *frozen snapshot* (taken at `open()`) expected here.  `extent_root` /

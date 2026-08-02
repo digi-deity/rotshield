@@ -11,18 +11,21 @@
 #   usr/local/emhttp/plugins/btrfs-integrity-recovery/bin/
 # by CI (build-plugin.yml) before this script runs, so they are bundled.
 
-DIR="$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"
+DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 tmpdir=/tmp/tmp.$(( $RANDOM * 19318203981230 + 40 ))
-plugin=$(basename ${DIR})
-archive="$(dirname $(dirname ${DIR}))/archive"
-version=$(date +"%Y.%m.%d")
+plugin=$(basename "${DIR}")
+archive="$(dirname "$(dirname "${DIR}")")/archive"
 
 mkdir -p "$tmpdir" "$archive"
 
-cd "$DIR"
+cd "$DIR" || { echo "FATAL: cannot cd to $DIR"; exit 1; }
 # Copy every file except the build script and the .gitkeep placeholders.
+# The find output is intentionally unquoted so each relative path is passed
+# as a separate argument to cp (word-splitting is what we want here); the
+# tree is ours and contains no whitespace/special-char names.
+# shellcheck disable=SC2046
 cp --parents -f $(find . -type f ! \( -iname "pkg_build.sh" -o -iname ".gitkeep" \) ) "$tmpdir/"
-cd "$tmpdir"
+cd "$tmpdir" || { echo "FATAL: cannot cd to $tmpdir"; exit 1; }
 # Normalise line endings and make scripts executable.
 find . -type f \( -iname '*.sh' -o -iname '*.page' -o -iname '*.plg' -o -iname 'rc.*' \) -exec sed -i 's/\r//g' {} +
 chmod -R +x ./

@@ -44,10 +44,11 @@
 //!   verify + cache-invalidate window, so the live FS cannot mutate a block
 //!   between our reconfirm and our write.  It is released by the
 //!   `FreezeGuard` RAII drop at the end of the batch.
-//! * The writer owns its **own** `FsReader` + `ChunkMap` clone for
-//!   re-confirmation, so it never borrows the main scrub's reader — the
-//!   two threads touch disjoint file handles.  The main thread only
-//!   *reads* the raw rdev; only the writer *writes*.
+//! * The writer owns an **independent** [`Reconfirmer`] (a filesystem
+//!   handle with its own file handles + chunk map, built via
+//!   [`FilesystemScrub::reconfirmer`]), so it never borrows the main
+//!   scrub's reader — the two threads touch disjoint file handles.  The
+//!   main thread only *reads* the raw rdev; only the writer *writes*.
 //! * Read-back verification: after writing each recovered block the writer
 //!   re-reads it from the raw rdev and asserts the verifier accepts it; a
 //!   mismatch is logged as a warning.  It then issues `BLKFLSBUF` on the
@@ -61,14 +62,8 @@ use std::time::Duration;
 
 use crate::array::config::ArrayConfig;
 use crate::array::stripe;
-use crate::btrfs::chunk::ChunkMap;
-use crate::btrfs::csum_strategy::CsumStrategy;
-use crate::btrfs::extent::Reconfirm;
-use crate::btrfs::extent::reconfirm_mismatch;
-use crate::btrfs::open::live_data_tree_roots;
-use crate::btrfs::reader::FsReader;
 use crate::freeze::FreezeController;
-use crate::fs::SectorVerifier;
+use crate::fs::{Reconfirm, ReconfirmRequest, Reconfirmer, SectorVerifier};
 use crate::recovery::{RecoveryInput, RecoveryResult, recover_block};
 
 /// A single corruption candidate handed from the scrub thread to the
@@ -81,13 +76,6 @@ pub struct Candidate {
     pub array_phys: u64,
     /// Sector size in bytes.
     pub block_size: usize,
-    /// btrfs logical address of the sector (for live-tree re-confirmation).
-    pub logical: u64,
-    /// btrfs device id of the failing disk (== NonRAID slot).
-    pub devid: u64,
-    /// Stored (expected) csum bytes from the CSUM tree, for comparing
-    /// against the *live* expected csum during re-confirmation.
-    pub stored_csum: Vec<u8>,
     /// Verifier closure: `true` iff a candidate block is the correct
     /// original data.  Used both for recovery verification and read-back.
     pub verify: SectorVerifier,
@@ -95,6 +83,15 @@ pub struct Candidate {
     pub raw_phys: u64,
     /// Raw-rdev path of the failing disk, for the write-back.
     pub failing_dev: PathBuf,
+    /// Filesystem-opaque deferred re-confirmation request, handed back to
+    /// the writer's [`Reconfirmer`] at write time to decide stale-vs-
+    /// corrupt right before the write.
+    pub reconfirm: Option<ReconfirmRequest>,
+    /// The candidate's source bytes were **unreadable** (device `EIO`) —
+    /// the scrub could not read the failing disk at all, so the self-heal
+    /// fresh-read pre-check must be skipped (it would just `EIO` again)
+    /// and recovery must use a zero placeholder for the corrupt block.
+    pub unreadable: bool,
 }
 
 /// Producer→accumulator protocol (channel A, depth 1).
@@ -168,19 +165,14 @@ pub struct BatchStats {
 /// Returns the sending half of channel A (for the scrub to push
 /// candidates into) plus the two join handles.  The writer handle's `join`
 /// yields the [`BatchStats`].  The writer takes ownership of `freeze` (so
-/// the freeze lives entirely on its thread), a fresh `FsReader` + the
-/// populated `ChunkMap` clone for re-confirmation, and the array config.
+/// the freeze lives entirely on its thread), a filesystem-owned
+/// [`Reconfirmer`] (independent of the scrub's reader) for write-time
+/// re-confirmation, and the array config.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pipeline(
     cfg: ArrayConfig,
     freeze: FreezeController,
-    dev: String,
-    base_offset: u64,
-    strategy: CsumStrategy,
-    devid: u64,
-    fsid: [u8; 16],
-    node_size: usize,
-    chunk_map: ChunkMap,
+    reconfirmer: Box<dyn Reconfirmer>,
     scrub_slot: u64,
     dry_run: bool,
     batch_max: usize,
@@ -190,10 +182,6 @@ pub fn spawn_pipeline(
     std::thread::JoinHandle<()>,
     std::thread::JoinHandle<BatchStats>,
 )> {
-    let f = std::fs::File::open(&dev)?;
-    let mut reader = FsReader::new(f, node_size, base_offset, Some(strategy));
-    reader = reader.with_devid(devid).with_fsid(fsid);
-
     // Channel A: scrub -> accumulator (depth 1 => scrub pauses when one
     // batch is buffered).  Channel B: accumulator -> writer (depth 1 =>
     // accumulator pauses while the writer is busy, but can fill the next
@@ -209,9 +197,7 @@ pub fn spawn_pipeline(
     let writer_handle = std::thread::Builder::new()
         .name("scrub-writer".into())
         .spawn(move || {
-            run_writer(
-                rx_b, cfg, freeze, reader, chunk_map, scrub_slot, dry_run, strategy,
-            )
+            run_writer(rx_b, cfg, freeze, reconfirmer, scrub_slot, dry_run)
         })
         .expect("spawn scrub-writer thread");
 
@@ -283,11 +269,9 @@ fn run_writer(
     rx: mpsc::Receiver<BatchMsg>,
     cfg: ArrayConfig,
     mut freeze: FreezeController,
-    mut reader: FsReader,
-    chunk_map: ChunkMap,
+    mut reconfirmer: Box<dyn Reconfirmer>,
     scrub_slot: u64,
     dry_run: bool,
-    strategy: CsumStrategy,
 ) -> BatchStats {
     let mut stats = BatchStats::default();
 
@@ -296,11 +280,9 @@ fn run_writer(
             &batch,
             &cfg,
             &mut freeze,
-            &mut reader,
-            &chunk_map,
+            &mut reconfirmer,
             scrub_slot,
             dry_run,
-            strategy,
             &mut stats,
         );
     }
@@ -314,20 +296,18 @@ fn flush_batch(
     batch: &[Candidate],
     cfg: &ArrayConfig,
     freeze: &mut FreezeController,
-    reader: &mut FsReader,
-    chunk_map: &ChunkMap,
+    reconfirmer: &mut Box<dyn Reconfirmer>,
     scrub_slot: u64,
     dry_run: bool,
-    strategy: CsumStrategy,
     stats: &mut BatchStats,
 ) {
-    // Dedupe by (devid, array_phys): a DUP chunk yields two dev-extents
-    // with *different* array_phys (two physical copies), which must BOTH
-    // be recovered — so we keep distinct array_phys and only collapse a
-    // true accidental duplicate of the same physical location.
+    // Dedupe by array_phys: a DUP chunk yields two dev-extents with
+    // *different* array_phys (two physical copies), which must BOTH be
+    // recovered — so we keep distinct array_phys and only collapse a true
+    // accidental duplicate of the same physical location.
     let mut batch = batch.to_vec();
-    batch.sort_by_key(|a| (a.devid, a.array_phys));
-    batch.dedup_by(|a, b| a.devid == b.devid && a.array_phys == b.array_phys);
+    batch.sort_by_key(|a| a.array_phys);
+    batch.dedup_by(|a, b| a.array_phys == b.array_phys);
 
     // One freeze for the whole batch's reconfirm + write + read-back.
     // Deliberately NOT per-candidate: toggling FIFREEZE/FITHAW on and off
@@ -344,19 +324,10 @@ fn flush_batch(
         // Per-sector metadata trust: if the metadata covering *this*
         // sector could not be read, we skip just this candidate — we do
         // NOT block the other candidates in the batch.
-        let verdict = match live_data_tree_roots(reader, chunk_map, reader.base_offset()) {
-            Some((ext_root, csum_root)) => reconfirm_mismatch(
-                reader,
-                chunk_map,
-                ext_root,
-                csum_root,
-                cand.logical,
-                &cand.stored_csum,
-                strategy.hash_len,
-                strategy.sector_size,
-            ),
-            // Couldn't re-read the live trees — be conservative and treat
-            // as real corruption (never hide a possible mismatch).
+        let verdict = match &cand.reconfirm {
+            Some(req) => reconfirmer.reconfirm(req),
+            // No re-confirm request (no stored csum) — be conservative and
+            // treat as real corruption (never hide a possible mismatch).
             None => Reconfirm::Corruption,
         };
 
@@ -377,41 +348,41 @@ fn flush_batch(
             Reconfirm::Corruption => {}
         }
 
-        // Read the failing disk's CURRENT bytes now, before counting this
-        // as a confirmed mismatch.  `reconfirm_mismatch` above only checks
-        // tree state (does the live CSUM_TREE still expect `stored_csum`
-        // here?) — it never re-reads the actual on-disk bytes, so it
-        // cannot see a live rewrite that hasn't committed a new csum yet
-        // (e.g. NODATACOW in-place rewrites, or the ordinary lag between a
-        // COW write landing on disk and its transaction committing to the
-        // CSUM_TREE). On a live, actively-written filesystem that gap lets
-        // a purely transient, already-self-healed write race get counted
-        // as `stats.mismatch` and logged as a scary FAILED/RECOVERED line
-        // even though the data was never actually bad by the time we could
-        // act on it. Checking the verifier against a FRESH read here closes
-        // that gap: if the current bytes already pass, treat it exactly
-        // like `Reconfirm::Stale` — no mismatch counted, nothing logged as
-        // corruption, no parity recovery attempted.
-        let corrupt_block = match stripe::read_block_or_zeros(
-            cfg,
-            &cand.failing_dev,
-            cand.array_phys,
-            cand.block_size,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("  [0x{:x}] read failing disk: {e}", cand.raw_phys);
-                stats.mismatch += 1;
-                stats.failed += 1;
+        // Obtain the "current bytes on the failing disk" for the recovery
+        // engine.  For a NORMAL candidate this is a fresh read, used both
+        // to close the transient-rewrite gap (if the live bytes now pass
+        // the verifier, the sector self-healed — treat as stale, no write)
+        // and as the `corrupt_block` input.  For an UNREADABLE candidate
+        // (EIO) the disk cannot return bytes — skip the fresh read entirely
+        // (it would just EIO again, see `docs/EIO-robustness-design.md`
+        // §5.2) and use a zero placeholder, exactly as the canary does for
+        // its P-only reconstruction.
+        let unreadable = cand.unreadable;
+        let corrupt_block: Vec<u8> = if unreadable {
+            vec![0u8; cand.block_size]
+        } else {
+            let block = match stripe::read_block_or_zeros(
+                cfg,
+                &cand.failing_dev,
+                cand.array_phys,
+                cand.block_size,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("  [0x{:x}] read failing disk: {e}", cand.raw_phys);
+                    stats.mismatch += 1;
+                    stats.failed += 1;
+                    continue;
+                }
+            };
+            if (cand.verify)(&block) {
+                // Self-healed since the scan/reconfirm read: the live bytes
+                // now match the stored csum. Benign churn, not corruption.
+                stats.stale += 1;
                 continue;
             }
+            block
         };
-        if (cand.verify)(&corrupt_block) {
-            // Self-healed since the scan/reconfirm read: the live bytes
-            // now match the stored csum. Benign churn, not corruption.
-            stats.stale += 1;
-            continue;
-        }
         stats.mismatch += 1;
 
         let stripe_chunks =
@@ -426,6 +397,7 @@ fn flush_batch(
         let input = RecoveryInput {
             failing_slot: scrub_slot,
             corrupt_block: &corrupt_block,
+            unreadable_source: unreadable,
             other_blocks: &stripe_chunks.other_data,
             p_block: stripe_chunks.p_block.as_deref(),
             q_block: stripe_chunks.q_block.as_deref(),

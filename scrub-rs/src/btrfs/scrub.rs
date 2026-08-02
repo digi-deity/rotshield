@@ -66,6 +66,20 @@ const PARALLEL_MIN_SECTORS: usize = 2;
 /// [`scrub_dev_tree`] for the pipeline's bounded-memory invariant.
 const MAX_RUN_SECTORS: usize = 16384; // 16384 * 4096 = 64 MiB at default sector size
 
+/// Fan-out for the EIO divide-and-conquer ([`isolate_run`]): how many
+/// sector-aligned pieces a failing read range is split into per level.
+///
+/// A binary split (2) needs `log2(MAX_RUN_SECTORS)` = 14 *failing* reads to
+/// pinpoint one bad sector in a full 64 MiB run; an 8-way split cuts that
+/// to `log8(16384)` ≈ 5.  On a dying disk a failing read is the expensive
+/// event (it re-touches the bad sector), so we want that count low; the
+/// extra successful reads on good sectors that a wider fan-out costs are
+/// cheap normal wear.  Must be ≥ 2 — a factor of 1 would recurse forever.
+/// The split clamps to the range's sector count, so small runs (the common
+/// case) isolate in a single level regardless of this value.  See
+/// `docs/EIO-robustness-design.md` §5.1.
+const EIO_SPLIT_FACTOR: usize = 8;
+
 /// Pipeline depth (number of in-flight `ReadCmd`s / `ReadRsp`s on each
 /// side of the scrub reader thread).  Greater than 1 lets the reader
 /// thread issue several `read_at`s back-to-back without waiting for the
@@ -105,15 +119,13 @@ fn prefetch_depth_for(strategy: &CsumStrategy) -> usize {
     }
 }
 
-/// Command sent to the reader thread: read `len` bytes at `phys` on
-/// `devid`, attached to which dev-extent (`dext_idx`, `dext`) for the
-/// logical→physical translation the checksum loop needs.  `entries` is
-/// the slice of `(sector_logical, stored_csum)` pairs that the run
-/// covers — appended on the main thread (which owns `csum_entries`) and
-/// shipped with the command so the reader thread doesn't need to know
-/// about the CSUM tree.
+/// Command sent to the reader thread: read `len` bytes at `phys`,
+/// attached to which dev-extent (`dext`) for the logical→physical
+/// translation the checksum loop needs.  `entries` is the slice of
+/// `(sector_logical, stored_csum)` pairs that the run covers — appended
+/// on the main thread (which owns `csum_entries`) and shipped with the
+/// command so the reader thread doesn't need to know about the CSUM tree.
 struct ReadCmd {
-    devid: u64,
     phys: u64,
     len: usize,
     /// The dev-extent this run lives in.  Sent as a `DevExtent` copy so
@@ -123,23 +135,34 @@ struct ReadCmd {
     /// The `(sector_logical, stored_csum)` pairs covered by this run.
     /// Owned (not a reference) so it can move across the channel.
     entries: Vec<(u64, Vec<u8>)>,
+    /// Sector size in bytes.  Needed by the reader thread's EIO
+    /// divide-and-conquer (which splits the run on sector boundaries).
+    sector_size: u64,
 }
 
-/// Response from the reader thread: the bytes read for the run, plus
-/// the dev-extent + csum entries the main thread needs to drive the
-/// checksum/verify loop.  An `Err` carries the per-sector `(logical, devid)`
-/// list so the error path can attribute the read failure to every sector
-/// in the run (matching the previous inline-error attribution).
+/// Response from the reader thread: the run's bytes (or the isolated
+/// good/bad regions if a sector failed to read), plus the dev-extent and
+/// csum entries the main thread needs to drive the checksum/verify loop.
+///
+/// This is the ONLY result shape.  On a healthy disk the reader's
+/// divide-and-conquer takes its first step (a whole-run `pread`), succeeds,
+/// and yields exactly one good region covering the whole run with no bad
+/// sectors — the degenerate case IS the happy path, so there is no separate
+/// `Ok` variant to drift.  When the run's read fails, the reader has
+/// already divided-and-conquered the byte range down to sector granularity:
+/// `good` lists the sectors that read fine (as `(byte_start_within_run,
+/// bytes)` regions, each sector-aligned) and `bad` lists the byte starts of
+/// the sectors that failed with `EIO`.  This bounds the blast radius of one
+/// bad sector to itself instead of discarding the whole (up to 64 MiB) run
+/// — see `docs/EIO-robustness-design.md` §5.1.
 enum ReadRsp {
-    Ok {
-        buf: Vec<u8>,
+    Isolated {
         dext: DevExtent,
         entries: Vec<(u64, Vec<u8>)>,
-    },
-    Err {
-        dext: DevExtent,
-        entries: Vec<(u64, Vec<u8>)>,
-        err: std::io::Error,
+        /// Sector-aligned good regions: `(byte_start_within_run, bytes)`.
+        good: Vec<(usize, Vec<u8>)>,
+        /// Sector-aligned byte starts of the sectors that failed (EIO set).
+        bad: Vec<usize>,
     },
 }
 
@@ -178,6 +201,13 @@ pub struct SectorResult {
     pub stored_csum: Option<Vec<u8>>,
     /// The freshly computed checksum of the on-disk data, as raw bytes.
     pub actual_csum: Vec<u8>,
+    /// The sector's source bytes were **unreadable** (device `EIO`) — the
+    /// sector could not be read at all, so `actual_csum` is empty and there
+    /// is no on-disk data to compare against the stored csum.  This is the
+    /// clearest "the disk is broken" signal and, with a stored csum
+    /// available, is recoverable from parity.  `false` for a sector that
+    /// read fine (whether its csum matched or not).
+    pub unreadable: bool,
     pub ok: bool,
 }
 
@@ -268,7 +298,6 @@ pub fn scrub_dev_tree<F>(
     dev_extents: &[DevExtent],
     strategy: &CsumStrategy,
     batch: bool,
-    mut freeze: Option<&mut crate::freeze::FreezeController>,
     mut on_sector: F,
 ) -> ScrubStats
 where
@@ -338,7 +367,6 @@ where
                 dev_extents,
                 strategy,
                 batch,
-                freeze,
                 on_sector,
             );
         }
@@ -410,18 +438,16 @@ where
                     readahead,
                 );
 
-                let rsp = match pread_at(&f, off, cmd.len) {
-                    Ok(buf) => ReadRsp::Ok {
-                        buf,
-                        dext: cmd.dext,
-                        entries: cmd.entries,
-                    },
-                    Err(e) => ReadRsp::Err {
-                        dext: cmd.dext,
-                        entries: cmd.entries,
-                        err: e,
-                    },
-                };
+                // The reader thread owns the `File` (a dup of the main
+                // reader's), so it is the right place to own the EIO
+                // divide-and-conquer.  `isolate_run_read` always produces
+                // the single `Isolated` result shape: on a healthy disk it
+                // does a whole-run `pread` (its first step) and yields one
+                // good region with no bad sectors — the degenerate happy
+                // path — and on a read failure it isolates the good regions
+                // from the truly-bad sectors so a single bad sector no
+                // longer discards the whole (up to 64 MiB) run.
+                let rsp = isolate_run_read(&f, off, cmd);
                 // Skip `POSIX_FADV_DONTNEED` here.  An earlier version
                 // dropped pages immediately after read so a multi-TiB one-
                 // pass scrub would not evict every other cached page
@@ -558,9 +584,8 @@ where
         // reaches `prefetch_depth` — block-receive and process the
         // *oldest* outstanding response to make room.  Captures all the
         // borrows the inner processing path needs — `reader` for the
-        // reconfirm walk, `freeze` for the live-mount freeze guard,
-        // `on_sector` for the mismatch emit, `stats` for counters, plus
-        // the channel endpoints.
+        // reconfirm walk, `on_sector` for the mismatch emit, `stats` for
+        // counters, plus the channel endpoints.
         let mut flush = |run: &mut Vec<(u64, Vec<u8>)>| {
             if run.is_empty() {
                 return;
@@ -568,11 +593,11 @@ where
             let run_phys = dext.phys_start + (run[0].0 - dext.chunk_offset);
             let run_len = run.len() * sz;
             let cmd = ReadCmd {
-                devid: dext.devid,
                 phys: run_phys,
                 len: run_len,
                 dext: *dext,
                 entries: std::mem::take(run),
+                sector_size,
             };
             // 1. Send the cmd.  The command channel itself is bounded to
             //    `prefetch_depth` slots, so this blocks only if the
@@ -595,7 +620,6 @@ where
                     chunk_map,
                     strategy,
                     batch,
-                    &mut freeze,
                     &mut on_sector,
                     &mut stats,
                 );
@@ -636,7 +660,6 @@ where
                     chunk_map,
                     strategy,
                     batch,
-                    &mut freeze,
                     &mut on_sector,
                     &mut stats,
                 );
@@ -669,7 +692,6 @@ fn scrub_dev_tree_inline<F>(
     dev_extents: &[DevExtent],
     strategy: &CsumStrategy,
     batch: bool,
-    mut freeze: Option<&mut crate::freeze::FreezeController>,
     mut on_sector: F,
 ) -> ScrubStats
 where
@@ -698,34 +720,38 @@ where
             }
             let run_phys = dext.phys_start + (run[0].0 - dext.chunk_offset);
             let run_len = run.len() * sz;
-            match reader.read_physical(dext.devid, run_phys, run_len) {
-                Ok(buf) => process_buf(
-                    &buf,
-                    run,
-                    dext,
-                    strategy,
-                    batch,
-                    &mut freeze,
-                    reader,
-                    chunk_map,
-                    &mut on_sector,
-                    &mut stats,
-                ),
-                Err(e) => {
-                    for (sector_logical, _stored) in run.iter() {
-                        stats.sectors_checked += 1;
-                        stats.bytes_checked += sector_size;
-                        stats.sectors_read_error += 1;
-                        eprintln!(
-                            "read error at phys 0x{:x} (devid {}, logical 0x{:x}): {}",
-                            dext.phys_start + (*sector_logical - dext.chunk_offset),
-                            dext.devid,
-                            *sector_logical,
-                            e
-                        );
-                    }
-                }
+            // Single path, same as the pipelined reader: isolate the run
+            // into good regions + bad sectors.  On a healthy disk this is
+            // one whole-run read (`isolate_run`'s first step) -> one good
+            // region, no bad sectors — the degenerate happy path.
+            let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
+            let mut bad: Vec<usize> = Vec::new();
+            {
+                let mut read = |phys: u64, len: usize| {
+                    reader.read_physical(dext.devid, phys, len)
+                };
+                isolate_run(
+                    &mut read,
+                    run_phys,
+                    0,
+                    run_len,
+                    sector_size,
+                    &mut good,
+                    &mut bad,
+                );
             }
+            process_isolated(
+                good,
+                bad,
+                dext,
+                run,
+                strategy,
+                batch,
+                reader,
+                chunk_map,
+                &mut on_sector,
+                &mut stats,
+            );
         };
         csum_provider.range(logical_lo, logical_hi, |e| {
             let contiguous = match prev_logical {
@@ -745,13 +771,13 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Shared run-processing helper — used by both the pipelined path (from the
-// reader thread's `ReadRsp::Ok` arm of `process_rsp`) and the inline
-// fallback (directly after `reader.read_physical`).  Runs the parallel
-// checksum via rayon, then the serial comparison — counting
-// ok/mismatch/no-csum/stale + invoking the reconfirm/freeze/emit path on
-// actual mismatches.  This is the same logic that previously lived inline
-// in `scrub_dev_tree::flush`; extracted so the two call sites don't drift.
+// Shared run-processing helper — used by both the pipelined path (from
+// `process_rsp`'s [`ReadRsp`] arm) and the inline fallback (directly after
+// `isolate_run`).  Runs the parallel checksum via rayon, then the serial
+// comparison — counting ok/mismatch/no-csum/stale + invoking the
+// reconfirm/emit path on actual mismatches.  This is the same logic that
+// previously lived inline in `scrub_dev_tree::flush`; extracted so the
+// call sites don't drift.
 #[allow(clippy::too_many_arguments)]
 fn process_buf(
     buf: &[u8],
@@ -759,7 +785,6 @@ fn process_buf(
     dext: &DevExtent,
     strategy: &CsumStrategy,
     batch: bool,
-    freeze: &mut Option<&mut crate::freeze::FreezeController>,
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     on_sector: &mut impl FnMut(&SectorResult),
@@ -808,16 +833,15 @@ fn process_buf(
                 file_offset: 0,
                 stored_csum: Some(stored.clone()),
                 actual_csum: actual.clone(),
+                unreadable: false,
                 ok: false,
             });
         } else {
             // Re-confirm against the LIVE EXTENT_TREE + CSUM_TREE before
             // reporting corruption.  Only runs on the rare mismatch path.
-            // The reconfirm AND the recovery write (via `on_sector`) are
-            // wrapped in a scoped filesystem freeze so a live mount cannot
-            // race the write.  The freeze is held only for this sector's
-            // reconfirm+write window.
-            let _freeze_guard = freeze.as_mut().and_then(|fc| fc.guard());
+            // The scrub walker never freezes and never writes here — a
+            // live-mount freeze (if any) is owned by the recovery sink at
+            // write time, not by the walker.
             let tree_says_corrupt = match crate::btrfs::open::live_data_tree_roots(
                 reader,
                 chunk_map,
@@ -836,7 +860,7 @@ fn process_buf(
                             strategy.hash_len,
                             strategy.sector_size,
                         ),
-                        crate::btrfs::extent::Reconfirm::Corruption
+                        crate::fs::Reconfirm::Corruption
                     )
                 }
                 None => true,
@@ -870,21 +894,21 @@ fn process_buf(
                     file_offset: 0,
                     stored_csum: Some(stored.clone()),
                     actual_csum: actual.clone(),
+                    unreadable: false,
                     ok: false,
                 });
             } else {
                 stats.sectors_stale += 1;
             }
-            // `_freeze_guard` dropped here -> filesystem thawed.
         }
     }
 }
 
 // `process_rsp` is the entry point the pipelined path calls inside its
-// flush closure.  It dispatches a `ReadRsp` from the reader thread into
-// `process_buf` (Ok) or the per-sector read-error attribution path (Err).
-// Separated from `process_buf` so the inline fallback can call
-// `process_buf` directly without having to wrap a fake `ReadRsp`.
+// flush closure.  There is a single [`ReadRsp`] shape — the reader's
+// divide-and-conquer output (good regions + bad sectors) — so this just
+// hands it to `process_isolated`, which re-verifies the good regions via
+// `process_buf` and counts/emits the bad (EIO) sectors.
 #[allow(clippy::too_many_arguments)]
 fn process_rsp(
     rsp: ReadRsp,
@@ -892,29 +916,423 @@ fn process_rsp(
     chunk_map: &ChunkMap,
     strategy: &CsumStrategy,
     batch: bool,
-    freeze: &mut Option<&mut crate::freeze::FreezeController>,
     on_sector: &mut impl FnMut(&SectorResult),
     stats: &mut ScrubStats,
 ) {
-    match rsp {
-        ReadRsp::Ok { buf, dext, entries } => {
-            process_buf(
-                &buf, &entries, &dext, strategy, batch, freeze, reader, chunk_map, on_sector, stats,
-            );
+    let ReadRsp::Isolated {
+        dext,
+        entries,
+        good,
+        bad,
+    } = rsp;
+    process_isolated(
+        good,
+        bad,
+        &dext,
+        &entries,
+        strategy,
+        batch,
+        reader,
+        chunk_map,
+        on_sector,
+        stats,
+    );
+}
+
+/// The reader thread's run-read handler: always divide-and-conquer the
+/// byte range, isolating the good regions from the truly-bad sectors (see
+/// `docs/EIO-robustness-design.md` §5.1).
+///
+/// `isolate_run`'s first step is a whole-run `pread`; on a healthy disk it
+/// succeeds and yields one good region covering the whole run with no bad
+/// sectors — so the happy path flows through this same function (no
+/// separate `Ok` variant).  On a failed read it recurses down to sector
+/// granularity.
+///
+/// Takes ownership of the `ReadCmd` (whose `entries`/`dext` must be moved
+/// into the resulting [`ReadRsp`]).  `phys` here is raw-rdev space (already
+/// had `base_offset` added in the reader thread); `read_exact_at` is
+/// positional so the offset is exact.
+fn isolate_run_read(f: &std::fs::File, off: u64, cmd: ReadCmd) -> ReadRsp {
+    let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut bad: Vec<usize> = Vec::new();
+    isolate_run(
+        &mut |phys: u64, len: usize| pread_at(f, phys, len),
+        off,
+        0,
+        cmd.len,
+        cmd.sector_size,
+        &mut good,
+        &mut bad,
+    );
+    ReadRsp::Isolated {
+        dext: cmd.dext,
+        entries: cmd.entries,
+        good,
+        bad,
+    }
+}
+
+/// Divide-and-conquer a failed read range into sector-aligned good regions
+/// and the truly-bad (EIO) sector starts.
+///
+/// `phys`/`len` describe the byte range being probed (in whatever space the
+/// caller's `read` closure expects — raw-rdev for the reader thread, array-
+/// partition for the inline fallback).  `start` is the byte offset of this
+/// sub-range **within the original run** (used to index `entries`); it is
+/// what the caller maps back to per-sector `(logical, csum)` pairs.
+///
+/// - A successful read of a sub-range ≥ sector size that is a whole number
+///   of sectors is a **good region** returned as `(start, bytes)`.  Every
+///   sub-range this function recurses into is constructed sector-aligned on
+///   both ends, so a successful read is always a valid good region (the
+///   alignment check below is defensive).
+/// - A failed read splits the range into [`EIO_SPLIT_FACTOR`] sector-aligned
+///   pieces and recurses, down to a single sector.  A sector that still
+///   fails is a **bad sector** (its `start` is recorded).
+/// - `len == 0` is a no-op (defensive; the recursion only produces
+///   non-empty sub-ranges).
+///
+/// Splitting by 8 instead of 2 cuts the number of *failing* reads needed to
+/// pinpoint a bad sector in a full 64 MiB run from `log2(16384)` = 14 to
+/// `log8(16384)` ≈ 5 — on a dying disk every failing read is extra strain,
+/// while the extra successful reads on good sectors are cheap normal wear.
+/// A range with fewer sectors than the factor splits into one piece per
+/// sector (`EIO_SPLIT_FACTOR.min(len/sz)`), so small runs — the common case
+/// — isolate in a single level.
+///
+/// Correctness guarantees:
+/// - The pieces partition `[start, start + len)` **exactly** — no sub-range
+///   is ever skipped or double-read, even when `len` is not divisible by
+///   the factor (the remainder is spread across the leading pieces as
+///   uneven, still sector-aligned splits).
+/// - Every piece is ≥ 1 sector and strictly smaller than its parent, so the
+///   recursion always terminates.
+/// - Pieces are visited strictly left-to-right, so `good`/`bad` stay
+///   ascending (which `process_isolated` relies on to slice `entries`).
+///
+/// This guarantees the bad set is exactly the physically-bad sectors and
+/// the good set is everything else — no whole-run discard, no blast radius.
+fn isolate_run(
+    read: &mut impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
+    phys: u64,
+    start: usize,
+    len: usize,
+    sector_size: u64,
+    good: &mut Vec<(usize, Vec<u8>)>,
+    bad: &mut Vec<usize>,
+) {
+    debug_assert!(
+        start.is_multiple_of(sector_size as usize),
+        "start not sector-aligned"
+    );
+    let sz = sector_size as usize;
+    // `len` is always a whole number of sectors here: the top-level call
+    // passes `run.len() * sector_size` and every recursive piece is
+    // `piece_nsec * sector_size`.  Assert it so a future caller can't
+    // silently lose a partial sector to the integer division below.
+    debug_assert!(
+        len.is_multiple_of(sz),
+        "len {len} not a multiple of sector size {sz}"
+    );
+    if len == 0 {
+        return;
+    }
+    // Base case: this range is exactly one sector.  Try to read it; a
+    // failure is a true EIO sector.
+    if len <= sz {
+        match read(phys, len) {
+            Ok(buf) => good.push((start, buf)),
+            Err(_) => bad.push(start),
         }
-        ReadRsp::Err { dext, entries, err } => {
-            for (sector_logical, _stored) in entries.iter() {
-                stats.sectors_checked += 1;
-                stats.bytes_checked += strategy.sector_size;
-                stats.sectors_read_error += 1;
-                eprintln!(
-                    "read error at phys 0x{:x} (devid {}, logical 0x{:x}): {}",
-                    dext.phys_start + (*sector_logical - dext.chunk_offset),
-                    dext.devid,
-                    *sector_logical,
-                    err
-                );
+        return;
+    }
+    // Try the whole range first — a transient failure that reads fine on
+    // retry is simply good data (exactly what we want).
+    if let Ok(buf) = read(phys, len) {
+        // Only accept as a good region when sector-aligned on both ends.
+        if start.is_multiple_of(sz) && len.is_multiple_of(sz) {
+            good.push((start, buf));
+            return;
+        }
+    }
+    // Split into `k` sector-aligned pieces and recurse left-to-right so
+    // `good`/`bad` stay ascending (see the guarantees above).  `k` is at
+    // most `EIO_SPLIT_FACTOR` but never more than the range's sector count,
+    // so a range too small to split into `K` splits into one piece per
+    // sector instead.  A remainder (range not divisible by `k`) is spread
+    // across the leading pieces as uneven splits — no bytes are lost.
+    let nsec = len / sz; // ≥ 2 here (len > sz and aligned)
+    let k = EIO_SPLIT_FACTOR.min(nsec);
+    let base = nsec / k; // ≥ 1 since k ≤ nsec
+    let rem = nsec % k;
+    let mut off = 0usize;
+    for i in 0..k {
+        let piece_nsec = base + if i < rem { 1 } else { 0 };
+        let piece_len = piece_nsec * sz;
+        isolate_run(
+            read,
+            phys + off as u64,
+            start + off,
+            piece_len,
+            sector_size,
+            good,
+            bad,
+        );
+        off += piece_len;
+    }
+}
+
+/// Process the output of the EIO divide-and-conquer for a run.
+///
+/// `good` is a list of sector-aligned `(byte_start_within_run, bytes)`
+/// regions that read fine; each is checksummed via [`process_buf`] (so the
+/// coverage lost by the whole-run discard is restored — every good sector
+/// is verified as usual).  `bad` is the list of `byte_start_within_run` of
+/// the sectors that physically failed (EIO); each is counted as a read
+/// error and, when a stored csum exists and `batch` mode is on, emitted as
+/// an `unreadable` recovery candidate (see
+/// `docs/EIO-robustness-design.md` §5.2).
+#[allow(clippy::too_many_arguments)]
+fn process_isolated(
+    good: Vec<(usize, Vec<u8>)>,
+    bad: Vec<usize>,
+    dext: &DevExtent,
+    entries: &[(u64, Vec<u8>)],
+    strategy: &CsumStrategy,
+    batch: bool,
+    reader: &mut FsReader,
+    chunk_map: &ChunkMap,
+    on_sector: &mut impl FnMut(&SectorResult),
+    stats: &mut ScrubStats,
+) {
+    let sz = strategy.sector_size as usize;
+
+    // 1. Re-verify every good region (restore the coverage the old whole-run
+    //    discard lost).  Each good region is sector-aligned, so slice it
+    //    into per-sector `(logical, csum)` entries for `process_buf`.
+    for (start, buf) in &good {
+        let first = start / sz;
+        let last = (start + buf.len()) / sz;
+        // Pass the region's csum entries as a slice directly — no clone.
+        // On a healthy run `good` is one region covering the whole run, so
+        // this is `&entries[..]`, byte-for-byte the old `Ok` arm.
+        let region_entries = &entries[first..last.min(entries.len())];
+        if region_entries.is_empty() {
+            continue;
+        }
+        process_buf(
+            buf,
+            region_entries,
+            dext,
+            strategy,
+            batch,
+            reader,
+            chunk_map,
+            on_sector,
+            stats,
+        );
+    }
+
+    // 2. Count + emit the truly-bad (EIO) sectors.  A sector with a stored
+    //    csum is a recoverable candidate (the stored csum is what lets
+    //    parity recovery verify its reconstruction); a sector without one
+    //    is a plain read error.
+    for &start in &bad {
+        let idx = start / sz;
+        if idx >= entries.len() {
+            continue;
+        }
+        let (sector_logical, stored) = &entries[idx];
+        stats.sectors_checked += 1;
+        stats.bytes_checked += strategy.sector_size;
+        stats.sectors_read_error += 1;
+        let phys = dext.phys_start + (*sector_logical - dext.chunk_offset);
+        eprintln!(
+            "read error at phys 0x{:x} (devid {}, logical 0x{:x})",
+            phys, dext.devid, *sector_logical
+        );
+        if batch && stored.len() == strategy.hash_len {
+            on_sector(&SectorResult {
+                logical: *sector_logical,
+                devid: dext.devid,
+                array_phys: phys,
+                inode: 0,
+                file_offset: 0,
+                stored_csum: Some(stored.clone()),
+                actual_csum: Vec::new(), // source bytes were unreadable
+                unreadable: true,
+                ok: false,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake read source over a `Vec<u8>` that returns EIO (errno 5) for
+    /// any byte range overlapping `fault` — stands in for a block device
+    /// with a bad sector, so the divide-and-conquer can be unit-tested
+    /// without a real device or `dmsetup`.
+    struct FaultyRead {
+        data: Vec<u8>,
+        fault: (usize, usize), // (start, len)
+    }
+
+    impl FaultyRead {
+        fn read(&mut self, phys: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            let start = phys as usize;
+            let end = start + len;
+            let (fstart, flen) = self.fault;
+            let fend = fstart.saturating_add(flen);
+            if start < fend && end > fstart {
+                return Err(std::io::Error::from_raw_os_error(5)); // EIO
+            }
+            Ok(self.data[start..end].to_vec())
+        }
+    }
+
+    fn sector(fill: u8) -> Vec<u8> {
+        vec![fill; 4096]
+    }
+
+    #[test]
+    fn isolate_bad_sector_keeps_neighbours() {
+        // 8 sectors; sector 3 (byte range 12288..16384) faults.  The whole
+        // run's read fails, but divide-and-conquer must keep every other
+        // sector as a good region and isolate exactly sector 3 as bad.
+        let mut data = Vec::new();
+        for i in 0..8u8 {
+            data.extend_from_slice(&sector(i));
+        }
+        let mut r = FaultyRead {
+            data,
+            fault: (3 * 4096, 4096),
+        };
+        let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut bad: Vec<usize> = Vec::new();
+        isolate_run(&mut |p, l| r.read(p, l), 0, 0, 8 * 4096, 4096, &mut good, &mut bad);
+
+        assert_eq!(bad, vec![3 * 4096], "only the faulted sector is bad");
+
+        // Coverage: every non-faulted sector is inside exactly one good
+        // region, and its bytes match the source.
+        let mut covered = std::collections::BTreeSet::new();
+        for (s, b) in &good {
+            let first = s / 4096;
+            let last = (s + b.len()) / 4096;
+            for idx in first..last {
+                covered.insert(idx);
+            }
+            // The region's bytes are contiguous from the source.
+            for (off, byte) in b.iter().enumerate() {
+                assert_eq!(*byte, ((s + off) / 4096) as u8, "region byte mismatch");
             }
         }
+        for i in 0..8usize {
+            if i == 3 {
+                assert!(!covered.contains(&i), "sector 3 must be bad");
+            } else {
+                assert!(covered.contains(&i), "sector {i} must be covered");
+            }
+        }
+    }
+
+    #[test]
+    fn isolate_fully_failing_range_reports_all_bad() {
+        // Every sector faults -> all reported bad, none good.
+        let data: Vec<u8> = vec![0u8; 4 * 4096];
+        let mut r = FaultyRead {
+            data,
+            fault: (0, usize::MAX),
+        };
+        let mut good = Vec::new();
+        let mut bad = Vec::new();
+        isolate_run(&mut |p, l| r.read(p, l), 0, 0, 4 * 4096, 4096, &mut good, &mut bad);
+        assert!(good.is_empty(), "no good regions when everything faults");
+        assert_eq!(bad, vec![0, 4096, 2 * 4096, 3 * 4096]);
+    }
+
+    #[test]
+    fn isolate_uneven_split_covers_every_sector() {
+        // 10 sectors with a single fault at sector 6 — a range NOT divisible
+        // by the 8-way split factor (10 % 8 == 2).  The remainder must be
+        // spread across the leading pieces as uneven (still sector-aligned)
+        // splits, and every non-faulted sector must be covered by exactly one
+        // good region with the faulted one reported bad.  This is the
+        // completeness guarantee: no subrange may be skipped or double-read.
+        let mut data = Vec::new();
+        for i in 0..10u8 {
+            data.extend_from_slice(&sector(i));
+        }
+        let mut r = FaultyRead {
+            data,
+            fault: (6 * 4096, 4096),
+        };
+        let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut bad: Vec<usize> = Vec::new();
+        isolate_run(&mut |p, l| r.read(p, l), 0, 0, 10 * 4096, 4096, &mut good, &mut bad);
+
+        assert_eq!(bad, vec![6 * 4096], "only the faulted sector is bad");
+
+        let mut covered = std::collections::BTreeSet::new();
+        for (s, b) in &good {
+            assert!(
+                s % 4096 == 0 && b.len() % 4096 == 0,
+                "good region must be sector-aligned on both ends"
+            );
+            let first = s / 4096;
+            let last = (s + b.len()) / 4096;
+            for idx in first..last {
+                assert!(covered.insert(idx), "sector {idx} covered twice");
+            }
+            // The region's bytes are contiguous from the source.
+            for (off, byte) in b.iter().enumerate() {
+                assert_eq!(*byte, ((s + off) / 4096) as u8, "region byte mismatch");
+            }
+        }
+        for i in 0..10usize {
+            if i == 6 {
+                assert!(!covered.contains(&i), "sector 6 must be bad");
+            } else {
+                assert!(covered.contains(&i), "sector {i} must be covered");
+            }
+        }
+    }
+
+    #[test]
+    fn isolate_small_range_smaller_than_split_factor() {
+        // 3 sectors — fewer than the 8-way split factor.  The split must
+        // clamp to one piece per sector (no zero-length pieces, no dropped
+        // sectors) and still isolate the single bad one.
+        let mut data = Vec::new();
+        for i in 0..3u8 {
+            data.extend_from_slice(&sector(i));
+        }
+        let mut r = FaultyRead {
+            data,
+            fault: (4096, 4096),
+        };
+        let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut bad: Vec<usize> = Vec::new();
+        isolate_run(&mut |p, l| r.read(p, l), 0, 0, 3 * 4096, 4096, &mut good, &mut bad);
+
+        assert_eq!(bad, vec![4096], "only the faulted sector is bad");
+
+        let mut covered = std::collections::BTreeSet::new();
+        for (s, b) in &good {
+            let first = s / 4096;
+            let last = (s + b.len()) / 4096;
+            for idx in first..last {
+                covered.insert(idx);
+            }
+        }
+        assert!(
+            covered.contains(&0) && covered.contains(&2),
+            "good sectors 0 and 2 must be covered"
+        );
+        assert!(!covered.contains(&1), "sector 1 must be bad");
     }
 }

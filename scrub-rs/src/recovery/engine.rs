@@ -47,7 +47,13 @@ pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryRe
     //    wants to see a corrupt block to compare against.
     let corrupt = input.corrupt_block;
     assert_eq!(corrupt.len(), block_size, "corrupt_block length mismatch");
-    if (input.verifier)(corrupt) {
+    // When the source bytes were unreadable (EIO), `corrupt` is a zero
+    // placeholder, NOT the on-disk data — the "already matches" early
+    // return and the "parity baked in" detections are meaningless and must
+    // be skipped (a legitimately all-zero block would otherwise be
+    // misclassified as NotCorrupt / ParityBakedIn).
+    let unreadable = input.unreadable_source;
+    if !unreadable && (input.verifier)(corrupt) {
         return RecoveryResult::NotCorrupt;
     }
 
@@ -67,7 +73,7 @@ pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryRe
                 xor_inplace(&mut zero_acc, b);
             }
             xor_inplace(&mut zero_acc, p_block);
-            if zero_acc.iter().all(|&x| x == 0) {
+            if !unreadable && zero_acc.iter().all(|&x| x == 0) {
                 Some(FailureReason::ParityBakedIn { via: ParityPath::P })
             } else {
                 let candidate = recover_via_p(corrupt, input.other_blocks, p_block, block_size);
@@ -88,13 +94,19 @@ pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryRe
         None => Some(FailureReason::ParityAbsent { via: ParityPath::Q }),
         Some(q_block) => {
             assert_eq!(q_block.len(), block_size, "q_block length mismatch");
+            // For an unreadable source, pass an empty `corrupt` slice so
+            // `recover_via_q`'s internal BakedIn comparison (recovered ==
+            // corrupt) can never fire — the zero placeholder is not the
+            // real data, and a legitimately all-zero recovered block must
+            // not be misclassified.
+            let q_corrupt: &[u8] = if unreadable { &[] } else { corrupt };
             match recover_via_q(
                 input.other_blocks,
                 q_block,
                 input.failing_slot,
                 block_size,
                 input.verifier,
-                corrupt,
+                q_corrupt,
             ) {
                 QOutcome::Recovered { block } => {
                     return RecoveryResult::Recovered {
@@ -464,6 +476,7 @@ mod tests {
         let input = RecoveryInput {
             failing_slot: failing,
             corrupt_block: &corrupt,
+            unreadable_source: false,
             other_blocks: &others,
             p_block: Some(&stripe.p),
             q_block: None,
@@ -487,6 +500,7 @@ mod tests {
         let input = RecoveryInput {
             failing_slot: failing,
             corrupt_block: &corrupt,
+            unreadable_source: false,
             other_blocks: &others,
             p_block: Some(&p_baked),
             q_block: Some(&q_orig),
@@ -510,6 +524,7 @@ mod tests {
         let input = RecoveryInput {
             failing_slot: failing,
             corrupt_block: &corrupt,
+            unreadable_source: false,
             other_blocks: &others,
             p_block: Some(&p_orig),
             q_block: Some(&q_baked),
@@ -561,6 +576,7 @@ mod tests {
         let input = RecoveryInput {
             failing_slot: failing,
             corrupt_block: &corrupt,
+            unreadable_source: false,
             other_blocks: &others,
             p_block: Some(&p),
             q_block: Some(&q),
@@ -592,6 +608,7 @@ mod tests {
         let input = RecoveryInput {
             failing_slot: failing,
             corrupt_block: &corrupt,
+            unreadable_source: false,
             other_blocks: &others,
             p_block: Some(&p_baked),
             q_block: Some(&q_baked),
@@ -623,6 +640,7 @@ mod tests {
         let input = RecoveryInput {
             failing_slot: failing,
             corrupt_block: &golden,
+            unreadable_source: false,
             other_blocks: &others,
             p_block: Some(&stripe.p),
             q_block: Some(&stripe.q),
@@ -651,6 +669,7 @@ mod tests {
         let input = RecoveryInput {
             failing_slot: failing,
             corrupt_block: &corrupt,
+            unreadable_source: false,
             other_blocks: &others,
             p_block: Some(&p_bad),
             q_block: None,
@@ -661,6 +680,109 @@ mod tests {
                 reason: FailureReason::NoQPathAndPFailed { .. },
             } => {}
             other => panic!("expected NoQPathAndPFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unreadable_source_recovers_all_zero_block_via_p() {
+        // The failing disk's bytes were unreadable (EIO), so the caller
+        // passes a ZERO placeholder as corrupt_block with unreadable_source
+        // set.  The underlying data is legitimately all-zero: without the
+        // flag the engine would misclassify the reconstruction as
+        // NotCorrupt / ParityBakedIn.  With it, P-only recovery must
+        // reconstruct the all-zero block and return Recovered.
+        let block_size = BLOCK;
+        let n = 3u8;
+        // Build a stripe where the failing slot's data is all zeros.
+        let mut data: Vec<(u64, Vec<u8>)> = (1..=n as u64)
+            .map(|slot| {
+                let bytes = if slot == 2 {
+                    vec![0u8; block_size]
+                } else {
+                    (0..block_size).map(|i| (slot as u8) * 7 + (i % 251) as u8).collect()
+                };
+                (slot, bytes)
+            })
+            .collect();
+        let p = {
+            let mut acc = vec![0u8; block_size];
+            for (_, b) in &data {
+                for (x, y) in acc.iter_mut().zip(b.iter()) {
+                    *x ^= y;
+                }
+            }
+            acc
+        };
+        // Slot 2 (failing) is excluded from other_blocks.
+        data.retain(|(s, _)| *s != 2);
+        let golden: Vec<u8> = vec![0u8; block_size];
+        let placeholder: Vec<u8> = vec![0u8; block_size];
+        let v = |b: &[u8]| b == golden;
+        let input = RecoveryInput {
+            failing_slot: 2,
+            corrupt_block: &placeholder,
+            unreadable_source: true,
+            other_blocks: &data,
+            p_block: Some(&p),
+            q_block: None,
+            verifier: &v,
+        };
+        expect_recovered(recover_block(&input, block_size), ParityPath::P, &golden);
+    }
+
+    #[test]
+    fn unreadable_source_skips_not_corrupt_when_verifier_accepts_placeholder() {
+        // Even with unreadable_source, a candidate whose verifier happens to
+        // accept the zero placeholder (e.g. a genuinely all-zero expected
+        // block) must NOT take the NotCorrupt early-return — the placeholder
+        // is not the real data, so "matches" proves nothing.  The engine
+        // must still reconstruct from parity and return Recovered.
+        let block_size = BLOCK;
+        let n = 3u8;
+        let mut data: Vec<(u64, Vec<u8>)> = (1..=n as u64)
+            .map(|slot| {
+                let bytes = (0..block_size).map(|i| (slot as u8) * 3 + (i % 199) as u8).collect();
+                (slot, bytes)
+            })
+            .collect();
+        // Failing slot 2, all-zero on disk.
+        data = data
+            .iter()
+            .map(|(s, b)| {
+                if *s == 2 {
+                    (*s, vec![0u8; block_size])
+                } else {
+                    (*s, b.clone())
+                }
+            })
+            .collect();
+        let p = {
+            let mut acc = vec![0u8; block_size];
+            for (_, b) in &data {
+                for (x, y) in acc.iter_mut().zip(b.iter()) {
+                    *x ^= y;
+                }
+            }
+            acc
+        };
+        data.retain(|(s, _)| *s != 2);
+        let placeholder: Vec<u8> = vec![0u8; block_size];
+        // Verifier accepts zeros (would-be NotCorrupt trap).
+        let v = |b: &[u8]| b == vec![0u8; block_size];
+        let input = RecoveryInput {
+            failing_slot: 2,
+            corrupt_block: &placeholder,
+            unreadable_source: true,
+            other_blocks: &data,
+            p_block: Some(&p),
+            q_block: None,
+            verifier: &v,
+        };
+        match recover_block(&input, block_size) {
+            RecoveryResult::Recovered { block, .. } => {
+                assert_eq!(block, vec![0u8; block_size]);
+            }
+            other => panic!("expected Recovered via P, got {other:?}"),
         }
     }
 }

@@ -68,6 +68,7 @@ pub type CsumMap = BTreeMap<u64, Vec<u8>>;
 /// `strategy` supplies the checksum width (`hash_len`) and the sector size
 /// used to stride the packed csum array and to compute each sector's
 /// logical address.  Returns the number of checksum entries inserted.
+#[allow(clippy::too_many_arguments)]
 pub fn build_csum_map(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
@@ -76,6 +77,7 @@ pub fn build_csum_map(
     map: &mut CsumMap,
     metadata_header_errors: &mut u64,
     metadata_mirror_mismatches: &mut u64,
+    metadata_read_errors: &mut u64,
 ) -> std::io::Result<usize> {
     let hash_len = strategy.hash_len;
     let sector_size = strategy.sector_size;
@@ -111,6 +113,7 @@ pub fn build_csum_map(
         // exit 0 — a corrupted CSUM_TREE leaf yielding fewer/no csums).
         |_logical| *metadata_header_errors += 1,
         |_logical| *metadata_mirror_mismatches += 1,
+        |_logical| *metadata_read_errors += 1,
     )?;
     Ok(count)
 }
@@ -161,6 +164,10 @@ pub struct LazyCsumProvider {
     /// was recovered, accumulated across all `range` calls.  Folded into
     /// the scrub's `metadata_mirror_mismatches` by the driver.
     mirror_mismatches: u64,
+    /// CSUM_TREE leaves that failed with a READ (EIO) error — the bytes
+    /// could not be fetched at all.  Folded into the scrub's
+    /// `metadata_read_errors` by the driver.
+    metadata_read_errors: u64,
 }
 
 /// One `(logical, csum)` pair yielded by [`LazyCsumProvider::range_iter`].
@@ -210,6 +217,7 @@ impl LazyCsumProvider {
             csum_root,
             metadata_errors: 0,
             mirror_mismatches: 0,
+            metadata_read_errors: 0,
         };
         // Header-only sweep — verify every CSUM_TREE node's header checksum
         // (via `walk_leaves` → `FsReader::read_node`'s DUP cross-check) and
@@ -222,6 +230,7 @@ impl LazyCsumProvider {
         // sector's csum on the heap.
         let metadata_errors = &mut me.metadata_errors;
         let mirror_mismatches = &mut me.mirror_mismatches;
+        let metadata_read_errors = &mut me.metadata_read_errors;
         let _ = walk_leaves(
             &mut me.reader,
             &me.chunk_map,
@@ -229,6 +238,7 @@ impl LazyCsumProvider {
             |_r, _leaf, _logical| Ok(()), // discard payload; this pass is for counters
             |_logical| *metadata_errors += 1,
             |_logical| *mirror_mismatches += 1,
+            |_logical| *metadata_read_errors += 1,
         );
         me
     }
@@ -249,6 +259,13 @@ impl LazyCsumProvider {
     /// end of the run.
     pub fn mirror_mismatches(&self) -> u64 {
         self.mirror_mismatches
+    }
+
+    /// Number of CSUM_TREE leaves that failed with a READ (EIO) error,
+    /// found during the open-time header-only sweep.  Folded into the
+    /// scrub's `metadata_read_errors` at the end of the run.
+    pub fn metadata_read_errors(&self) -> u64 {
+        self.metadata_read_errors
     }
 
     /// Stream `(logical, csum)` entries in ascending logical order for the
@@ -349,6 +366,7 @@ impl LazyCsumProvider {
             },
             |_logical| {}, // open-time sweep already counted these
             |_logical| {},
+            |_logical| {}, // read (EIO) errors counted by the open-time sweep
         );
         // Propagate walk errors as zero yields for the affected leaves
         // (matching the eager map behaviour of simply having fewer entries

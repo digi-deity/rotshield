@@ -66,6 +66,7 @@ pub fn build_dev_extents(
     devid: u64,
     metadata_header_errors: &mut u64,
     metadata_mirror_mismatches: &mut u64,
+    metadata_read_errors: &mut u64,
 ) -> io::Result<Vec<DevExtent>> {
     let mut out = Vec::new();
     walk_leaves(
@@ -107,6 +108,10 @@ pub fn build_dev_extents(
         // header error so the gap surfaces in the summary and exit code.
         |_logical| *metadata_header_errors += 1,
         |_logical| *metadata_mirror_mismatches += 1,
+        // A DEV_TREE leaf that failed with a READ (EIO) error — the bytes
+        // could not be fetched at all.  Skip + count so the gap surfaces
+        // instead of silently under-scrubbing.
+        |_logical| *metadata_read_errors += 1,
     )?;
     Ok(out)
 }

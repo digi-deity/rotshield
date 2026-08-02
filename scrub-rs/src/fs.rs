@@ -1,20 +1,16 @@
-//! Filesystem-scrub contract — the boundary a filesystem implementation
+//! Filesystem-scrub contract — the interface a filesystem implementation
 //! (`btrfs/`, a future `zfs/`) fulfils so `main` can drive parity recovery
 //! without knowing which on-disk format it's reading.
 //!
-//! This is the **filesystem duty** boundary from scrub-rs's separation of
-//! responsibilities:
+//! The design intent: keep the filesystem specifics (btrfs tree walks,
+//! checksum formats) inside the filesystem implementation, and pass only
+//! what recovery actually needs across the interface.
 //!
-//! ```text
-//!   fs::FilesystemScrub  ──▶  array::stripe  ──▶  recovery::engine
-//!   (filesystem-specific)     (chunk-gathering)    (pure parity math)
-//! ```
+//! ## Two output streams
 //!
-//! ## Two streams, one seam
-//!
-//! A scrub produces two distinct kinds of output, and the contract keeps
-//! them on separate callbacks because they have *different lifetimes and
-//! different audiences*:
+//! A scrub produces two distinct kinds of output, kept on separate
+//! callbacks because they have *different lifetimes and different
+//! audiences*:
 //!
 //! - **Log lines** ([`ScrubCallbacks::on_log`]) — human-readable text,
 //!   free-form, fully owned by the filesystem implementation.  btrfs emits
@@ -28,20 +24,21 @@
 //!
 //! - **Recovery events** ([`ScrubCallbacks::on_event`], carrying
 //!   [`ScrubEvent`]) — the narrow correctness-only payload: which disk
-//!   byte offset, what block size, and a `verify` closure that decides
-//!   "is this candidate the original data?".  No checksum bytes, no
-//!   algorithm name, no log context.  The CLI's `on_event` hands the
-//!   closure straight to [`crate::recovery::RecoveryInput::verifier`] and
-//!   never inspects it.  This is the seam that has to be stable across
-//!   filesystems; the log seam is allowed to be format-flavoured.
+//!   byte offset, what block size, a `verify` closure that decides "is
+//!   this candidate the original data?", and a filesystem-opaque
+//!   [`ReconfirmRequest`] for deferred re-checking at write time.  No
+//!   checksum bytes, no algorithm name, no log context.  The CLI's
+//!   `on_event` hands the closure straight to
+//!   [`crate::recovery::RecoveryInput::verifier`] and never inspects it.
+//!   This is the seam that has to be stable across filesystems; the log
+//!   seam is allowed to be format-flavoured.
 //!
-//! Splitting them means the recovery seam stays tiny and algorithm-
-//! agnostic forever, while logging — which is genuinely format-specific
-//! (every filesystem has its own diagnostic vocabulary) — is owned by the
-//! filesystem implementation that has context to format it well.  A
-//! future ZFS implementation never has to ask "what hex width does the
-//! recovery layer expect?" because the answer is "none, format your own
-//! log string".
+//! Splitting them keeps the recovery payload small and algorithm-agnostic,
+//! while logging — which is genuinely format-specific (every filesystem
+//! has its own diagnostic vocabulary) — is owned by the filesystem
+//! implementation that has context to format it well.  A future ZFS
+//! implementation never has to ask "what hex width does the recovery layer
+//! expect?" because the answer is "none, format your own log string".
 //!
 //! ## Why a callback and not `Iterator`
 //!
@@ -53,7 +50,7 @@
 //! scrub already does internally (it has to walk B-trees in order anyway)
 //! and gives the caller one obvious place for logging + recovery glue.
 //!
-//! ## The verifier is owned by the event, not the caller
+//! ## The verifier is built by the event, not the caller
 //!
 //! Different filesystems use different checksum algorithms (btrfs crc32c,
 //! 4 bytes little-endian; ZFS fletcher2/fletcher4/sha256/blake3/edonr,
@@ -63,19 +60,27 @@
 //! `|b| crc32c::crc32c(b) == stored`; a ZFS implementation captures
 //! `|b| sha256(b).as_slice() == stored`.  The recovery layer takes a
 //! `&dyn Fn(&[u8]) -> bool` and never asks what algorithm produced it —
-//! broad enough to cover any checksum, with zero width/type coupling at
-//! the boundary.
-
+//! broad enough to cover any checksum.
+//!
+//! ## Deferred re-confirmation
+//!
+//! Re-confirming "is this sector *still* corrupt right before I write?" is
+//! filesystem-specific (btrfs checks the live EXTENT_TREE/CSUM_TREE at the
+//! logical address; ZFS would consult its own live metadata).  So the event
+//! carries a filesystem-opaque [`ReconfirmRequest`], and the filesystem
+//! implementation exposes a [`Reconfirmer`] handle the batched writer calls
+//! at write time.  The recovery glue never interprets the request — it just
+//! carries it from the event back to the [`Reconfirmer`] the same
+//! filesystem produced.
 /// Recovery-only payload emitted by a filesystem scrub per mismatched
 /// sector.
 ///
-/// Deliberately tiny: just `array_phys`, `block_size`, and a `verify`
-/// closure.  No checksum bytes, no algorithm name, no log context —
-/// those live on the [`ScrubCallbacks::on_log`] stream, which the
-/// filesystem implementation owns end-to-end.  Recovery only needs to
-/// know *where on disk* and *is this candidate right*; everything else
-/// is either implementation detail or diagnostic noise that shouldn't
-/// cross this seam.
+/// Kept small: just `array_phys`, `block_size`, a `verify` closure, and a
+/// filesystem-opaque re-confirm request.  No checksum bytes, no algorithm
+/// name, no log context — those live on the [`ScrubCallbacks::on_log`]
+/// stream, which the filesystem implementation owns end-to-end.  Recovery
+/// only needs to know *where on disk*, *is this candidate right*, and *how
+/// to re-check the mismatch at write time*.
 ///
 /// `verify` carries `Send + Sync` so the event (and the closure it holds)
 /// can be moved across threads if the caller ever wants a parallel
@@ -112,19 +117,75 @@ pub struct ScrubEvent {
     /// channel for a batched writer thread without re-deriving the
     /// algorithm.
     pub verify: Option<SectorVerifier>,
-    /// Logical address of the sector (btrfs-internal).  Carried so a
-    /// filesystem-specific recovery sink can re-confirm the mismatch
-    /// against the live EXTENT_TREE/CSUM_TREE at write time (the
-    /// reconfirmation is deferred to the recovery batch, not done inline
-    /// in the scrub loop).  `0` for filesystems that don't expose it.
-    pub logical: u64,
-    /// btrfs device id of the failing disk (== NonRAID slot for our
-    /// arrays).  Carried alongside `logical` for re-confirmation.
-    pub devid: u64,
-    /// The stored (expected) checksum bytes from the CSUM tree, needed by
-    /// the re-confirmation step to compare against the *live* expected
-    /// csum.  `None` when the sector has no stored checksum.
-    pub stored_csum: Option<Vec<u8>>,
+    /// Filesystem-opaque re-confirmation request.  Carried so a recovery
+    /// sink can defer re-confirmation to write time: the batched writer
+    /// hands it back to the filesystem-owned [`Reconfirmer`], which knows
+    /// how to check whether this sector is *still* corrupt right before
+    /// the write.  `None` when the sector has no stored checksum (nothing
+    /// to re-confirm against).
+    pub reconfirm: Option<ReconfirmRequest>,
+    /// The sector's source bytes were **unreadable** (the device returned
+    /// `EIO`) when the scrub tried to read them — as opposed to a sector
+    /// that read fine but whose checksum mismatched.  This is the clearest
+    /// "the disk is broken" signal, and exactly the case parity recovery
+    /// was built for, so the recovery sink must NOT re-read the failing
+    /// disk for its self-heal pre-check (it will just `EIO` again); it
+    /// recovers from parity with a zero placeholder for the corrupt block.
+    ///
+    /// When `true`, `verify` is still populated (built from the stored
+    /// csum), which is what makes parity recovery verifiable despite the
+    /// source bytes being unreadable.  Recovery is skipped entirely when
+    /// `true` AND `verify` is `None` (no stored csum to confirm against).
+    pub unreadable: bool,
+}
+
+/// Filesystem-opaque re-confirmation request, captured by the filesystem
+/// implementation per mismatched sector and handed back to its own
+/// [`Reconfirmer`] at write time.
+///
+/// The fields are deliberately opaque to the seam: `token` is whatever the
+/// filesystem needs to locate the live metadata for this sector (btrfs:
+/// the logical address), and `stored_csum` is the expected checksum from
+/// the scrub's snapshot that must be compared against the *live* expected
+/// checksum to decide stale-vs-corrupt.  Only the filesystem
+/// implementation interprets these; the recovery glue just carries them.
+#[derive(Clone, Debug)]
+pub struct ReconfirmRequest {
+    /// Filesystem-internal location token for the sector (btrfs logical).
+    pub token: u64,
+    /// The stored (expected) checksum bytes from the scrub's snapshot.
+    pub stored_csum: Vec<u8>,
+}
+
+/// Verdict of a deferred re-confirmation at write time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reconfirm {
+    /// Still genuine corruption: the live metadata still expects the
+    /// stored checksum and the sector is still owned.  Recover + write.
+    Corruption,
+    /// Benign churn: the sector was freed / rewritten / written without a
+    /// checksum since the scan.  Nothing to write.
+    Stale,
+    /// The metadata covering this sector could not be read, so we cannot
+    /// safely re-confirm it.  Skip the write for just this sector.
+    Unverifiable,
+}
+
+/// A filesystem-owned handle that re-confirms a deferred mismatch against
+/// the *live* metadata at write time.
+///
+/// The scrub walker runs on one thread with its own reader; a batched
+/// recovery writer runs concurrently and must not share that reader, so
+/// the filesystem implementation hands the recovery glue an *independent*
+/// re-confirmation handle (own file handles, own chunk map) via
+/// [`FilesystemScrub::reconfirmer`].  The glue never interprets the
+/// [`ReconfirmRequest`] — it just calls back into the filesystem that
+/// produced the event.
+///
+/// `Send` because the writer owns it on its own thread.
+pub trait Reconfirmer: Send {
+    /// Re-confirm one deferred mismatch against the live metadata.
+    fn reconfirm(&mut self, req: &ReconfirmRequest) -> Reconfirm;
 }
 
 /// Rollup result returned by [`FilesystemScrub::run`] when scrubbing is
@@ -168,6 +229,19 @@ pub struct ScrubStats {
     /// errors.  Does not affect the exit code on its own (the good copy
     /// means the data is intact), but is surfaced for visibility.
     pub metadata_mirror_mismatches: u64,
+    /// Metadata nodes that failed with a **read (device `EIO`) error** — as
+    /// opposed to a header-checksum failure (which is `metadata_header_errors`).
+    /// An `EIO` is hardware (the disk cannot return the bytes); a checksum
+    /// failure is corruption.  Both mean the scrub could not trust the
+    /// metadata it needed, so some data may have been left unverified — but
+    /// the operator response differs ("check the disk hardware" vs "run
+    /// `btrfs check --repair`"), so they are counted separately and the
+    /// scrub continues past the unreadable leaf rather than aborting the
+    /// whole tree walk.
+    ///
+    /// Surfaced as a hard error (non-zero → non-zero exit) so a scrub that
+    /// lost metadata coverage can never report clean.
+    pub metadata_read_errors: u64,
 }
 
 /// Sink for the two streams a scrub produces (see module docs).
@@ -189,6 +263,21 @@ pub trait ScrubCallbacks {
     /// Receive a recovery-only [`ScrubEvent`] for one mismatched sector.
     /// Only carries what recovery needs; no checksum bytes or log context.
     fn on_event(&mut self, ev: &ScrubEvent);
+
+    /// Whether this sink consumes **raw** (un-reconfirmed) mismatch
+    /// candidates, so it can defer re-confirmation to write time (batched
+    /// recovery).  When `true`, the filesystem implementation emits every
+    /// csum mismatch as a raw [`ScrubEvent`] and does *not* classify it —
+    /// the sink owns mismatch/stale accounting.  When `false` (default),
+    /// the implementation re-confirms inline and only emits events it has
+    /// already classified as corruption.
+    ///
+    /// The batched recovery driver in `main` returns `true` whenever it
+    /// has a writer thread running; plain (array-less) scrubs keep the
+    /// default `false` so the filesystem's inline accounting is used.
+    fn wants_raw_candidates(&self) -> bool {
+        false
+    }
 }
 
 /// The contract a filesystem implementation fulfils so `main` can drive
@@ -223,16 +312,30 @@ pub trait FilesystemScrub {
     /// per-sector loop (e.g. "walking chunk tree: 24 leaves") — the
     /// contract doesn't police log volume.
     ///
-    /// `freeze` is an optional live-filesystem freeze controller.  When
-    /// `Some`, the implementation acquires a scoped freeze around each
-    /// reconfirmation+recovery-write so a live mounted filesystem cannot
-    /// race the write with its own (now-stale) data.  Pass `None` when
-    /// scrubbing an offline/unmounted image, or when recovery writes are
-    /// disabled (dry-run).  The freeze is held only for the per-sector
-    /// reconfirm+write window — never for the whole scrub run.
-    fn run(
-        &mut self,
-        callbacks: &mut dyn ScrubCallbacks,
-        freeze: Option<&mut crate::freeze::FreezeController>,
-    ) -> std::io::Result<ScrubStats>;
+    /// Whether mismatches are emitted raw (deferred re-confirmation) or
+    /// re-confirmed inline is decided by
+    /// [`ScrubCallbacks::wants_raw_candidates`].  The filesystem
+    /// implementation never freezes and never writes; the recovery sink
+    /// owns the freeze and the write-back.
+    fn run(&mut self, callbacks: &mut dyn ScrubCallbacks) -> std::io::Result<ScrubStats>;
+
+    /// Build an **independent** re-confirmation handle for a concurrent
+    /// recovery writer thread.  The handle owns its own file handles and
+    /// chunk map, so it never shares (or races) the scrub's reader.
+    fn reconfirmer(&self) -> std::io::Result<Box<dyn Reconfirmer>>;
+
+    /// Multi-line header describing this filesystem for the CLI's
+    /// pre-scrub dump (device, format version, checksum strategy,
+    /// geometry, …).  Format is owned by the implementation.
+    fn describe(&self) -> Vec<String>;
+
+    /// Byte offset of this filesystem's primary superblock within its
+    /// partition — the fact the startup array-config canary needs to know
+    /// where to reconstruct from parity.
+    fn superblock_offset(&self) -> u64;
+
+    /// Whether a raw block of bytes carries this filesystem's magic — the
+    /// fact the startup array-config canary uses to recognise a correctly
+    /// reconstructed superblock.
+    fn block_has_magic(&self, block: &[u8]) -> bool;
 }

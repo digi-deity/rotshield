@@ -31,6 +31,15 @@ LOCK_DIR="${RUNS_DIR}/.lock"
 SCRUB="${PLUGIN_DIR}/bin/scrub-rs"
 KEEP_RUNS=3
 
+# Script-level flag: set when any device's scrub-rs run did NOT complete
+# (failed to print its "scrub complete:" marker), so run() can surface the
+# overall run as ERROR rather than trusting a misleading per-device rc.
+# Kept at script scope (not a run()-local) so scrub_one_device can set it
+# from any calling context without relying on bash dynamic scoping.
+errored=0
+
+# Config is sourced dynamically (key=value, both bash and PHP INI parsable).
+# shellcheck disable=SC1090
 [ -f "${CONFIG_FILE}" ] && . "${CONFIG_FILE}"
 
 # Build the scrub-rs argument string from the structured config keys
@@ -188,11 +197,16 @@ scrub_one_device() {
   # Target the RAW rdev: scrub-rs reads the btrfs superblock at the partition
   # offset, so we pass --offset +<rdevOffset> (sectors) from /proc/nmdstat. If
   # the offset is wrong it rejects the device early with a clear superblock
-  # error — it never silently scrubs garbage.
+  # error — it never silently scrubs garbage. An array partition
+  # (/dev/nmd<N>p<M>) is the one exception: its btrfs superblock lives at
+  # offset 0 (the array driver already strips the per-disk header), so no
+  # --offset is passed and no warning is warranted.
   off="$(offset_for "${device}")"
   if [ -n "${off}" ]; then
     dev_opts="${dev_opts} --offset +${off}"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: partition offset +${off} sectors"
+  elif is_array_partition "${device}"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: array partition (superblock at offset 0)"
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: WARNING no rdevOffset found in nmdstat; scrub-rs will likely reject this device"
   fi
@@ -241,9 +255,10 @@ run() {
   local total; total=$(echo ${devlist} | wc -w)
   local opts; opts="$(build_args)"
   local start_ts; start_ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  local run_log="${RUNS_DIR}/run-$(date '+%Y%m%d-%H%M%S').log"
+  local run_log
+  run_log="${RUNS_DIR}/run-$(date '+%Y%m%d-%H%M%S').log"
 
-  local overall_rc=0 errored=0 idx=0 rc
+  local overall_rc=0 idx=0 rc
   {
     echo "[${start_ts}] starting sequential scrub of: ${devlist} ${opts}"
     for device in ${devlist}; do
@@ -272,8 +287,11 @@ run() {
   # Keep the persistent plugin log simple: append the exact run log bytes.
   cat "${run_log}" >> "${LOG}"
 
-  # Prune old run logs, keep the most recent KEEP_RUNS.
+  # Prune old run logs, keep the most recent KEEP_RUNS.  Filenames are
+  # tool-generated (run-YYYYMMDD-HHMMSS.log) so `ls -1t` (newest first) is
+  # safe here; the glob below is only used to find the candidates.
   local n=0
+  # shellcheck disable=SC2045  # controlled, whitespace-free names
   for f in $(ls -1t "${RUNS_DIR}"/run-*.log 2>/dev/null); do
     n=$((n + 1))
     [ "${n}" -gt "${KEEP_RUNS}" ] && rm -f "${f}"
@@ -310,7 +328,7 @@ data_devices() {
     [ -n "$p" ] && [ -f "$p" ] && { stat="$p"; break; }
   done
   [ -z "$stat" ] && return 0
-  local slot name off line
+  local slot name off
   while IFS='=' read -r key val; do
     case "$key" in
       rdevName.*)
@@ -335,6 +353,19 @@ devices() {
   data_devices | cut -d'|' -f1
 }
 
+# True for array-partition device names (/dev/nmd<N>p<M>), where the btrfs
+# superblock lives at offset 0 (the array driver strips the per-disk header).
+# Mirrors scrub-rs's own slot_from_array_partition pattern (nmd + one-or-more
+# digits + p + one-or-more digits). Raw rdevs (/dev/loopN, /dev/sdX) return
+# false — they need their rdevOffset applied via --offset.
+is_array_partition() {
+  local name="${1##*/}"
+  case "$name" in
+    nmd[0-9]*p[0-9]*) return 0 ;;
+  esac
+  return 1
+}
+
 # Print the partition offset (in 512-byte sectors) for a given raw rdev, or
 # nothing if it isn't a known data disk. scrub-rs accepts --offset +N as
 # sector multiples.
@@ -352,24 +383,22 @@ stop() {
     echo "No scrub is currently running (stale lock removed)."
     return 0
   fi
-  # Kill ONLY the runner and its scrub-rs children. Deliberately NOT the
-  # process group: the runner was started as `nohup ... &` from PHP/emhttp,
-  # so it shares a process group with webGui processes — a group kill would
-  # take unrelated jobs down with it. scrub-rs is a direct child of the
-  # runner, so terminating the runner's tree via pkill is precise.
-  pkill -TERM -P "${pid}" 2>/dev/null
-  pkill -TERM -x scrub-rs 2>/dev/null
-  kill -TERM "${pid}" 2>/dev/null
+  # Terminate ONLY the runner's process tree (runner + scrub-rs spawned in
+  # pipeline subshells). Deliberately NOT the process group: the runner was
+  # started as `nohup ... &` from PHP/emhttp, so it shares a process group
+  # with webGui processes — a group kill would take unrelated jobs down
+  # with it. Walking descendants via pgrep -P is precise: it reaches
+  # scrub-rs wherever it sits in the runner's tree without touching any
+  # unrelated scrub-rs process.
+  kill_tree "${pid}" TERM
   # Give it a moment, then escalate to KILL if still alive.
-  local i
-  for i in 1 2 3 4 5; do
-    kill -0 "${pid}" 2>/dev/null || break
+  local waited=0
+  while [ "${waited}" -lt 5 ] && kill -0 "${pid}" 2>/dev/null; do
     sleep 0.5
+    waited=$((waited + 1))
   done
   if kill -0 "${pid}" 2>/dev/null; then
-    kill -KILL "${pid}" 2>/dev/null
-    pkill -KILL -P "${pid}" 2>/dev/null
-    pkill -KILL -x scrub-rs 2>/dev/null
+    kill_tree "${pid}" KILL
   fi
   # The run() EXIT trap clears the lock on its way out; remove it here too in
   # case the runner was killed without running the trap.
@@ -378,6 +407,17 @@ stop() {
   # scrub was interrupted rather than completed.
   notify_scrub_stopped ""
   echo "Scrub stopped."
+}
+
+# Send a signal to a process and every descendant (recursively), so a stop
+# reaches the whole runner tree — including scrub-rs spawned inside pipeline
+# subshells — while never signalling unrelated processes.
+kill_tree() {
+  local pid="$1" sig="$2" child
+  for child in $(pgrep -P "${pid}" 2>/dev/null); do
+    kill_tree "${child}" "${sig}"
+  done
+  kill -"${sig}" "${pid}" 2>/dev/null
 }
 
 case "${1:-running}" in

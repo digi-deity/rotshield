@@ -37,6 +37,15 @@ pub struct RecoveryInput<'a> {
     /// both to confirm corruption (the verifier should reject it) and to
     /// detect the "parity baked from the corrupt byte" case.
     pub corrupt_block: &'a [u8],
+    /// The source bytes were **unreadable** (the device returned `EIO`) —
+    /// `corrupt_block` is a caller-supplied zero placeholder, NOT the
+    /// on-disk data.  When set, the engine must skip the two checks that
+    /// compare reconstruction against the corrupt block (the
+    /// "already matches" early return and the "parity baked in"
+    /// detections), because the placeholder is not the real bytes: a
+    /// legitimately all-zero recovered block would otherwise be
+    /// misclassified as `NotCorrupt` / `ParityBakedIn`.
+    pub unreadable_source: bool,
     /// `block_size`-byte chunk for each other data disk (`failing_slot`
     /// excluded), in arbitrary order.  All entries must be `block_size`
     /// bytes long.
@@ -62,6 +71,7 @@ impl<'a> std::fmt::Debug for RecoveryInput<'a> {
         f.debug_struct("RecoveryInput")
             .field("failing_slot", &self.failing_slot)
             .field("corrupt_block_len", &self.corrupt_block.len())
+            .field("unreadable_source", &self.unreadable_source)
             .field("other_blocks_n", &self.other_blocks.len())
             .field("p_block_len", &self.p_block.map(|b| b.len()))
             .field("q_block_len", &self.q_block.map(|b| b.len()))

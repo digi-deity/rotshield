@@ -82,6 +82,13 @@ pub struct BtrfsContext {
     /// walks; surfaced for visibility (does not affect the exit code on its
     /// own, since the good copy means the data is intact).
     pub metadata_mirror_mismatches: u64,
+    /// Number of metadata nodes that failed with a **read (device `EIO`)**
+    /// error during the chunk/root-tree walks — the bytes could not be
+    /// fetched at all.  Distinct from `metadata_header_errors` (checksum
+    /// corruption): an `EIO` is hardware, the operator response differs.  A
+    /// node that EIOs is skipped (not descended) and counted here so the
+    /// coverage gap surfaces rather than silently under-scrubbing.
+    pub metadata_read_errors: u64,
 }
 
 /// Open `dev` (a block device or image file) at `base_offset`, populate the
@@ -177,6 +184,7 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
 
     let mut chunk_records: Vec<ChunkRecord> = Vec::new();
     let mut metadata_header_errors: u64 = 0;
+    let mut metadata_read_errors: u64 = 0;
     walk_leaves(
         &mut reader,
         &chunk_map,
@@ -202,6 +210,12 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
             // A mirrored (DUP) chunk-tree node whose copies disagree but
             // still has a good copy — self-heal-recoverable divergence.
             metadata_mirror_mismatches += 1;
+        },
+        |_logical| {
+            // A chunk-tree node that failed with a READ (EIO) error — the
+            // bytes could not be fetched at all.  Skip + count so the gap
+            // surfaces instead of silently under-scrubbing the device.
+            metadata_read_errors += 1;
         },
     )?;
     for rec in &chunk_records {
@@ -242,6 +256,12 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
             // still has a good copy — self-heal-recoverable divergence.
             metadata_mirror_mismatches += 1;
         },
+        |_logical| {
+            // A root-tree node that failed with a READ (EIO) error — the
+            // bytes could not be fetched at all.  Skip + count so the gap
+            // surfaces instead of silently under-scrubbing.
+            metadata_read_errors += 1;
+        },
     )?;
     let roots = TreeRoots {
         fs_root: fs_root.ok_or_else(|| {
@@ -279,6 +299,7 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         strategy,
         metadata_header_errors,
         metadata_mirror_mismatches,
+        metadata_read_errors,
     })
 }
 
@@ -354,6 +375,11 @@ pub fn live_data_tree_roots(
         |_logical| {
             // Mirror divergence on the live root tree: not counted here
             // (this walk only resolves tree roots, not a full scrub).
+        },
+        |_logical| {
+            // A read (EIO) error on the live root tree: this walk only
+            // resolves tree roots, so a failure is conservative (the caller
+            // treats the sector as corruption) and not counted here.
         },
     )
     .ok()?;

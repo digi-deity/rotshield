@@ -4,10 +4,10 @@
 //! This is the array-side half of the bridge between the filesystem world
 //! (which knows where a bad block lives on which disk) and the array world
 //! (which knows how to open the raw rdev that backs that disk and what
-//! per-disk `rdevOffset` header to add).  It is deliberately filesystem
-//! agnostic — it takes `(devid, phys)` and knows nothing about btrfs chunks,
-//! logical addresses, or ZFS vdevs.  Any filesystem scrub that can produce
-//! a `(devid, phys)` pair can drive recovery through this module.
+//! per-disk `rdevOffset` header to add).  It takes a `(devid, phys)` pair
+//! and has no knowledge of btrfs chunks, logical addresses, or ZFS vdevs;
+//! any filesystem scrub that can produce a `(devid, phys)` pair can drive
+//! recovery through this module.
 //!
 //! Mirrors the relevant pieces of `recover.py::find_physical_offset` and
 //! `handle_failure`'s raw-offset translation.

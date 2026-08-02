@@ -1,19 +1,18 @@
 //! NonRAID / Unraid array integration.
 //!
-//! This module is the array-side counterpart to `btrfs/`.  Where a
-//! filesystem scrub reports checksum mismatches with their on-disk
-//! physical location `(devid, array_phys)`, `array/` knows how to talk
-//! to a NonRAID/Unraid parity array: it parses `/proc/nmdstat` (or
+//! This is the array-side counterpart to `btrfs/`.  Where a filesystem
+//! scrub reports checksum mismatches with their on-disk physical
+//! location `(devid, array_phys)`, `array/` knows how to talk to a
+//! NonRAID/Unraid parity array: it parses `/proc/nmdstat` (or
 //! `/proc/mdstat`), maps a `(devid, array_phys)` pair to a raw rdev
 //! path + raw offset, and uses parity XOR to recover corrupt data
 //! blocks.
 //!
-//! The module is deliberately filesystem-agnostic — it imports nothing
-//! from `btrfs/`.  Any filesystem scrub that can produce `(devid,
-//! array_phys, block_size, expected_csum)` can drive recovery through
-//! this module.  The block size is passed per-call rather than hardcoded
-//! so a future ZFS integration (which uses different checksums and
-//! record sizes) can reuse the same recovery path.
+//! The module does not depend on `btrfs/`; any filesystem scrub that can
+//! produce `(devid, array_phys, block_size, expected_csum)` can drive
+//! recovery through it.  The block size is passed per-call rather than
+//! hardcoded so a future ZFS integration (which uses different checksums
+//! and record sizes) can reuse the same recovery path.
 //!
 //! # Address spaces and I/O paths
 //!
@@ -75,21 +74,20 @@
 //! fix a botched recovery.  This mirrors the Python `recover.py`, which
 //! opens the raw rdev directly for the same reason.
 //!
-//! # Separation of duties
+//! # What lives here
 //!
-//! `array/` is the **array data management** duty: it parses
-//! `/proc/nmdstat` into [`config::ArrayConfig`], translates
-//! `(slot, array_phys)` to a raw-rdev path + offset via
+//! `array/` parses `/proc/nmdstat` into [`config::ArrayConfig`],
+//! translates `(slot, array_phys)` to a raw-rdev path + offset via
 //! [`resolve::resolve`], and gathers the aligned chunks of one stripe
 //! (data disks + parity, with zero-substitution past a smaller disk's
-//! end) via [`stripe::gather_stripe`].  It imports nothing from
-//! `btrfs/` or `recovery/` — the only knowledge it has of either side is
-//! the slice shapes handed across [`stripe::StripeChunks`].  The GF(2^8)
-//! parity math lives in [`crate::recovery::gf`]; there is no `array::gf`
-//! shim, so any caller (e.g. `bin/craft_corrupt.rs`) that needs the
-//! tables imports [`crate::recovery::gf`] directly.  `btrfs/` is the
-//! **filesystem duty**: it scrubs and produces `(array_phys,
-//! expected_csum)` for the engine to verify candidates against.
+//! end) via [`stripe::gather_stripe`].  It does not depend on `btrfs/`;
+//! the only `recovery/` dependency is [`crate::recovery::gf`] (the shared
+//! GF(2^8) arithmetic tables), used by [`parity`] to compute live P/Q
+//! syndromes for `bin/craft_corrupt` — there is no `array::gf` shim, so
+//! any caller that needs the tables imports [`crate::recovery::gf`]
+//! directly.  The startup array-soundness canary used to live here; it is
+//! now [`crate::canary`], a top-level glue module that composes `array/`
+//! + `recovery/` + a filesystem magic probe.
 //!
 //! Writing to the raw rdev leaves parity holding the *original*
 //! relationship.  A subsequent parity check will flag the inconsistency
@@ -97,7 +95,6 @@
 //! fix a botched recovery.  This mirrors the Python `recover.py`, which
 //! opens the raw rdev directly for the same reason.
 
-pub mod canary;
 pub mod config;
 pub mod parity;
 pub mod resolve;

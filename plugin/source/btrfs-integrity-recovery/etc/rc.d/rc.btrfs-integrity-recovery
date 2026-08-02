@@ -13,6 +13,8 @@ CONFIG_FILE="${CONFIG_DIR}/config.cfg"
 CRON_FILE="/etc/cron.d/${PLUGIN}"
 
 install_cron() {
+  # Config is sourced dynamically (key=value, both bash and PHP INI parsable).
+  # shellcheck disable=SC1090
   [ -f "${CONFIG_FILE}" ] && . "${CONFIG_FILE}"
   rm -f "${CRON_FILE}"
   case "${SCHEDULE:-disabled}" in

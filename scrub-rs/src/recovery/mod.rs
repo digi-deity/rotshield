@@ -1,23 +1,12 @@
 //! Parity-based block recovery engine — pure, I/O-free, checksum-agnostic.
 //!
-//! This module is the **recovery duty** in scrub-rs's separation of
-//! responsibilities:
+//! Given the aligned chunk for every disk at one offset (plus an optional
+//! P and Q parity chunk), reconstruct the missing block via P / Q / PQ.
+//! It works on plain byte slices and a **verifier closure** that decides
+//! whether a candidate block is "good".
 //!
-//! ```text
-//!   filesystem (btrfs/)  →  array (array/)  →  recovery (recovery/)
-//!   scrub + offset +       gather aligned       given the aligned chunks
-//!   checksum               chunks across disks  and a checksum-verifier,
-//!                          for one offset        reconstruct the missing
-//!                                                block via P / Q / PQ and
-//!                                                verify the candidate.
-//! ```
-//!
-//! `recovery/` knows nothing about disks, files, btrfs, ZFS, or any
-//! specific checksum algorithm. It takes plain byte slices (the aligned
-//! chunk for every disk at one offset, plus an optional P and Q chunk)
-//! and a **verifier closure** that decides whether a candidate block is
-//! "good". Recovery cannot tell correct from garbage on its own — the
-//! parity math only produces candidates; the caller's verifier (typically
+//! Recovery cannot tell correct from garbage on its own — the parity math
+//! only produces candidates; the caller's verifier (typically
 //! `crc32c::crc32c(block) == expected_csum` for btrfs, or `block ==
 //! &golden[..]` in tests) is what confirms success. Keeping the verifier
 //! pluggable means a drop-in ZFS edonr/sha checksum later replaces one

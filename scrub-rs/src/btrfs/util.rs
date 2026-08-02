@@ -34,9 +34,42 @@ pub fn read_at<R: Read + Seek>(fp: &mut R, offset: u64, n: usize) -> io::Result<
 #[cfg(unix)]
 pub fn pread_at(fp: &std::fs::File, offset: u64, n: usize) -> io::Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
+    // Fault-injection hook: when `SCRUB_FAULT=start[,len]` is set, any read
+    // whose byte range overlaps `[start, start+len)` fails with EIO.  Lets
+    // the integration harness exercise the EIO paths (divide-and-conquer
+    // isolation, unreadable recovery candidates, metadata read errors)
+    // without a real failing device or `dmsetup`.  No-op when unset, so
+    // healthy-disk throughput is unchanged.  See
+    // `docs/EIO-robustness-design.md` §7.
+    if let Some((fstart, flen)) = fault_range() {
+        let fend = fstart.saturating_add(flen);
+        let req_end = offset.saturating_add(n as u64);
+        if offset < fend && req_end > fstart {
+            return Err(io::Error::from_raw_os_error(5)); // EIO
+        }
+    }
     let mut buf = vec![0u8; n];
     fp.read_exact_at(&mut buf, offset)?;
     Ok(buf)
+}
+
+/// Parse the `SCRUB_FAULT` env var (once per process): `start[,len]` in
+/// bytes.  `len` defaults to 4096 (one sector).  `None` when unset or
+/// malformed (unset = healthy-disk behaviour).
+#[cfg(unix)]
+fn fault_range() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static FAULT: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *FAULT.get_or_init(|| {
+        let raw = std::env::var("SCRUB_FAULT").ok()?;
+        let (start, len) = match raw.split_once(',') {
+            Some((s, l)) => (s.trim(), l.trim()),
+            None => (raw.trim(), "4096"),
+        };
+        let start: u64 = start.parse().ok()?;
+        let len: u64 = len.parse().ok()?;
+        Some((start, len.max(1)))
+    })
 }
 
 pub fn le_u16(buf: &[u8], pos: usize) -> u16 {

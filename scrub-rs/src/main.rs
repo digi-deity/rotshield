@@ -11,6 +11,7 @@
 use scrub_rs::array;
 use scrub_rs::btrfs;
 use scrub_rs::fs;
+use scrub_rs::fs::FilesystemScrub;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,9 @@ use std::process::ExitCode;
 ///      confirmed block was rebuilt successfully (or would-be-written in
 ///      dry-run). The expected good outcome; data is (or would be) intact.
 ///   5  issues found AND some UNRECOVERABLE — at least one confirmed block
-///      could not be rebuilt (parity/gather/write failure). Needs attention.
+///      could not be rebuilt (parity/gather/write failure), OR metadata
+///      coverage was lost to READ (EIO) errors (which are not recovered by
+///      parity, so some data may be unverified). Needs attention.
 ///   6  METADATA FATAL — at least one btrfs metadata node had NO good copy
 ///      (every DUP/RAID1 mirror failed its header checksum and no parity
 ///      read could recover it). The live filesystem may be serving corrupt
@@ -235,42 +238,17 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
     };
-    let sb = scrub.superblock();
-
-    {
-        println!("device        : {dev}");
-        println!("base offset   : 0x{:x} ({})", base_offset, base_offset);
-        println!("magic         : {:?}", sb.magic);
-        println!("fsid          : {}", btrfs::util::hex(&sb.fsid));
-        println!("bytenr        : 0x{:x}", sb.bytenr);
-        println!("generation   : {}", sb.generation);
-        println!("root          : 0x{:x}", sb.root);
-        println!("chunk_root    : 0x{:x}", sb.chunk_root);
-        println!("total_bytes   : {}", sb.total_bytes);
-        println!("bytes_used    : {}", sb.bytes_used);
-        println!("num_devices   : {}", sb.num_devices);
-        println!("sector_size   : {}", sb.sector_size);
-        println!("node_size     : {}", sb.node_size);
-        println!("stripesize    : {}", sb.stripesize);
-        println!("csum_type     : {} ({})", sb.csum_type, scrub.csum_name());
-        println!(
-            "csum sectors  : {} ({} bytes)",
-            scrub.num_sectors(),
-            scrub.csum_bytes()
-        );
-        println!(
-            "dev extents   : {} (physical-order scrub)",
-            scrub.num_dev_extents()
-        );
+    for line in scrub.describe() {
+        println!("{line}");
     }
 
     // Recovery glue: the contract routes two streams through one
     // `ScrubCallbacks` impl below — `on_log` for free-form diagnostic
     // text owned by the filesystem scrub, `on_event` for the narrow
-    // recovery payload (array_phys + block_size + verify closure).  The
-    // filesystem's checksum algorithm is fully encapsulated inside the
-    // `verify` closure — main never imports crc32c and doesn't care what
-    // bytes the csum is.
+    // recovery payload (array_phys + block_size + verify closure +
+    // opaque re-confirm request).  The filesystem's checksum algorithm is
+    // fully encapsulated inside the `verify` closure — main never imports
+    // crc32c and doesn't care what bytes the csum is.
     //
     // Recovery-possibility assessment runs in EVERY mode.  We always try
     // to load the array config and spawn the assessment pipeline so that
@@ -314,37 +292,33 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // the array config is actually sound.  We reconstruct the target disk's
     // superblock block from the *other* data disks + primary parity (the
     // exact machinery recovery depends on) and check whether the result
-    // carries the btrfs magic.  A match means the slot, offsets, and parity
-    // are all consistent — if they weren't, every later recovery attempt
-    // would be built on a misconfigured array.  This is a cheap, early
-    // smoke test of the environment/config, not a correctness guarantee of
-    // the data itself (the real scrub still runs in full when the canary
-    // passes).  It is FATAL: a failure means the array config, slot, or
-    // parity is misconfigured, so any recovery we attempt later would be
-    // built on sand — we abort with EXIT_RUNTIME_ERROR rather than produce
-    // misleading results.  Only runs when we have an array config and a
-    // recognized data-disk slot (otherwise there's nothing to reconstruct
-    // against, and a single-disk/offline run is allowed to proceed).
+    // carries the filesystem's magic.  A match means the slot, offsets, and
+    // parity are all consistent — if they weren't, every later recovery
+    // attempt would be built on a misconfigured array.  This is a cheap,
+    // early smoke test of the environment/config, not a correctness
+    // guarantee of the data itself (the real scrub still runs in full when
+    // the canary passes).  It is FATAL: a failure means the array config,
+    // slot, or parity is misconfigured, so any recovery we attempt later
+    // would be built on sand — we abort with EXIT_RUNTIME_ERROR rather than
+    // produce misleading results.  Only runs when we have an array config
+    // and a recognized data-disk slot (otherwise there's nothing to
+    // reconstruct against, and a single-disk/offline run is allowed to
+    // proceed).
     if let (Some(cfg), slot) = (cfg.as_ref(), scrub_slot)
         && slot != 0
     {
         const SB_BLOCK: usize = 4096;
-        match array::canary::reconstruct_block(
-            cfg,
-            slot,
-            btrfs::superblock::SUPERBLOCK_OFFSET,
-            SB_BLOCK,
-        ) {
+        match scrub_rs::canary::reconstruct_block(cfg, slot, scrub.superblock_offset(), SB_BLOCK) {
             Ok(block) => {
-                if btrfs::superblock::has_magic_at(&block, btrfs::superblock::OFF_MAGIC) {
+                if scrub.block_has_magic(&block) {
                     println!(
                         "\ncanary         : OK — parity reconstructed the target \
-                         superblock and it carries the btrfs magic (array config sound)"
+                         superblock and it carries the filesystem magic (array config sound)"
                     );
                 } else {
                     eprintln!(
                         "\n[CANARY FATAL] parity reconstructed the target superblock \
-                         block but it does NOT carry the btrfs magic. The array config, \
+                         block but it does NOT carry the filesystem magic. The array config, \
                          slot, or parity is misconfigured (stale/out-of-sync parity, \
                          wrong rdevOffset, or wrong disk). Aborting: any recovery would \
                          be built on a broken array config."
@@ -389,6 +363,10 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         scrub_slot: u64,
     }
     impl fs::ScrubCallbacks for Driver {
+        fn wants_raw_candidates(&self) -> bool {
+            self.tx.is_some()
+        }
+
         fn on_log(&mut self, line: &str) {
             eprintln!("{line}");
         }
@@ -416,12 +394,11 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             let cand = scrub_rs::batch_recover::Candidate {
                 array_phys: ev.array_phys,
                 block_size: ev.block_size,
-                logical: ev.logical,
-                devid: ev.devid,
-                stored_csum: ev.stored_csum.clone().unwrap_or_default(),
                 verify: verifier.clone(),
                 raw_phys,
                 failing_dev: failing_dev.to_path_buf(),
+                reconfirm: ev.reconfirm.clone(),
+                unreadable: ev.unreadable,
             };
             // `send` blocks once two batches are buffered (depth-2 channel),
             // naturally pausing the scrub while the writer is frozen/writing.
@@ -472,7 +449,16 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     let mut writer_handle = None;
     let mut acc_handle = None;
     if let Some(cfg) = cfg.clone() {
-        scrub.set_recover_batch(true);
+        // The writer thread needs its own re-confirmation handle (an
+        // independent filesystem handle, not a share of the scrub's
+        // reader).  The filesystem implementation builds it for us.
+        let reconfirmer = match scrub.reconfirmer() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error building recovery re-confirm handle: {e}");
+                return ExitCode::from(EXIT_RUNTIME_ERROR);
+            }
+        };
         // Move the freeze controller into the writer thread.
         let fc = std::mem::replace(
             &mut freeze_controller,
@@ -481,13 +467,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         let (tx, acc, handle) = match scrub_rs::batch_recover::spawn_pipeline(
             cfg,
             fc,
-            dev.clone(),
-            scrub.base_offset(),
-            scrub.strategy(),
-            scrub.devid(),
-            scrub.fsid(),
-            scrub.node_size(),
-            scrub.chunk_map_clone(),
+            reconfirmer,
             scrub_slot,
             dry_run,
             batch_max,
@@ -513,14 +493,16 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             }
         );
     } else {
-        // No array: plain scrub with inline reconfirm.  `set_recover_batch`
-        // stays false so the scrub loop owns mismatch/stale accounting.
+        // No array: plain scrub with inline reconfirm.  `wants_raw_candidates`
+        // is false (no writer attached), so the scrub loop owns
+        // mismatch/stale accounting.
         println!("recovery       : disabled (no array config / not a data disk) — plain scrub");
     }
 
     // The freeze lives on the writer thread in every mode, so the scrub loop
-    // itself never freezes — pass None here.
-    let stats = match scrub.run(&mut driver, None) {
+    // itself never freezes.  Batch vs inline mismatch handling is decided by
+    // the driver's `wants_raw_candidates` (true when a writer is attached).
+    let stats = match scrub.run(&mut driver) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error running scrub: {e}");
@@ -561,6 +543,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     );
     println!("  sectors read error : {}", stats.sectors_read_error);
     println!("  metadata hdr errs  : {}", stats.metadata_header_errors);
+    println!("  metadata read err  : {}", stats.metadata_read_errors);
     println!("  metadata mirror   : {}", stats.metadata_mirror_mismatches);
     println!("  bytes checked      : {}", stats.bytes_checked);
 
@@ -578,7 +561,24 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
 
     let issues_found = stats.sectors_mismatch + batch_stats.mismatch > 0
         || stats.sectors_read_error > 0
-        || stats.metadata_header_errors > 0;
+        || stats.metadata_header_errors > 0
+        || stats.metadata_read_errors > 0;
+
+    // Metadata READ errors (device EIO) are hardware, NOT checksum
+    // corruption — the operator response differs, so we do NOT trigger the
+    // "btrfs check --repair" advice below (that is written for checksum
+    // corruption).  Print a hardware-focused message instead; the exit
+    // code still reflects the coverage gap (a scrub that lost metadata
+    // coverage can never report clean / fully-verified).
+    if stats.metadata_read_errors > 0 {
+        eprintln!(
+            "\n[METADATA READ ERRORS] {} metadata node(s) failed with a READ \
+             (EIO) error — the bytes could not be fetched from the device. Some \
+             data may be UNVERIFIED. Check the disk hardware (SMART, cables, \
+             controller), not `btrfs check`.",
+            stats.metadata_read_errors
+        );
+    }
 
     // METADATA FATAL takes top priority over everything else.  A metadata
     // node with NO good copy (every DUP/RAID1 mirror failed its header
@@ -602,12 +602,18 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
 
     if !issues_found {
         ExitCode::SUCCESS
-    } else if writer_handle.is_some() && batch_stats.failed == 0 {
+    } else if writer_handle.is_some()
+        && stats.metadata_read_errors == 0
+        && batch_stats.failed == 0
+    {
         // Corruption found, but every confirmed block was rebuilt
         // successfully (or would-be-written in dry-run).  The expected good
         // outcome — the data is (or would be) intact.  Mode-independent:
         // plain scrub and --repair both report this the same way for the
-        // same disk.
+        // same disk.  Metadata read errors are deliberately excluded from
+        // this branch: lost metadata coverage means the data result cannot
+        // imply full verification (see the METADATA READ ERRORS message
+        // above), so it escalates to exit 5 (some unrecoverable) instead.
         ExitCode::from(EXIT_RECOVERED)
     } else if writer_handle.is_some() {
         // Corruption found AND at least one block could not be rebuilt

@@ -7,8 +7,8 @@ you can run a scrub on demand or on a schedule.
 Unlike a typical daemon plugin, this is an **on-demand tool**: there is no
 long-running service. The Settings page (Utilities → btrfs-integrity-recovery)
 triggers `scripts/scrub.sh`, which runs `scrub-rs` against the configured device
-and writes a status file the page polls. An optional schedule is applied via a
-`cron.d` entry managed by the `rc` script.
+and writes a per-run log the page can show. An optional schedule is applied via
+a `cron.d` entry managed by the `rc` script.
 
 ## Layout
 
@@ -21,8 +21,7 @@ plugin/
 │   ├── install/slack-desc
 │   ├── etc/rc.d/rc.btrfs-integrity-recovery   # schedule manager (cron.d)
 │   └── usr/local/emhttp/plugins/btrfs-integrity-recovery/
-│       ├── btrfs-integrity-recovery.page # menu entry
-│       ├── btrfs-integrity-recovery.php  # Settings UI (run / schedule)
+│       ├── btrfs-integrity-recovery.page # menu entry + Settings UI
 │       ├── images/btrfs-integrity-recovery.png
 │       ├── scripts/
 │       │   ├── install.sh                # .plg install step
@@ -47,16 +46,16 @@ only runs `upgradepkg` + `scripts/install.sh`; there is no `curl` to GitHub.
 ## Build locally
 
 ```sh
-# 1. Build the static binaries (musl, portable on unRAID's older glibc)
+# 1. Build the binaries (gnu target, matching unRAID's glibc runtime and the
+#    integration-test binaries — see build-plugin.yml)
 cd scrub-rs
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release
 cd ..
 
 # 2. Stage them into the plugin tree
 BIN=plugin/source/btrfs-integrity-recovery/usr/local/emhttp/plugins/btrfs-integrity-recovery/bin
-cp scrub-rs/target/x86_64-unknown-linux-musl/release/scrub-rs    "$BIN"/
-cp scrub-rs/target/x86_64-unknown-linux-musl/release/craft-corrupt "$BIN"/
+cp scrub-rs/target/release/scrub-rs    "$BIN"/
+cp scrub-rs/target/release/craft-corrupt "$BIN"/
 chmod 755 "$BIN"/scrub-rs "$BIN"/craft-corrupt
 
 # 3. Package the bundle
@@ -73,7 +72,7 @@ bash pkg_build.sh
   root + `btrfs-progs` + loop devices).
 - **Plugin packaging**: see
   [`../.github/workflows/build-plugin.yml`](../.github/workflows/build-plugin.yml).
-  It builds the musl binaries, runs `cargo test` as a gate, packages the
+  It builds the gnu binaries, runs `cargo test` as a gate, packages the
   bundle, uploads it as an artifact, and (on `v*` tags) publishes it to a
   GitHub Release.
 
