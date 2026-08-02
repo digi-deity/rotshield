@@ -58,7 +58,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::array::config::ArrayConfig;
@@ -66,6 +68,7 @@ use crate::array::stripe;
 use crate::freeze::FreezeController;
 use crate::fs::{Reconfirm, ReconfirmRequest, Reconfirmer, SectorVerifier};
 use crate::recovery::{RecoveryInput, RecoveryResult, recover_block};
+use crate::status::StatusCounters;
 
 /// A single corruption candidate handed from the scrub thread to the
 /// writer thread.  Carries everything the writer needs to re-confirm and
@@ -178,6 +181,7 @@ pub fn spawn_pipeline(
     dry_run: bool,
     batch_max: usize,
     batch_idle: Duration,
+    counters: Option<Arc<StatusCounters>>,
 ) -> io::Result<(
     SyncSender<Msg>,
     std::thread::JoinHandle<()>,
@@ -198,7 +202,15 @@ pub fn spawn_pipeline(
     let writer_handle = std::thread::Builder::new()
         .name("scrub-writer".into())
         .spawn(move || {
-            run_writer(rx_b, cfg, freeze, reconfirmer, scrub_slot, dry_run)
+            run_writer(
+                rx_b,
+                cfg,
+                freeze,
+                reconfirmer,
+                scrub_slot,
+                dry_run,
+                counters.as_deref(),
+            )
         })
         .expect("spawn scrub-writer thread");
 
@@ -273,6 +285,7 @@ fn run_writer(
     mut reconfirmer: Box<dyn Reconfirmer>,
     scrub_slot: u64,
     dry_run: bool,
+    counters: Option<&StatusCounters>,
 ) -> BatchStats {
     let mut stats = BatchStats::default();
 
@@ -284,6 +297,7 @@ fn run_writer(
             &mut reconfirmer,
             scrub_slot,
             dry_run,
+            counters,
             &mut stats,
         );
     }
@@ -300,6 +314,7 @@ fn flush_batch(
     reconfirmer: &mut Box<dyn Reconfirmer>,
     scrub_slot: u64,
     dry_run: bool,
+    counters: Option<&StatusCounters>,
     stats: &mut BatchStats,
 ) {
     // Dedupe by array_phys: a DUP chunk yields two dev-extents with
@@ -335,11 +350,17 @@ fn flush_batch(
         match verdict {
             Reconfirm::Stale => {
                 stats.stale += 1;
+                if let Some(c) = counters {
+                    c.stale.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
             }
             Reconfirm::Unverifiable => {
                 // Metadata for THIS sector unreadable — skip only this one.
                 stats.skipped += 1;
+                if let Some(c) = counters {
+                    c.skipped.fetch_add(1, Ordering::Relaxed);
+                }
                 eprintln!(
                     "  [0x{:x}] SKIPPED (re-confirm metadata unreadable for this sector)",
                     cand.raw_phys
@@ -373,6 +394,10 @@ fn flush_batch(
                     eprintln!("  [0x{:x}] read failing disk: {e}", cand.raw_phys);
                     stats.mismatch += 1;
                     stats.failed += 1;
+                    if let Some(c) = counters {
+                        c.mismatch.fetch_add(1, Ordering::Relaxed);
+                        c.failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
             };
@@ -380,11 +405,17 @@ fn flush_batch(
                 // Self-healed since the scan/reconfirm read: the live bytes
                 // now match the stored csum. Benign churn, not corruption.
                 stats.stale += 1;
+                if let Some(c) = counters {
+                    c.stale.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
             }
             block
         };
         stats.mismatch += 1;
+        if let Some(c) = counters {
+            c.mismatch.fetch_add(1, Ordering::Relaxed);
+        }
 
         let stripe_chunks =
             match stripe::gather_stripe(cfg, scrub_slot, cand.array_phys, cand.block_size) {
@@ -392,6 +423,9 @@ fn flush_batch(
                 Err(e) => {
                     eprintln!("  [0x{:x}] gather stripe failed: {e}", cand.raw_phys);
                     stats.failed += 1;
+                    if let Some(c) = counters {
+                        c.failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
             };
@@ -421,6 +455,9 @@ fn flush_batch(
                         Err(e) => {
                             eprintln!("  [0x{:x}] write back failed: {e}", cand.raw_phys);
                             stats.failed += 1;
+                            if let Some(c) = counters {
+                                c.failed.fetch_add(1, Ordering::Relaxed);
+                            }
                             continue;
                         }
                     }
@@ -454,6 +491,9 @@ fn flush_batch(
                     cand.failing_dev.display(),
                 );
                 stats.recovered += 1;
+                if let Some(c) = counters {
+                    c.recovered.fetch_add(1, Ordering::Relaxed);
+                }
             }
             RecoveryResult::NotCorrupt => {
                 // Re-confirm said corruption, but parity reconstruction
@@ -471,6 +511,9 @@ fn flush_batch(
                     cand.failing_dev.display(),
                 );
                 stats.failed += 1;
+                if let Some(c) = counters {
+                    c.failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }

@@ -50,12 +50,20 @@ errored=0
 # Recovery assessment is ALWAYS on (free + read-only); --repair is what
 # opts in to writing reconstructed blocks back. Dry-run is the safe default,
 # so we pass --repair ONLY when WRITE is explicitly enabled.
+#
+# The live status server is ON by default (port STATUS_PORT, default 9101) so
+# the Settings page can poll the running scrub's error counters via
+# `scrub.sh status`. STATUS_PORT=0 disables it. scrub-rs itself skips a busy
+# port (logged, never fatal), so two runs can never collide on it.
 build_args() {
   local args=""
   [ "${WRITE:-0}" = "1" ] && args="${args} --repair"
   [ "${NO_FREEZE:-0}" = "1" ] && args="${args} --no-freeze"
   [ -n "${BATCH_MAX:-}" ]   && args="${args} --batch-max ${BATCH_MAX}"
   [ -n "${BATCH_IDLE:-}" ]  && args="${args} --batch-idle ${BATCH_IDLE}"
+  # 0 = disabled; anything else (incl. empty -> default) enables the server.
+  local port="${STATUS_PORT:-9101}"
+  [ "${port}" != "0" ] && args="${args} --status-port ${port}"
   [ -n "${EXTRA_OPTIONS:-}" ] && args="${args} ${EXTRA_OPTIONS}"
   echo "${args}"
 }
@@ -420,10 +428,21 @@ kill_tree() {
   kill -"${sig}" "${pid}" 2>/dev/null
 }
 
+# Print the live status payload from the running scrub's status server
+# (key=value lines; empty if the server isn't up or curl is missing).  Backs
+# the Settings page's live-status panel.
+status() {
+  local port="${STATUS_PORT:-9101}"
+  [ "${port}" = "0" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  curl -s --max-time 2 "http://127.0.0.1:${port}/status" 2>/dev/null
+}
+
 case "${1:-running}" in
   run)     run ;;
   running) running ;;
   devices) devices ;;
+  status)  status ;;
   stop)    stop ;;
-  *) echo "usage: $0 run|running|devices|stop" ;;
+  *) echo "usage: $0 run|running|devices|status|stop" ;;
 esac

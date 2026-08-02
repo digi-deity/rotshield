@@ -16,6 +16,7 @@ use scrub_rs::fs::FilesystemScrub;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 /// Exit-code contract (kept small and stable so callers — e.g. the
 /// btrfs-integrity-recovery unRAID plugin — can branch on meaning, not on
@@ -149,8 +150,29 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // still flushes promptly (idle timer) while bursts are coalesced.
     let mut batch_max: usize = 64;
     let mut batch_idle: f64 = 5.0;
+    // Optional localhost HTTP status server for the plugin: when a non-zero
+    // `--status-port <n>` is given, scrub-rs serves the live error/progress
+    // counters on 127.0.0.1:<n> from a background thread (see `status.rs`).
+    // 0 (default) = no server, so standalone behaviour is unchanged.
+    let mut status_port: u16 = 0;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--status-port" => {
+                let v = match args.next() {
+                    Some(s) => s,
+                    None => {
+                        eprintln!("error: --status-port requires a value");
+                        return ExitCode::from(EXIT_USAGE_ERROR);
+                    }
+                };
+                match v.parse::<u16>() {
+                    Ok(p) => status_port = p,
+                    Err(_) => {
+                        eprintln!("error: --status-port must be a port number (0-65535)");
+                        return ExitCode::from(EXIT_USAGE_ERROR);
+                    }
+                }
+            }
             "--offset" => {
                 let v = match args.next() {
                     Some(s) => s,
@@ -222,7 +244,8 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
                 eprintln!("unknown argument: {other}");
                 eprintln!(
                     "usage: scrub-rs <device-or-image> [--offset <bytes>] \
-                     [--repair] [--freeze-mount <path>] [--no-freeze]"
+                     [--repair] [--freeze-mount <path>] [--no-freeze] \
+                     [--status-port <n>]"
                 );
                 return ExitCode::from(EXIT_USAGE_ERROR);
             }
@@ -241,6 +264,28 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     for line in scrub.describe() {
         println!("{line}");
     }
+
+    // Optional localhost status server (plugin integration).  The shared
+    // counters are handed to both the scrub loop and the recovery writer so
+    // `GET /status` reports live numbers while the run is in flight.  The
+    // server runs on its own background thread; dropping its handle here
+    // detaches it — the thread lives until the process exits.
+    let status = Arc::new(scrub_rs::status::StatusCounters::new());
+    if status_port != 0 {
+        status.set_state("starting");
+        status.set_device(&dev);
+        // A busy port (e.g. a previous run still up) is logged and skipped —
+        // the scrub must never fail just because the status port is taken.
+        match scrub_rs::status::StatusServer::spawn(status_port, status.clone()) {
+            Ok(_) => println!(
+                "status         : serving live counters on 127.0.0.1:{status_port} (GET /status)"
+            ),
+            Err(e) => eprintln!(
+                "note: could not start status server on 127.0.0.1:{status_port} ({e}); continuing without it"
+            ),
+        }
+    }
+    scrub.set_status(status.clone());
 
     // Recovery glue: the contract routes two streams through one
     // `ScrubCallbacks` impl below — `on_log` for free-form diagnostic
@@ -472,6 +517,11 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             dry_run,
             batch_max,
             std::time::Duration::from_secs_f64(batch_idle),
+            if status_port != 0 {
+                Some(status.clone())
+            } else {
+                None
+            },
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -502,9 +552,11 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // The freeze lives on the writer thread in every mode, so the scrub loop
     // itself never freezes.  Batch vs inline mismatch handling is decided by
     // the driver's `wants_raw_candidates` (true when a writer is attached).
+    status.set_state("running");
     let stats = match scrub.run(&mut driver) {
         Ok(s) => s,
         Err(e) => {
+            status.set_state("error");
             eprintln!("error running scrub: {e}");
             return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
@@ -513,6 +565,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // If we spawned a writer thread, signal completion and collect its
     // stats.  The `Done` message flushes any pending batch; joining waits
     // for the final freeze/thaw to finish so the FS is never left frozen.
+    status.set_state("done");
     let mut batch_stats = scrub_rs::batch_recover::BatchStats::default();
     if writer_handle.is_some() {
         if let Some(tx) = driver.tx.take() {
@@ -645,6 +698,7 @@ fn print_help() {
     println!("  --no-freeze           disable the freeze (unsafe with --repair on a live FS)");
     println!("  --batch-max <N>       max candidates per recovery batch (default 64)");
     println!("  --batch-idle <X>      flush a batch after Xs of no new candidate (default 5.0)");
+    println!("  --status-port <n>     serve live counters on 127.0.0.1:<n> (0 = off)");
     println!("  --help, -h            show this help and the recovery-counter glossary");
     println!();
     println!("recovery summary counters (always assessed when an array is present):");

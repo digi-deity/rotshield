@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.08.01b">
-<!ENTITY bundleversion "2026.08.01b">
+<!ENTITY version       "2026.08.02">
+<!ENTITY bundleversion "2026.08.02">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,21 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.02
+- Live status endpoint: scrub-rs now serves real-time error + progress
+  counters on a localhost-only HTTP port (STATUS_PORT, default 9101; set 0 to
+  disable). The Settings page shows a live "Status" panel that polls it every
+  2 s while a scrub runs, instead of just "running / idle".
+- Coarse scrub progress: `progress_pct` (float, two decimals, monotonic
+  non-decreasing) on the status endpoint — the fraction of data dev-extents
+  scrubbed so far, known up front with no full scan. 1 TiB+ disks get ~1000+
+  steps (~0.1% resolution); tiny test images show chunky ~10% jumps.
+- New `scrub.sh status` subcommand (curls the live server) backing the panel.
+- Internal refactor: filesystem re-confirmation moved behind the `fs` seam
+  (filesystem-owned `Reconfirmer`), the array canary moved to a glue module,
+  and the recovery batch writer no longer depends on btrfs internals. No
+  user-visible behaviour change.
 
 ###2026.08.01b
 - Settings form: align inputs with their pre-text labels (fixed-width label

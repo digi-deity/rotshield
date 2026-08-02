@@ -119,9 +119,53 @@ array partition `/dev/nmdNp1`). There is nothing for the user to set — and no
 fallback, because without a valid offset recovery is impossible anyway.
 | `BATCH_MAX` | max candidates per recovery batch | `--batch-max` |
 | `BATCH_IDLE` | idle-seconds flush threshold | `--batch-idle` |
+| `STATUS_PORT` | localhost HTTP port for the live status endpoint (`0` disables; default `9101`) | `--status-port` |
 | `EXTRA_OPTIONS` | appended verbatim (advanced) | — |
 | `SCHEDULE` | `disabled` / `weekly` / `monthly` / `custom` | (cron) |
 | `CRON` | 5-field cron time spec (`min hour day month weekday`), used only when `SCHEDULE=custom` (e.g. `0 4 1 * *` = 04:00 on the 1st). `daily` is intentionally not offered — a scrub can take days and would overlap its own previous run. | (cron) |
+
+### Live status endpoint
+
+While a scrub runs, scrub-rs can serve the live error counters over a
+localhost-only HTTP endpoint so the Settings page shows real-time numbers
+instead of just "running / idle". This is on by default (`STATUS_PORT=9101`)
+and binds to `127.0.0.1` only — never the network. `scrub.sh status` prints
+the payload, and the Settings page polls it every 2 s.
+
+```
+$ curl -s http://127.0.0.1:9101/status
+state=running
+device=/dev/nmd1p1
+sectors_checked=123456
+sectors_ok=123455
+sectors_mismatch=1
+sectors_stale=0
+sectors_no_csum=0
+sectors_read_error=0
+bytes_checked=505937920
+metadata_header_errors=0
+metadata_mirror_mismatches=0
+metadata_read_errors=0
+recovered=1
+failed=0
+skipped=0
+progress_total=1073741824
+progress_done=268435456
+progress_pct=25.00
+```
+
+`progress_pct` is a coarse scrub-completion percentage emitted as a float
+with two decimal places (0.00–100.00, monotonic non-decreasing): the numerator
+is the physical length of data dev-extents already fully scrubbed (the scrub is
+a single front-to-back pass over the DEV_TREE, so each completed extent advances
+it), the denominator is the total length of all DATA dev-extents, known up front
+with no scan. It's coarse (extent-granular, ~1 GiB steps on a default
+filesystem), which is plenty on real disks (1 TiB → ~1000 steps → 0.1%
+resolution) and only visibly chunky on tiny test images.
+
+`key=value` lines, shell-parseable (e.g. `curl -s …/status | awk -F= '$1=="recovered"{print $2}'`).
+Set `STATUS_PORT=0` to disable. A busy port is logged and skipped by scrub-rs,
+never fatal.
 
 ## Releasing
 

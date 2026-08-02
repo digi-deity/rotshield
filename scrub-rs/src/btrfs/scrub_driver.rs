@@ -24,6 +24,7 @@
 
 use std::io;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::btrfs::chunk::ChunkMap;
@@ -31,12 +32,14 @@ use crate::btrfs::csum::LazyCsumProvider;
 use crate::btrfs::csum_strategy::CsumStrategy;
 use crate::btrfs::dev_extent::build_dev_extents;
 use crate::btrfs::extent::reconfirm_mismatch;
+use crate::btrfs::key::bg_flag;
 use crate::btrfs::open::live_data_tree_roots;
 use crate::btrfs::reader::FsReader;
 use crate::btrfs::scrub::scrub_dev_tree;
 use crate::btrfs::superblock::Superblock;
 use crate::fs;
 use crate::fs::{Reconfirm, ReconfirmRequest, Reconfirmer, ScrubEvent, ScrubStats, SectorVerifier};
+use crate::status::StatusCounters;
 
 /// A btrfs filesystem scrub.
 ///
@@ -92,6 +95,11 @@ pub struct BtrfsScrub {
     /// The device path this filesystem was opened from, for the CLI header
     /// ([`FilesystemScrub::describe`]).
     dev: String,
+    /// Optional shared live-status counters (the plugin's status server).
+    /// `None` for standalone scrub-rs runs — glue attached by `main` via
+    /// [`BtrfsScrub::set_status`] before `run`; the scrub loop mirrors its
+    /// running totals into them so a `GET /status` shows live numbers.
+    status: Option<Arc<StatusCounters>>,
 }
 
 impl BtrfsScrub {
@@ -182,7 +190,52 @@ impl BtrfsScrub {
             metadata_mirror_mismatches,
             metadata_read_errors,
             dev: dev.to_string(),
+            status: None,
         })
+    }
+
+    /// Attach the shared live-status counters for the plugin's status
+    /// server.  Glue — set by `main` before `run`; `None` by default so a
+    /// standalone scrub-rs behaves exactly as before.  The metadata-error
+    /// counters are already final after `open` (the chunk/root-tree walks
+    /// and the CSUM-tree header sweep run in the constructor), so they are
+    /// mirrored here immediately rather than only at the end of `run`.
+    pub fn set_status(&mut self, counters: Arc<StatusCounters>) {
+        // Coarse progress denominator: the total physical length of the
+        // DATA dev-extents the scrub loop will actually scrub, summed
+        // from the eagerly-walked DEV_TREE.  Computed here (not in `run`)
+        // so a `GET /status` shows a stable, non-zero denominator from
+        // the very start.  No full scan — the extents are already in
+        // memory; this is just a sum.  Non-DATA (metadata/system) extents
+        // are excluded because the scrub loop `continue`s past them, so
+        // they would otherwise pad the denominator with bytes that are
+        // never credited and drag the final percentage below 100.
+        let progress_total: u64 = self
+            .dev_extents
+            .iter()
+            .filter(|d| {
+                self.chunk_map
+                    .info(d.chunk_offset)
+                    .is_some_and(|c| c.flags & bg_flag::DATA != 0)
+            })
+            .map(|d| d.length)
+            .sum();
+        counters
+            .progress_total
+            .store(progress_total, Ordering::Relaxed);
+
+        counters.metadata_header_errors.store(
+            self.metadata_header_errors + self.csum_provider.metadata_errors(),
+            Ordering::Relaxed,
+        );
+        counters
+            .metadata_mirror_mismatches
+            .store(self.metadata_mirror_mismatches, Ordering::Relaxed);
+        counters.metadata_read_errors.store(
+            self.metadata_read_errors + self.csum_provider.metadata_read_errors(),
+            Ordering::Relaxed,
+        );
+        self.status = Some(counters);
     }
 
 }
@@ -287,6 +340,7 @@ impl fs::FilesystemScrub for BtrfsScrub {
             &self.dev_extents,
             &self.strategy,
             batch,
+            self.status.as_deref(),
             &mut emit,
         );
 

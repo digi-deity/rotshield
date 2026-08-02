@@ -52,6 +52,8 @@ use crate::btrfs::dev_extent::DevExtent;
 use crate::btrfs::key::bg_flag;
 use crate::btrfs::reader::FsReader;
 use crate::btrfs::util::pread_at;
+use crate::status::StatusCounters;
+use std::sync::atomic::Ordering;
 
 /// Minimum run size (in sectors) before parallel checksumming kicks in.
 /// Below this the per-thread dispatch overhead exceeds the savings, so
@@ -298,6 +300,7 @@ pub fn scrub_dev_tree<F>(
     dev_extents: &[DevExtent],
     strategy: &CsumStrategy,
     batch: bool,
+    counters: Option<&StatusCounters>,
     mut on_sector: F,
 ) -> ScrubStats
 where
@@ -367,6 +370,7 @@ where
                 dev_extents,
                 strategy,
                 batch,
+                counters,
                 on_sector,
             );
         }
@@ -620,6 +624,7 @@ where
                     chunk_map,
                     strategy,
                     batch,
+                    counters,
                     &mut on_sector,
                     &mut stats,
                 );
@@ -643,6 +648,18 @@ where
         });
         // Flush the trailing run for this dev-extent.
         flush(&mut run);
+
+        // Coarse progress: this DATA dev-extent's physical bytes are now
+        // fully scrubbed.  Bump the numerator by the extent's full length
+        // so the status server's `progress_pct` advances.  Crediting the
+        // whole extent at completion (rather than per-sector) is
+        // deliberate: free space / inline / nodatasum gaps inside the
+        // extent were never csum-yielded but are still "walked past", so
+        // crediting the full length keeps the bar monotonic and lands it
+        // on exactly 100% when the last extent finishes.
+        if let Some(c) = counters {
+            c.progress_done.fetch_add(dext.length, Ordering::Relaxed);
+        }
     }
 
     // Drain the pipeline: close the command channel so the reader thread
@@ -660,6 +677,7 @@ where
                     chunk_map,
                     strategy,
                     batch,
+                    counters,
                     &mut on_sector,
                     &mut stats,
                 );
@@ -692,6 +710,7 @@ fn scrub_dev_tree_inline<F>(
     dev_extents: &[DevExtent],
     strategy: &CsumStrategy,
     batch: bool,
+    counters: Option<&StatusCounters>,
     mut on_sector: F,
 ) -> ScrubStats
 where
@@ -747,6 +766,7 @@ where
                 run,
                 strategy,
                 batch,
+                counters,
                 reader,
                 chunk_map,
                 &mut on_sector,
@@ -765,6 +785,13 @@ where
             prev_logical = Some(e.logical);
         });
         flush(&mut run, reader);
+
+        // Coarse progress: same numerator bump as the pipelined path (see
+        // `scrub_dev_tree`), so the inline fallback reports identical
+        // dev-tree-position progress.
+        if let Some(c) = counters {
+            c.progress_done.fetch_add(dext.length, Ordering::Relaxed);
+        }
     }
 
     stats
@@ -785,6 +812,7 @@ fn process_buf(
     dext: &DevExtent,
     strategy: &CsumStrategy,
     batch: bool,
+    counters: Option<&StatusCounters>,
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     on_sector: &mut impl FnMut(&SectorResult),
@@ -817,8 +845,16 @@ fn process_buf(
         let actual = &actuals[i];
         stats.sectors_checked += 1;
         stats.bytes_checked += strategy.sector_size;
+        if let Some(c) = counters {
+            c.sectors_checked.fetch_add(1, Ordering::Relaxed);
+            c.bytes_checked
+                .fetch_add(strategy.sector_size, Ordering::Relaxed);
+        }
         if actual == stored {
             stats.sectors_ok += 1;
+            if let Some(c) = counters {
+                c.sectors_ok.fetch_add(1, Ordering::Relaxed);
+            }
         } else if batch {
             // Batched recovery mode: emit the raw mismatch as a candidate
             // for the (separate) recovery sink.  We do NOT re-confirm or
@@ -886,6 +922,9 @@ fn process_buf(
                 };
             if is_corruption {
                 stats.sectors_mismatch += 1;
+                if let Some(c) = counters {
+                    c.mismatch.fetch_add(1, Ordering::Relaxed);
+                }
                 on_sector(&SectorResult {
                     logical: *sector_logical,
                     devid: dext.devid,
@@ -899,6 +938,9 @@ fn process_buf(
                 });
             } else {
                 stats.sectors_stale += 1;
+                if let Some(c) = counters {
+                    c.stale.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -916,6 +958,7 @@ fn process_rsp(
     chunk_map: &ChunkMap,
     strategy: &CsumStrategy,
     batch: bool,
+    counters: Option<&StatusCounters>,
     on_sector: &mut impl FnMut(&SectorResult),
     stats: &mut ScrubStats,
 ) {
@@ -932,6 +975,7 @@ fn process_rsp(
         &entries,
         strategy,
         batch,
+        counters,
         reader,
         chunk_map,
         on_sector,
@@ -1101,6 +1145,7 @@ fn process_isolated(
     entries: &[(u64, Vec<u8>)],
     strategy: &CsumStrategy,
     batch: bool,
+    counters: Option<&StatusCounters>,
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     on_sector: &mut impl FnMut(&SectorResult),
@@ -1127,6 +1172,7 @@ fn process_isolated(
             dext,
             strategy,
             batch,
+            counters,
             reader,
             chunk_map,
             on_sector,
@@ -1147,6 +1193,12 @@ fn process_isolated(
         stats.sectors_checked += 1;
         stats.bytes_checked += strategy.sector_size;
         stats.sectors_read_error += 1;
+        if let Some(c) = counters {
+            c.sectors_checked.fetch_add(1, Ordering::Relaxed);
+            c.bytes_checked
+                .fetch_add(strategy.sector_size, Ordering::Relaxed);
+            c.sectors_read_error.fetch_add(1, Ordering::Relaxed);
+        }
         let phys = dext.phys_start + (*sector_logical - dext.chunk_offset);
         eprintln!(
             "read error at phys 0x{:x} (devid {}, logical 0x{:x})",

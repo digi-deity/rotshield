@@ -15,6 +15,10 @@
 //! * `batch_recover.rs` — the batched two-stage recovery pipeline.
 //! * `canary.rs` — the startup array-soundness probe.
 //! * `freeze.rs` — live-mount freeze control for recovery writes.
+//! * `status.rs` — opt-in HTTP status server + shared live counters so the
+//!   unRAID plugin can show a running scrub's error/progress numbers without
+//!   polling process logs.  Std-only; the counters mirror what the scrub and
+//!   recovery writer already accumulate.
 
 pub mod array;
 pub mod batch_recover;
@@ -23,3 +27,4 @@ pub mod canary;
 pub mod freeze;
 pub mod fs;
 pub mod recovery;
+pub mod status;

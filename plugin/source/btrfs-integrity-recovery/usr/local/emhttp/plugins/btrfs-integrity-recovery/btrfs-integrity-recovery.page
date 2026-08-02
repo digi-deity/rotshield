@@ -31,7 +31,7 @@ function cron_expr_valid($expr) {
 
 if (!is_file($config_file)) {
     @mkdir($config_dir, 0777, true);
-    file_put_contents($config_file, "DEVICES='/dev/nmd1p1'\nDEVICE='/dev/nmd1p1'\nSCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nNO_FREEZE=0\nBATCH_MAX=\nBATCH_IDLE=\nEXTRA_OPTIONS=\n");
+    file_put_contents($config_file, "DEVICES='/dev/nmd1p1'\nDEVICE='/dev/nmd1p1'\nSCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nNO_FREEZE=0\nBATCH_MAX=\nBATCH_IDLE=\nSTATUS_PORT=9101\nEXTRA_OPTIONS=\n");
 }
 $config = parse_ini_file($config_file);
 
@@ -77,6 +77,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $batch_max= escapeshellarg(trim($_POST['batch_max']   ?? ''));
     $batch_idle=escapeshellarg(trim($_POST['batch_idle']  ?? ''));
     $extra    = escapeshellarg(trim($_POST['extra_options'] ?? ''));
+    // Live status port: 0 disables the localhost status endpoint, 1-65535
+    // enables it on 127.0.0.1. Validated to a plain integer so it can never
+    // inject anything into the config / command line.
+    $status_port = trim($_POST['status_port'] ?? '9101');
+    $status_port = (ctype_digit($status_port) && (int)$status_port <= 65535)
+        ? (int)$status_port : 9101;
     // Single-quote every string value so the file is valid BOTH as PHP INI
     // (parse_ini_file strips the quotes) AND as a bash `source`d file. An
     // unquoted space-separated value — DEVICES with multiple disks, or a
@@ -92,6 +98,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         "NO_FREEZE=$no_freeze\n" .
         "BATCH_MAX=$batch_max\n" .
         "BATCH_IDLE=$batch_idle\n" .
+        "STATUS_PORT=$status_port\n" .
         "EXTRA_OPTIONS=$extra\n");
     exec("/etc/rc.d/rc.$plugin restart 2>&1");
     if (isset($_POST['run'])) {
@@ -220,6 +227,9 @@ pre { max-width: 100%; overflow-x: auto; }
     <tr><td>Extra options <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Advanced: extra arguments appended verbatim to the scrub-rs command line (e.g. --dump-array or --resolve for debugging). Anything you type is passed through unmodified, so invalid flags will make the scrub fail with a usage error. Most users should leave this empty.</span></span></td>
         <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>">
 </td></tr>
+    <tr><td>Status port <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Localhost HTTP port that serves the running scrub's live error counters (scrub-rs --status-port), shown in the live-status panel below. Binds only to 127.0.0.1, so it is never reachable from the network. Set 0 to disable. The scrub-rs process skips a busy port without failing, so two runs can never collide on it.</span></span></td>
+        <td><input type="text" name="status_port" size="10" value="<?=htmlspecialchars($config['STATUS_PORT'] ?? '9101')?>" placeholder="9101">
+</td></tr>
   </table>
   <p>
     <input type="submit" name="save" value="Save Settings">
@@ -231,6 +241,35 @@ pre { max-width: 100%; overflow-x: auto; }
 
 <h2>Status</h2>
 <p><b>Scrub:</b> <?= $running ? '<span style="color:#c00">Running</span>' : 'Idle' ?></p>
+<?php
+// Live error counters served by the running scrub's localhost status server
+// (scrub.sh status -> curl to 127.0.0.1:<port>). Empty while idle (no server
+// up). Rendered server-side on load and polled live by the JS below.
+$live_status = trim(shell_exec("$plugin_dir/scripts/scrub.sh status 2>/dev/null") ?: '');
+?>
+<div id="live-status-wrap" style="margin-top:8px">
+  <b>Live counters:</b>
+  <pre id="live-status" style="margin-top:6px"><?=htmlspecialchars($live_status !== '' ? $live_status : '(no live data — scrub idle or status disabled)')?></pre>
+</div>
+<script>
+// Poll the status endpoint every 2 s so the counters update while a scrub is
+// running, without reloading the settings form.
+(function () {
+  var url = '/plugins/<?=htmlspecialchars($plugin)?>/status.php';
+  var pre = document.getElementById('live-status');
+  function poll() {
+    fetch(url, {cache: 'no-store'})
+      .then(function (r) { return r.text(); })
+      .then(function (t) {
+        t = (t || '').trim();
+        pre.textContent = t !== '' ? t : '(no live data — scrub idle or status disabled)';
+      })
+      .catch(function () { /* server down while idle — leave as-is */ });
+  }
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
 
 <?php if ($view_log !== "" || isset($_GET['view']) || isset($_GET['log'])): ?>
 <h2><?=htmlspecialchars($view_title)?></h2>
