@@ -46,9 +46,10 @@
 //!   `FreezeGuard` RAII drop at the end of the batch.
 //! * The writer owns an **independent** [`Reconfirmer`] (a filesystem
 //!   handle with its own file handles + chunk map, built via
-//!   [`FilesystemScrub::reconfirmer`]), so it never borrows the main
-//!   scrub's reader — the two threads touch disjoint file handles.  The
-//!   main thread only *reads* the raw rdev; only the writer *writes*.
+//!   [`crate::fs::FilesystemScrub::reconfirmer`]), so it never borrows
+//!   the main scrub's reader — the two threads touch disjoint file
+//!   handles.  The main thread only *reads* the raw rdev; only the writer
+//!   *writes*.
 //! * Read-back verification: after writing each recovered block the writer
 //!   re-reads it from the raw rdev and asserts the verifier accepts it; a
 //!   mismatch is logged as a warning.  It then issues `BLKFLSBUF` on the

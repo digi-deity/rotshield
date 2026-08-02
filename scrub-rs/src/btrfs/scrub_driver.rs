@@ -377,9 +377,10 @@ impl fs::FilesystemScrub for BtrfsScrub {
 /// handle (own `FsReader`, own `ChunkMap`) that re-checks a deferred csum
 /// mismatch against the *live* EXTENT_TREE + CSUM_TREE at write time.
 ///
-/// Constructed via [`FilesystemScrub::reconfirmer`] from the scrub's own
-/// reader (a dup'd fd + the already-built chunk map), so the writer thread
-/// never shares the scrub's reader and the two can run concurrently.
+/// Constructed via [`crate::fs::FilesystemScrub::reconfirmer`] from the
+/// scrub's own reader (a dup'd fd + the already-built chunk map), so the
+/// writer thread never shares the scrub's reader and the two can run
+/// concurrently.
 struct BtrfsReconfirmer {
     reader: FsReader,
     chunk_map: ChunkMap,
