@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.08.02">
-<!ENTITY bundleversion "2026.08.02">
+<!ENTITY version       "2026.08.02a">
+<!ENTITY bundleversion "2026.08.02a">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,16 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.02a
+- Fixed plugin updates: the bundle is now installed with
+  `upgradepkg --install-new --reinstall`. The bundle filename is kept fixed
+  (so the releases/latest/download URL stays stable), which made
+  upgradepkg see the same package name on every update and skip
+  re-extracting the bundle (`Skipping package ... already installed`) —
+  leaving the old binaries on disk. `--reinstall` forces re-extraction so
+  version bumps actually take effect; `--install-new` keeps fresh installs
+  working.
 
 ###2026.08.02
 - Live status endpoint: scrub-rs now serves real-time error + progress
@@ -62,9 +72,19 @@
 <!--
 Install the bundle. It already contains the prebuilt binaries
 (scrub-rs, craft-corrupt) plus all plugin files, so there is NO
-binary download at install time (we build & ship it ourselves).
+binary download at install time (we build and ship it ourselves).
+
+Both flags are required:
+- install-new installs the package on first install (no installed copy).
+- reinstall is REQUIRED because pkg_build.sh keeps the bundle filename
+  FIXED (btrfs-integrity-recovery-x86_64-1.txz so the
+  releases/latest/download URL stays stable). With a fixed name,
+  upgradepkg compares package NAMES, not versions, so on an update it
+  sees "already installed" and skips re-extracting the bundle, leaving
+  the old binaries on disk. reinstall forces it to re-extract every
+  time, which is what makes version bumps actually take effect.
 -->
-<FILE Name="/boot/config/plugins/btrfs-integrity-recovery/install/btrfs-integrity-recovery-x86_64-1.txz" Run="upgradepkg --install-new">
+<FILE Name="/boot/config/plugins/btrfs-integrity-recovery/install/btrfs-integrity-recovery-x86_64-1.txz" Run="upgradepkg --install-new --reinstall">
 <URL>&bundleURL;</URL>
 </FILE>
 
@@ -73,9 +93,12 @@ binary download at install time (we build & ship it ourselves).
 <INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh</INLINE>
 </FILE>
 
-<!-- Re-run the same logic on upgrade: upgradepkg re-extracts the bundle,
-     but without this Method="upgrade" hook the post-install steps
-     (perms, default config, rc restart) would be skipped on version bumps. -->
+<!-- Re-run the same logic on upgrade: the bundle is re-extracted by the
+     FILE element above (upgradepkg with both install-new and reinstall;
+     reinstall is what actually forces the fixed-name bundle to be
+     re-extracted), and this Method="upgrade" hook re-runs the
+     post-install steps (perms, default config, rc restart) so they are
+     not skipped on version bumps. -->
 <FILE Run="/bin/bash" Method="upgrade">
 <INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh</INLINE>
 </FILE>
