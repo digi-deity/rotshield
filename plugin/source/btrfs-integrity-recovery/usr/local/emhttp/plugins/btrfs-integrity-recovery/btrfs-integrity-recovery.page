@@ -133,8 +133,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $message = "Scrub started in the background.";
         }
     } elseif (isset($_POST['stop'])) {
-        exec("$plugin_dir/scripts/scrub.sh stop 2>&1");
-        $message = "Scrub stop requested.";
+        // Pass the page's last-known live payload to scrub.sh stop() as a
+        // fallback snapshot: if the status server can't be reached at stop
+        // time (busy port, dead server, ...), the cancelled block still
+        // carries the last numbers the page had.  stop() validates the
+        // payload (device must match the active disk) before recording it.
+        $snapshot = trim($_POST['last_status'] ?? '');
+        $snapshot_file = '';
+        if ($snapshot !== '') {
+            $snapshot_file = "/tmp/${plugin}-stop-snapshot";
+            @file_put_contents($snapshot_file, $snapshot);
+        }
+        // Surface the real outcome (e.g. "Run already finished") instead of
+        // always claiming the stop was requested.
+        $stop_out = trim(shell_exec("$plugin_dir/scripts/scrub.sh stop " . escapeshellarg($snapshot_file) . " 2>&1") ?: '');
+        if ($snapshot_file !== '') { @unlink($snapshot_file); }
+        $message = $stop_out !== '' ? $stop_out : "Scrub stop requested.";
     } else {
         $message = "Settings saved.";
     }
@@ -316,6 +330,10 @@ pre { max-width: 100%; overflow-x: auto; }
     <input type="submit" name="save" value="Save Settings">
     <input type="submit" name="run"  value="Run Scrub Now">
     <input type="submit" name="stop" id="stop-btn" value="Stop Scrub" <?= $running ? '' : 'style="display:none"' ?>>
+    <!-- The page's last-received live status payload, refreshed every poll.
+         Sent with the Stop request so scrub.sh stop() can still record the
+         aborted disk's counters even if its own status curl fails. -->
+    <input type="hidden" name="last_status" id="stop-snapshot" value="">
   </p>
 </form>
 
@@ -516,9 +534,10 @@ $configured_devices = array_values(array_filter(
 
   // --- polling ----------------------------------------------------------
   function parseBlocks(text) {
-    // { finals: [kv...], live: kv|null, meta: kv } — blocks with state=done/
-    // error are final (from the run log), any other state block is live.
-    var finals = [], live = null, meta = {};
+    // { finals: [kv...], live: kv|null, liveRaw: string|null, meta: kv } —
+    // blocks with state=done/error/cancelled are final (from the run log),
+    // any other state block is live.
+    var finals = [], live = null, liveRaw = null, meta = {};
     var parts = (text || '').split(/\n\s*\n/);
     for (var i = 0; i < parts.length; i++) {
       var kv = {};
@@ -529,9 +548,9 @@ $configured_devices = array_values(array_filter(
       }
       if (kv.running !== undefined) { meta = kv; }
       else if (kv.state === 'done' || kv.state === 'error' || kv.state === 'cancelled') { finals.push(kv); }
-      else if (kv.state) { live = kv; }
+      else if (kv.state) { live = kv; liveRaw = parts[i].trim(); }
     }
-    return { finals: finals, live: live, meta: meta };
+    return { finals: finals, live: live, liveRaw: liveRaw, meta: meta };
   }
 
   function apply(text) {
@@ -567,6 +586,12 @@ $configured_devices = array_values(array_filter(
     updateLine(meta);
     var stopBtn = document.getElementById('stop-btn');
     if (stopBtn) stopBtn.style.display = running ? '' : 'none';
+    // Keep the hidden Stop-snapshot field fresh with the last live payload,
+    // so a Stop POST can hand scrub.sh its own snapshot as a fallback.
+    if (p.liveRaw) {
+      var snap = document.getElementById('stop-snapshot');
+      if (snap) snap.value = p.liveRaw;
+    }
     renderTable();
     document.getElementById('progress-updated').textContent =
       'Last updated ' + new Date().toLocaleTimeString();

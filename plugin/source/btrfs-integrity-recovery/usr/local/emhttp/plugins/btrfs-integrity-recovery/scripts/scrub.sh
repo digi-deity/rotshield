@@ -400,6 +400,10 @@ offset_for() {
 }
 
 stop() {
+  # Optional fallback snapshot file (written by the Settings page with the
+  # last live payload it received): used only when the direct status curl
+  # comes up empty, so a busy port / dead server can't lose the counters.
+  local fallback_file="${1:-}"
   [ -d "${LOCK_DIR}" ] || { echo "No scrub is currently running."; return 0; }
   local pid; pid="$(cat "${LOCK_DIR}/pid" 2>/dev/null)"
   if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
@@ -408,13 +412,39 @@ stop() {
     echo "No scrub is currently running (stale lock removed)."
     return 0
   fi
+
+  local run_log; run_log="$(newest_run_log)"
+  # CHECK: has this run already written its `finished:` line?  run() writes
+  # it BEFORE releasing the lock, so a stop in that window must NOT kill the
+  # (already done) process or append a fake cancellation after a real
+  # completion — that would flip the outcome to CANCELLED and, worse, an
+  # empty-counters block would overwrite the device's real final data.
+  if [ -n "${run_log}" ] && grep -q "finished:" "${run_log}"; then
+    rm -rf "${LOCK_DIR}"
+    echo "Run already finished — nothing to cancel."
+    return 0
+  fi
+
   # ONE snapshot before the kill: fetch the live counters while the status
   # server is still up, then record them as a cancelled status block in the
   # run log.  This is the only write a stop produces (no per-change state
   # writes anywhere) — it keeps the aborted disk's last known numbers sticky
-  # in the UI, even after a page reload.  Best-effort: with STATUS_PORT=0 or
-  # a dead server we record a state-only block.
+  # in the UI, even after a page reload.  If the curl payload is missing or
+  # fails validation, fall back to the Settings page's last-received live
+  # payload (written to ${fallback_file} by the Stop POST).
   local payload; payload="$(status)"
+  local active_dev=""
+  [ -n "${run_log}" ] && active_dev="$(last_scrubbed_device "${run_log}")"
+  # CHECK: only trust a payload that looks like a real scrub-rs status
+  # payload AND describes the disk this run is actually scrubbing.  A busy
+  # port, a dead server, or a leftover foreign server would otherwise record
+  # garbage (or another device's numbers) into the run log.
+  payload="$(sanitize_status_payload "${payload}" "${active_dev}")"
+  if [ -z "${payload}" ] && [ -n "${fallback_file}" ] && [ -f "${fallback_file}" ]; then
+    payload="$(sanitize_status_payload "$(cat "${fallback_file}" 2>/dev/null)" "${active_dev}")"
+  fi
+  [ -n "${fallback_file}" ] && rm -f "${fallback_file}"
+
   # Terminate ONLY the runner's process tree (runner + scrub-rs spawned in
   # pipeline subshells). Deliberately NOT the process group: the runner was
   # started as `nohup ... &` from PHP/emhttp, so it shares a process group
@@ -424,33 +454,50 @@ stop() {
   # unrelated scrub-rs process.
   kill_tree "${pid}" TERM
   # Give it a moment, then escalate to KILL if still alive.
-  local waited=0
+  local waited=0 killed=1
   while [ "${waited}" -lt 5 ] && kill -0 "${pid}" 2>/dev/null; do
     sleep 0.5
     waited=$((waited + 1))
   done
   if kill -0 "${pid}" 2>/dev/null; then
     kill_tree "${pid}" KILL
+    sleep 0.2
+    if kill -0 "${pid}" 2>/dev/null; then
+      killed=0   # could not terminate — reported below, still record the block
+    fi
   fi
+
   # Record the cancellation in the run log (after the tree is dead, so this
   # block is the last thing in the file).  status.php parses it like any
   # other final block; the UI shows the aborted disk as cancelled with the
   # counters captured above.
-  local run_log; run_log="$(newest_run_log)"
   if [ -n "${run_log}" ]; then
     {
+      # Newline guard: if the killed process left the log ending mid-line,
+      # start the append on a fresh line so the `status:` marker stays a
+      # standalone line and the block parses.
+      tail -c 1 "${run_log}" 2>/dev/null | grep -q . && echo
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] manual stop requested"
       echo "status:"
       if [ -n "${payload}" ]; then
-        # Keep the exact last counters; only the state line changes.
-        echo "${payload}" | sed 's/^state=.*/state=cancelled/'
+        # Keep the exact last counters; only the state line changes.  The
+        # trailing blank line the payload carries is dropped so the block
+        # stays a clean key=value run.
+        echo "${payload}" | sed 's/^state=.*/state=cancelled/' | sed '/^$/d'
       else
-        local dev; dev="$(last_scrubbed_device "${run_log}")"
         echo "state=cancelled"
-        [ -n "${dev}" ] && echo "device=${dev}"
+        [ -n "${active_dev}" ] && echo "device=${active_dev}"
       fi
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] finished: CANCELLED (manual stop)"
     } >> "${run_log}"
+    # CHECK: the cancelled block must actually be in the log (e.g. a full
+    # flash drive would silently drop the append).
+    if ! tail -n 8 "${run_log}" | grep -q "^state=cancelled$"; then
+      echo "WARNING: could not record the cancellation in the run log."
+    fi
+  fi
+  if [ "${killed}" -ne 1 ]; then
+    echo "WARNING: scrub process (pid ${pid}) could not be terminated."
   fi
   # The run() EXIT trap clears the lock on its way out; remove it here too in
   # case the runner was killed without running the trap.
@@ -459,6 +506,24 @@ stop() {
   # scrub was interrupted rather than completed.
   notify_scrub_stopped ""
   echo "Scrub stopped."
+}
+
+# Validate a candidate status payload: it must carry state= and device=,
+# and (when the run log tells us which disk is active) describe that disk.
+# Echoes the payload unchanged if valid, nothing otherwise — so a busy port,
+# a dead server, a foreign server, or a stale snapshot can never record
+# garbage into the run log.
+sanitize_status_payload() {
+  local cand="$1" expect_dev="$2"
+  [ -n "${cand}" ] || return 0
+  local pdev pstate
+  pdev="$(echo "${cand}" | awk -F= '$1=="device"{print $2; exit}')"
+  pstate="$(echo "${cand}" | awk -F= '$1=="state"{print $2; exit}')"
+  if [ -z "${pdev}" ] || [ -z "${pstate}" ] \
+     || { [ -n "${expect_dev}" ] && [ "${pdev}" != "${expect_dev}" ]; }; then
+    return 0
+  fi
+  echo "${cand}"
 }
 
 # Newest per-run log (same listing the rotation uses; names are
@@ -500,6 +565,6 @@ case "${1:-running}" in
   running) running ;;
   devices) devices ;;
   status)  status ;;
-  stop)    stop ;;
+  stop)    stop "${2:-}" ;;
   *) echo "usage: $0 run|running|devices|status|stop" ;;
 esac

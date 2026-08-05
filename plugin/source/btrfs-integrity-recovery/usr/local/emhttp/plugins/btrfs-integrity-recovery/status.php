@@ -32,6 +32,18 @@ header("Cache-Control: no-store");
 
 $blocks = [];   // each element = array of key=value lines (one block)
 
+// Serialise one block into key=value lines.  Log-parsed blocks are
+// associative (key=>value) — implode() on those would join only the VALUES
+// and silently drop the keys, producing a payload the page cannot parse.
+// The live block is already a list of full key=value strings (int keys).
+function block_lines($b) {
+    $lines = [];
+    foreach ($b as $k => $v) {
+        $lines[] = is_int($k) ? $v : "$k=$v";
+    }
+    return $lines;
+}
+
 // 1. Final per-device blocks from the newest run log.  Parsed with a
 //    streaming fgets loop: only the in-progress block is held in memory, so
 //    a huge log (mass corruption -> millions of MISMATCH lines) costs no
@@ -103,7 +115,7 @@ if ($running && $active !== "") {
 // Blank-line-separated blocks; the meta block is always last.
 $out = [];
 foreach ($blocks as $b) {
-    $out[] = implode("\n", $b);
+    $out[] = implode("\n", block_lines($b));
 }
 $out[] = implode("\n", $meta);
 echo implode("\n\n", $out), "\n";

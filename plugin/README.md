@@ -182,7 +182,8 @@ never fatal.
 `status:` marker followed by the same `key=value` payload to stdout, so the
 run log (written by `scrub.sh` under `…/runs/run-*.log`) carries each device's
 exact end-of-run numbers. A manual stop records one extra `status:` block with
-`state=cancelled` and the last live counters (fetched just before the kill),
+`state=cancelled` and the last live counters (fetched just before the kill,
+falling back to the Settings page's last-received payload if the fetch fails),
 so an aborted disk keeps its numbers instead of dropping back to empty.
 `status.php` merges those final blocks with the live
 endpoint, which is how the table keeps finished disks populated even though
