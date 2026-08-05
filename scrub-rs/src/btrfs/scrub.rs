@@ -746,9 +746,7 @@ where
             let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
             let mut bad: Vec<usize> = Vec::new();
             {
-                let mut read = |phys: u64, len: usize| {
-                    reader.read_physical(dext.devid, phys, len)
-                };
+                let mut read = |phys: u64, len: usize| reader.read_physical(dext.devid, phys, len);
                 isolate_run(
                     &mut read,
                     run_phys,
@@ -969,17 +967,7 @@ fn process_rsp(
         bad,
     } = rsp;
     process_isolated(
-        good,
-        bad,
-        &dext,
-        &entries,
-        strategy,
-        batch,
-        counters,
-        reader,
-        chunk_map,
-        on_sector,
-        stats,
+        good, bad, &dext, &entries, strategy, batch, counters, reader, chunk_map, on_sector, stats,
     );
 }
 
@@ -1265,7 +1253,15 @@ mod tests {
         };
         let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut bad: Vec<usize> = Vec::new();
-        isolate_run(&mut |p, l| r.read(p, l), 0, 0, 8 * 4096, 4096, &mut good, &mut bad);
+        isolate_run(
+            &mut |p, l| r.read(p, l),
+            0,
+            0,
+            8 * 4096,
+            4096,
+            &mut good,
+            &mut bad,
+        );
 
         assert_eq!(bad, vec![3 * 4096], "only the faulted sector is bad");
 
@@ -1302,7 +1298,15 @@ mod tests {
         };
         let mut good = Vec::new();
         let mut bad = Vec::new();
-        isolate_run(&mut |p, l| r.read(p, l), 0, 0, 4 * 4096, 4096, &mut good, &mut bad);
+        isolate_run(
+            &mut |p, l| r.read(p, l),
+            0,
+            0,
+            4 * 4096,
+            4096,
+            &mut good,
+            &mut bad,
+        );
         assert!(good.is_empty(), "no good regions when everything faults");
         assert_eq!(bad, vec![0, 4096, 2 * 4096, 3 * 4096]);
     }
@@ -1325,7 +1329,15 @@ mod tests {
         };
         let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut bad: Vec<usize> = Vec::new();
-        isolate_run(&mut |p, l| r.read(p, l), 0, 0, 10 * 4096, 4096, &mut good, &mut bad);
+        isolate_run(
+            &mut |p, l| r.read(p, l),
+            0,
+            0,
+            10 * 4096,
+            4096,
+            &mut good,
+            &mut bad,
+        );
 
         assert_eq!(bad, vec![6 * 4096], "only the faulted sector is bad");
 
@@ -1369,7 +1381,15 @@ mod tests {
         };
         let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut bad: Vec<usize> = Vec::new();
-        isolate_run(&mut |p, l| r.read(p, l), 0, 0, 3 * 4096, 4096, &mut good, &mut bad);
+        isolate_run(
+            &mut |p, l| r.read(p, l),
+            0,
+            0,
+            3 * 4096,
+            4096,
+            &mut good,
+            &mut bad,
+        );
 
         assert_eq!(bad, vec![4096], "only the faulted sector is bad");
 

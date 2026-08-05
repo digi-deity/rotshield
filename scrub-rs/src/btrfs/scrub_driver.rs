@@ -24,8 +24,8 @@
 
 use std::io;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::btrfs::chunk::ChunkMap;
 use crate::btrfs::csum::LazyCsumProvider;
@@ -237,7 +237,6 @@ impl BtrfsScrub {
         );
         self.status = Some(counters);
     }
-
 }
 
 impl fs::FilesystemScrub for BtrfsScrub {

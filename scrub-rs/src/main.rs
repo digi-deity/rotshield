@@ -676,10 +676,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         ExitCode::from(EXIT_METADATA_FATAL)
     } else if !issues_found {
         ExitCode::SUCCESS
-    } else if had_writer
-        && stats.metadata_read_errors == 0
-        && batch_stats.failed == 0
-    {
+    } else if had_writer && stats.metadata_read_errors == 0 && batch_stats.failed == 0 {
         // Corruption found, but every confirmed block was rebuilt
         // successfully (or would-be-written in dry-run).  The expected good
         // outcome — the data is (or would be) intact.  Mode-independent:

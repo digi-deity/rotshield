@@ -699,7 +699,9 @@ mod tests {
                 let bytes = if slot == 2 {
                     vec![0u8; block_size]
                 } else {
-                    (0..block_size).map(|i| (slot as u8) * 7 + (i % 251) as u8).collect()
+                    (0..block_size)
+                        .map(|i| (slot as u8) * 7 + (i % 251) as u8)
+                        .collect()
                 };
                 (slot, bytes)
             })
@@ -741,7 +743,9 @@ mod tests {
         let n = 3u8;
         let mut data: Vec<(u64, Vec<u8>)> = (1..=n as u64)
             .map(|slot| {
-                let bytes = (0..block_size).map(|i| (slot as u8) * 3 + (i % 199) as u8).collect();
+                let bytes = (0..block_size)
+                    .map(|i| (slot as u8) * 3 + (i % 199) as u8)
+                    .collect();
                 (slot, bytes)
             })
             .collect();

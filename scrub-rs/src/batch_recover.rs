@@ -58,9 +58,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::array::config::ArrayConfig;

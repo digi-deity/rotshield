@@ -179,8 +179,7 @@ impl StatusCounters {
         let pct = if total == 0 {
             100.0
         } else {
-            let milli =
-                u128::from(done).saturating_mul(100_000) / u128::from(total);
+            let milli = u128::from(done).saturating_mul(100_000) / u128::from(total);
             (milli.min(100_000) as f64) / 1000.0
         };
         format!(
@@ -293,12 +292,8 @@ mod tests {
         counters.bytes_checked.store(4096, Ordering::Relaxed);
         counters.recovered.store(1, Ordering::Relaxed);
         counters.recovery.store(1, Ordering::Relaxed);
-        counters
-            .progress_total
-            .store(1073741824, Ordering::Relaxed);
-        counters
-            .progress_done
-            .store(268435456, Ordering::Relaxed);
+        counters.progress_total.store(1073741824, Ordering::Relaxed);
+        counters.progress_done.store(268435456, Ordering::Relaxed);
 
         // Bind with port 0 -> the OS assigns an ephemeral port; query it so
         // the test connects to the right socket.
@@ -307,8 +302,7 @@ mod tests {
         let handle = thread::spawn(move || server.serve());
 
         // 1. GET /status -> 200 with the payload.
-        let mut stream =
-            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
             .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("write");
@@ -342,8 +336,7 @@ mod tests {
         }
 
         // 2. Any other path -> 404.
-        let mut stream =
-            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
             .write_all(b"GET /nope HTTP/1.1\r\n\r\n")
             .expect("write");
