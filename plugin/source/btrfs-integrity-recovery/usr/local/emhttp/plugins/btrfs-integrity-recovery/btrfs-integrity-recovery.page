@@ -45,6 +45,11 @@ $config = parse_ini_file($config_file);
 // captures the full multi-line output, which we then split into an array.
 $devices_raw = shell_exec("$plugin_dir/scripts/scrub.sh devices 2>/dev/null") ?: '';
 $devices = array_filter(array_map('trim', explode("\n", trim($devices_raw))));
+// Present (and therefore save) disks in alphabetical order — natural sort,
+// so /dev/loop2 comes before /dev/loop10.  The config is the single source
+// of truth for the scrub order (scrub.sh runs DEVICES verbatim), so the
+// saved DEVICES list is deliberately stored alphabetically here.
+usort($devices, 'strnatcmp');
 if (empty($devices)) {
     $devices = ['/dev/nmd1p1'];   // fallback if the array isn't up yet
 }
@@ -52,10 +57,14 @@ if (empty($devices)) {
 $message = "";
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // devices[] is a multi-select; keep only entries that are real array
-    // data-disk partitions, in the order presented.
+    // data-disk partitions, then store them ALPHABETICALLY — the config is
+    // the single source of truth for the scrub order (scrub.sh runs DEVICES
+    // verbatim), so the saved order is deliberately normalized here.  A
+    // hand-edited config.cfg order is honored by the run as-is.
     $sel = $_POST['devices'] ?? [];
     $sel = is_array($sel) ? $sel : [$sel];
     $sel = array_values(array_filter(array_map('trim', $sel), fn($d) => in_array($d, $devices, true)));
+    usort($sel, 'strnatcmp');
     if (empty($sel)) { $sel = [$devices[0]]; }
     $devices_csv = implode(' ', $sel);
     // A scrub can take days, so "daily" is intentionally NOT offered — it
@@ -233,7 +242,7 @@ pre { max-width: 100%; overflow-x: auto; }
       document.getElementById('cron-row').style.display = (this.value === 'custom') ? '' : 'none';
   });
   </script>
-    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, each with its own log. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/nmd1p1 or /dev/sdX). Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job.</span></span></td>
+    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, in alphabetical order. The whole run is written to a single per-run log (…/runs/run-&lt;ts&gt;.log) with each disk's section and final status block; the progress table below shows per-disk results. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/nmd1p1 or /dev/sdX). Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job.</span></span></td>
         <td><div class="devices-list">
             <?php
             $selected = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '/dev/nmd1p1'));
@@ -273,7 +282,9 @@ pre { max-width: 100%; overflow-x: auto; }
 <?php
 // Configured scrub targets: these appear as table columns up front (pending)
 // and fill in as the sequential run reaches each disk.  Any device that
-// shows up in a status block is added as a column dynamically.
+// shows up in a status block is added as a column dynamically.  Column
+// order follows the config order (scrub.sh scrubs DEVICES verbatim), so
+// the table always matches the execution order.
 $configured_devices = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '/dev/nmd1p1'));
 ?>
 <div id="progress-wrap" style="margin-top:8px">

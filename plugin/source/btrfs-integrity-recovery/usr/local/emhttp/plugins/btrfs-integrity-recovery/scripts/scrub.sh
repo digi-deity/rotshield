@@ -3,9 +3,12 @@
 #
 #   scrub.sh run      run scrub-rs against the configured device(s). Multiple
 #                     disks (DEVICES, space-separated) are scrubbed SEQUENTIALLY
-#                     — one after another. The full output is appended to
-#                     /var/log/$PLUGIN.log and mirrored to a per-run file
-#                     ($CONFIG_DIR/runs/run-<ts>.log; rotation keeps KEEP_RUNS).
+#                     — one after another, in the order listed in DEVICES (the
+#                     Settings page stores them alphabetically). The full output
+#                     is appended to /var/log/$PLUGIN.log and mirrored to a
+#                     per-run file ($CONFIG_DIR/runs/run-<ts>.log; rotation keeps
+#                     KEEP_RUNS). Each device's section ends with its `status:`
+#                     block (exact final counters), which status.php reads back.
 #                     A run lock serialises manual and scheduled runs — if one
 #                     is already active, the second invocation skips.
 #   scrub.sh running  print 1 if a scrub is currently running, else 0.
@@ -259,6 +262,9 @@ run() {
 
   # Resolve the device list: DEVICES (space-separated, multiple disks) takes
   # precedence; fall back to the single DEVICE key for backwards compat.
+  # The order here IS the scrub order — config is the single source of truth
+  # (the Settings page stores DEVICES alphabetically, but a hand-edited
+  # config is honored verbatim).
   local devlist="${DEVICES:-${DEVICE:-/dev/nmd1p1}}"
   local total; total=$(echo ${devlist} | wc -w)
   local opts; opts="$(build_args)"
