@@ -100,7 +100,7 @@ into `scrub-rs` arguments (see `scrub-rs/src/main.rs` for the full flag list):
 
 | Key | Meaning | scrub-rs flag |
 |-----|---------|---------------|
-| `DEVICES` | space-separated list of **raw array data-disk rdevs** to scrub **sequentially** (e.g. `/dev/sdX`, `/dev/nvmeXnY`, `/dev/loopX` — whatever `/proc/nmdstat` reports in `rdevName.N` for the data slots; parity slots 0 and 29 are excluded). Scrub order = the listed order (config is the single source of truth); the Settings page stores them alphabetically | `<device>` (one per run) |
+| `DEVICES` | space-separated list of **raw array data-disk rdevs** to scrub **sequentially** (e.g. `/dev/sdX`, `/dev/nvmeXnY`, `/dev/loopX` — whatever `/proc/nmdstat` reports in `rdevName.N` for the data slots; parity slots 0 and 29 are excluded). Scrub order = the listed order (config is the single source of truth); the Settings page stores them alphabetically. **No target is preselected on a fresh install** (empty list = the table stays empty and scrubbing is skipped until you pick a disk) | `<device>` (one per run) |
 | `DEVICE` | first entry of `DEVICES` (kept for backwards compatibility) | `<device>` |
 | `WRITE` | `1` writes reconstructed blocks back (`--repair`); `0` (default) dry-run assessment only | `--repair` |
 | `NO_FREEZE` | `1` disables freeze (unsafe with repair) | `--no-freeze` |

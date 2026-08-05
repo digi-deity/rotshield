@@ -268,8 +268,15 @@ run() {
   # precedence; fall back to the single DEVICE key for backwards compat.
   # The order here IS the scrub order — config is the single source of truth
   # (the Settings page stores DEVICES alphabetically, but a hand-edited
-  # config is honored verbatim).
-  local devlist="${DEVICES:-${DEVICE:-/dev/nmd1p1}}"
+  # config is honored verbatim).  An empty (deliberately saved) target list
+  # means "don't scrub": never invent a target.  (The old /dev/nmd1p1
+  # last-resort pointed at a device that is not a discoverable option on
+  # every system.)
+  local devlist="${DEVICES:-${DEVICE:-}}"
+  if [ -z "${devlist}" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] no disks targeted (empty DEVICES) — nothing to scrub" >> "${LOG}"
+    return 1
+  fi
   local total; total=$(echo ${devlist} | wc -w)
   local opts; opts="$(build_args)"
   local start_ts; start_ts="$(date '+%Y-%m-%d %H:%M:%S')"

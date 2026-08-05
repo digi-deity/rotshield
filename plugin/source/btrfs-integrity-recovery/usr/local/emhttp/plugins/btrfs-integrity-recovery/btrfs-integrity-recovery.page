@@ -32,13 +32,11 @@ function cron_expr_valid($expr) {
     return true;
 }
 
-if (!is_file($config_file)) {
-    @mkdir($config_dir, 0777, true);
-    file_put_contents($config_file, "DEVICES='/dev/nmd1p1'\nDEVICE='/dev/nmd1p1'\nSCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nNO_FREEZE=0\nBATCH_MAX=\nBATCH_IDLE=\nSTATUS_PORT=9101\nEXTRA_OPTIONS=\n");
-}
-$config = parse_ini_file($config_file);
-
-// Discover the array's btrfs data-disk partitions from /proc/nmdstat|mdstat.
+// Discover the array's btrfs data-disk partitions from /proc/nmdstat|mdstat
+// BEFORE the first-use config is created: the default config must not
+// hardcode a target.  /dev/nmd1p1 (the array partition) is NOT one of the
+// discoverable options, so a hardcoded default made a phantom disk appear
+// in the progress table on systems where that device doesn't exist.
 // NOTE: use shell_exec(), NOT exec(). PHP's exec() returns only the LAST
 // line of output, so with multiple data disks exec() would silently drop
 // every disk except the final one (e.g. only /dev/sdc shows up). shell_exec()
@@ -50,9 +48,19 @@ $devices = array_filter(array_map('trim', explode("\n", trim($devices_raw))));
 // of truth for the scrub order (scrub.sh runs DEVICES verbatim), so the
 // saved DEVICES list is deliberately stored alphabetically here.
 usort($devices, 'strnatcmp');
-if (empty($devices)) {
-    $devices = ['/dev/nmd1p1'];   // fallback if the array isn't up yet
+
+// First use (no config yet): create an EMPTY default config — no target is
+// preselected.  The user picks disks; until then the progress table stays
+// empty (headers only) and scrubbing is skipped (the POST handler and
+// scrub.sh run() both refuse to invent a target).
+if (!is_file($config_file)) {
+    @mkdir($config_dir, 0777, true);
+    file_put_contents($config_file,
+        "DEVICES=''\n" .
+        "DEVICE=''\n" .
+        "SCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nNO_FREEZE=0\nBATCH_MAX=\nBATCH_IDLE=\nSTATUS_PORT=9101\nEXTRA_OPTIONS=\n");
 }
+$config = parse_ini_file($config_file);
 
 $message = "";
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -61,11 +69,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // the single source of truth for the scrub order (scrub.sh runs DEVICES
     // verbatim), so the saved order is deliberately normalized here.  A
     // hand-edited config.cfg order is honored by the run as-is.
+    // An EMPTY selection is saved as-is and never silently replaced with
+    // the first disk: with no disks targeted, scrubbing is skipped until
+    // the user picks at least one (see the Target disk(s) help).
     $sel = $_POST['devices'] ?? [];
     $sel = is_array($sel) ? $sel : [$sel];
-    $sel = array_values(array_filter(array_map('trim', $sel), fn($d) => in_array($d, $devices, true)));
+    $sel = array_values(array_filter(array_map('trim', $sel), fn($d) => $d !== '' && in_array($d, $devices, true)));
     usort($sel, 'strnatcmp');
-    if (empty($sel)) { $sel = [$devices[0]]; }
     $devices_csv = implode(' ', $sel);
     // A scrub can take days, so "daily" is intentionally NOT offered — it
     // would overlap its own previous run. Allowed presets: weekly, monthly,
@@ -102,7 +112,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // scrub.sh / rc.<plugin> source it, silently dropping the setting.
     file_put_contents($config_file,
         "DEVICES='$devices_csv'\n" .
-        "DEVICE='{$sel[0]}'\n" .
+        "DEVICE='" . ($sel[0] ?? '') . "'\n" .
         "SCHEDULE='$schedule'\n" .
         "CRON='$cron'\n" .
         "RECOVER=$recover\n" .
@@ -114,8 +124,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         "EXTRA_OPTIONS=$extra\n");
     exec("/etc/rc.d/rc.$plugin restart 2>&1");
     if (isset($_POST['run'])) {
-        exec("nohup $plugin_dir/scripts/scrub.sh run >/dev/null 2>&1 &");
-        $message = "Scrub started in the background.";
+        if ($devices_csv === '') {
+            // Honest no-op: the empty selection was saved as-is above and
+            // must never silently scrub something else.
+            $message = "No disks targeted — nothing to scrub. Select at least one disk, then run again.";
+        } else {
+            exec("nohup $plugin_dir/scripts/scrub.sh run >/dev/null 2>&1 &");
+            $message = "Scrub started in the background.";
+        }
     } elseif (isset($_POST['stop'])) {
         exec("$plugin_dir/scripts/scrub.sh stop 2>&1");
         $message = "Scrub stop requested.";
@@ -265,10 +281,13 @@ pre { max-width: 100%; overflow-x: auto; }
       document.getElementById('cron-row').style.display = (this.value === 'custom') ? '' : 'none';
   });
   </script>
-    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, in alphabetical order. The whole run is written to a single per-run log (…/runs/run-&lt;ts&gt;.log) with each disk's section and final status block; the progress table below shows per-disk results. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/nmd1p1 or /dev/sdX). Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job.</span></span></td>
+    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, in the order listed; the whole run is written to a single per-run log (…/runs/run-&lt;ts&gt;.log) with each disk's section and final status block, and the progress table below shows per-disk results. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/sdX). An empty selection is saved as-is: the table stays empty (headers only) and scrubbing is skipped until at least one disk is selected. Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job.</span></span></td>
         <td><div class="devices-list">
             <?php
-            $selected = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '/dev/nmd1p1'));
+            $selected = array_values(array_filter(
+                explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '')),
+                'strlen'   // a deliberately-saved empty DEVICES renders as nothing targeted, not an empty-string disk
+            ));
             foreach ($devices as $d): ?>
             <label style="display:block"><input type="checkbox" name="devices[]" value="<?=htmlspecialchars($d)?>" <?=in_array($d, $selected, true) ? 'checked' : ''?>><?=htmlspecialchars($d)?></label>
             <?php endforeach; ?>
@@ -307,8 +326,12 @@ pre { max-width: 100%; overflow-x: auto; }
 // and fill in as the sequential run reaches each disk.  Any device that
 // shows up in a status block is added as a column dynamically.  Column
 // order follows the config order (scrub.sh scrubs DEVICES verbatim), so
-// the table always matches the execution order.
-$configured_devices = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '/dev/nmd1p1'));
+// the table always matches the execution order.  Empty entries are
+// filtered: an empty (deliberately saved) DEVICES list means no columns.
+$configured_devices = array_values(array_filter(
+    explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '')),
+    'strlen'
+));
 ?>
 <div id="progress-wrap">
   <table id="progress-table"></table>
@@ -463,7 +486,11 @@ $configured_devices = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '
       html += '<th style="text-align:left"><span class="devname" title="' + esc(devs[i]) + '">' +
               esc(name) + '</span>' + chip + '</th>';
     }
-    html += '</tr></thead><tbody>';
+    html += '</tr></thead>';
+    // No disks targeted -> headers only: no columns, no stat rows.  The
+    // body (groups + rows) appears once at least one disk is targeted.
+    if (devs.length > 0) {
+      html += '<tbody>';
     for (var g = 0; g < GROUPS.length; g++) {
       var grp = GROUPS[g];
       html += '<tr class="grp"><td colspan="' + span + '" title="' + esc(grp.tip) + '">' +
@@ -482,7 +509,8 @@ $configured_devices = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '
         html += '</tr>';
       }
     }
-    html += '</tbody>';
+      html += '</tbody>';
+    }
     document.getElementById('progress-table').innerHTML = html;
   }
 

@@ -25,9 +25,12 @@ mkdir -p "${CONFIG_DIR}"
 if [ ! -f "${CONFIG_FILE}" ]; then
   # Defaults written single-quoted for string values so the file parses as
   # BOTH PHP INI and a bash `source`d file (see the Settings page for why).
+  # No target is preselected: /dev/nmd1p1 (the array partition) is not a
+  # discoverable option, and the Settings page + run() both refuse to
+  # invent a target — the user picks disks on first visit.
   cat > "${CONFIG_FILE}" <<'EOF'
-DEVICES='/dev/nmd1p1'
-DEVICE='/dev/nmd1p1'
+DEVICES=''
+DEVICE=''
 SCHEDULE='disabled'
 CRON=''
 RECOVER=1
