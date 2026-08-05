@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.08.05">
-<!ENTITY bundleversion "2026.08.05">
+<!ENTITY version       "2026.08.05a">
+<!ENTITY bundleversion "2026.08.05a">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,24 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.05a
+- Target disks are now stored and listed in alphabetical order (natural
+  sort, so /dev/loop2 comes before /dev/loop10). The config stays the
+  single source of truth for the scrub order: the run and the progress
+  table follow DEVICES verbatim, so a hand-edited config order is honored.
+- Manual stop now keeps the aborted disk's results: scrub.sh fetches one
+  snapshot of the live counters right before killing the run and records a
+  `status:` block with state=cancelled (plus a "finished: CANCELLED"
+  marker) in the run log. The table shows the aborted disk as cancelled
+  with its last known numbers, sticky across page reloads; completed disks
+  of the aborted run keep their done state.
+- The progress table no longer stretches: fixed column widths (220px
+  statistic column, 170px per disk), long disk names ellipsize with a
+  tooltip, and the wrapper scrolls horizontally when many disks exceed the
+  page width.
+- Idle disks with no data no longer show a "pending" chip — pending only
+  appears while a run is active.
 
 ###2026.08.05
 - The Settings page now shows a per-disk **progress table** instead of raw
