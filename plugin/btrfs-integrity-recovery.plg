@@ -3,17 +3,35 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.08.05a">
-<!ENTITY bundleversion "2026.08.05a">
+<!ENTITY version       "2026.08.05b">
+<!ENTITY bundleversion "2026.08.05b">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
-<!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
+<!ENTITY bundlefile    "btrfs-integrity-recovery-&version;-x86_64-1.txz">
+<!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/download/v&version;/&bundlefile;">
 ]>
 
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;">
 
 <CHANGES>
 ##&name;
+
+###2026.08.05b
+- Plugin updates now actually replace the shipped files. The bundle
+  filename and download URL are derived from the plugin version
+  (btrfs-integrity-recovery-&lt;version&gt;-x86_64-1.txz, fetched from the
+  release tagged v&lt;version&gt;), so every release downloads a fresh bundle.
+  unRAID's plugin manager never re-downloads a file that already exists
+  on the flash drive ("skipping: ... already exists"), which is why the
+  previous fixed-name bundle — even with upgradepkg --reinstall — left
+  the old php pages and binaries in place after an update. The versioned
+  package is installed with plain upgradepkg --install-new, which
+  replaces the previous package and drops files that no longer ship.
+- Stale bundles are pruned from the flash drive on install/update, so
+  repeated updates don't accumulate .txz files under
+  /boot/config/plugins/btrfs-integrity-recovery/install/.
+- Releases must be tagged v&lt;version&gt; matching the .plg version; the
+  build workflow verifies this and fails the release otherwise.
 
 ###2026.08.05a
 - Target disks are now stored and listed in alphabetical order (natural
@@ -113,33 +131,43 @@ Install the bundle. It already contains the prebuilt binaries
 (scrub-rs, craft-corrupt) plus all plugin files, so there is NO
 binary download at install time (we build and ship it ourselves).
 
-Both flags are required:
-- install-new installs the package on first install (no installed copy).
-- reinstall is REQUIRED because pkg_build.sh keeps the bundle filename
-  FIXED (btrfs-integrity-recovery-x86_64-1.txz so the
-  releases/latest/download URL stays stable). With a fixed name,
-  upgradepkg compares package NAMES, not versions, so on an update it
-  sees "already installed" and skips re-extracting the bundle, leaving
-  the old binaries on disk. reinstall forces it to re-extract every
-  time, which is what makes version bumps actually take effect.
+The bundle filename is VERSIONED (btrfs-integrity-recovery-<version>-
+x86_64-1.txz) on purpose. unRAID's plugin manager does not re-download
+a FILE whose target already exists on the flash drive ("skipping: ...
+already exists"), so a fixed bundle name meant updates only replaced
+the .plg, never the files inside the bundle. With the version in the
+filename, every release downloads a fresh file and upgradepkg installs
+it as a new package, replacing the previous one (files that no longer
+ship are removed together with the old package).
+
+The URL is pinned to the release tagged v<version> (GitHub's
+releases/download/<tag>/<asset> convention), NOT releases/latest: a
+"latest" URL would resolve to whatever release is newest, which may
+not match this .plg's version.
+
+Plain install-new is correct here (no reinstall flag): the versioned
+package name is what makes upgradepkg perform the upgrade; reinstall
+would only re-extract an already-installed package on every boot.
 -->
-<FILE Name="/boot/config/plugins/btrfs-integrity-recovery/install/btrfs-integrity-recovery-x86_64-1.txz" Run="upgradepkg --install-new --reinstall">
+<FILE Name="/boot/config/plugins/btrfs-integrity-recovery/install/&bundlefile;" Run="upgradepkg --install-new">
 <URL>&bundleURL;</URL>
 </FILE>
 
-<!-- Run install logic (binaries are already in place from the bundle). -->
+<!-- Run install logic (binaries are already in place from the bundle).
+     $1 = current plugin version (from &version;), used by install.sh to
+     prune stale bundles from the flash drive. -->
 <FILE Run="/bin/bash" Method="install">
-<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh</INLINE>
+<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh &version;</INLINE>
 </FILE>
 
-<!-- Re-run the same logic on upgrade: the bundle is re-extracted by the
-     FILE element above (upgradepkg with both install-new and reinstall;
-     reinstall is what actually forces the fixed-name bundle to be
-     re-extracted), and this Method="upgrade" hook re-runs the
-     post-install steps (perms, default config, rc restart) so they are
-     not skipped on version bumps. -->
+<!-- Re-run the same logic on upgrade. NOTE: unRAID's stock plugin script
+     never invokes the "upgrade" method, an update runs the "install"
+     method elements of the new .plg (so the bundle FILE element above
+     and this install hook both run on update), so this hook is a no-op
+     safety net for plugin scripts/forks that do call it; install.sh is
+     idempotent. -->
 <FILE Run="/bin/bash" Method="upgrade">
-<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh</INLINE>
+<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh &version;</INLINE>
 </FILE>
 
 <!-- Uninstall logic. -->

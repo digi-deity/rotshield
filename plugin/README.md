@@ -66,7 +66,8 @@ chmod 755 "$BIN"/scrub-rs "$BIN"/craft-corrupt
 # 3. Package the bundle
 cd plugin/source/btrfs-integrity-recovery
 bash pkg_build.sh
-# -> ../../../archive/btrfs-integrity-recovery-x86_64-1.txz
+# -> ../../../archive/btrfs-integrity-recovery-<version>-x86_64-1.txz
+#    (<version> is read from the .plg's <!ENTITY version>)
 ```
 
 ## Test
@@ -83,8 +84,9 @@ bash pkg_build.sh
 
 ## Install on unRAID
 
-1. Grab `btrfs-integrity-recovery-x86_64-1.txz` from the latest GitHub Release
-   (or build it locally per above).
+1. Grab `btrfs-integrity-recovery-<version>-x86_64-1.txz` (the version
+   matching your `.plg`) from the matching GitHub Release (or build it
+   locally per above).
 2. Install the plugin via the unRAID webUI (Plugins → Install Plugin, paste the
    raw `.plg` URL), or drop the `.plg` on the flash drive and install it.
 3. Open **Settings → btrfs-integrity-recovery**, select the target raw data
@@ -191,8 +193,18 @@ recovery ran; 0 = plain scrub, the table shows n/a).
 
 ## Releasing
 
-Push a tag `vX.Y.Z`. The `build-plugin.yml` workflow builds, packages, and
-attaches `btrfs-integrity-recovery-x86_64-1.txz` to a GitHub Release with
-auto-generated release notes. The `.plg`'s `bundleURL` points at
-`…/releases/latest/download/…`, so no manifest edit is needed between releases
-(only bump `version`/`bundleversion` for the changelog display).
+Bump `version` / `bundleversion` in `btrfs-integrity-recovery.plg` (and add a
+CHANGES entry), then push a tag `v<version>` (e.g. `v2026.08.05b`). The
+`build-plugin.yml` workflow builds, packages and attaches
+`btrfs-integrity-recovery-<version>-x86_64-1.txz` to that release with
+auto-generated release notes — and verifies the tag matches the `.plg`
+version, so the `.plg`'s `bundleURL` (`…/releases/download/v<version>/…`)
+always resolves.
+
+The bundle filename is versioned on purpose: unRAID's plugin manager skips
+re-downloading a bundle file that already exists on the flash drive
+("skipping: … already exists"), so a fixed name would silently leave the old
+php pages and binaries in place after an update. The versioned package is
+installed with plain `upgradepkg --install-new`, which replaces the previous
+package (dropping files that no longer ship) — and `install.sh` prunes stale
+bundles from the flash drive so they don't accumulate.

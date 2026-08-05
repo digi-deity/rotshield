@@ -63,29 +63,47 @@ jobs:
 
       - name: Compute md5 and inject into .plg
         run: |
-          TXZ="plugin/archive/btrfs-integrity-recovery-x86_64-1.txz"
+          VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*\([^"]*\)".*/\1/p' plugin/btrfs-integrity-recovery.plg | head -1)
+          TXZ="plugin/archive/btrfs-integrity-recovery-${VERSION}-x86_64-1.txz"
           MD5=$(md5sum "$TXZ" | awk '{print $1}')
+          echo "bundle: $TXZ"
           echo "bundle md5: $MD5"
-          # The .plg uses a releases/latest/download URL, so no md5 entity is
-          # required; if you switch to a committed archive, set md5bundle here:
-          # sed -i "s/<!ENTITY md5bundle.*>/<!ENTITY md5bundle \"$MD5\">/" plugin/btrfs-integrity-recovery.plg
+          # No md5 is pinned in the .plg on purpose: the plg is served from
+          # the main branch, but the bundle is only built when the release
+          # tag is pushed, so its checksum is unknowable at commit time. (A
+          # stale md5 in the committed plg would reject every download and
+          # break updates.) Integrity is HTTPS + upgradepkg failing loudly
+          # on a corrupt archive.
           echo "MD5=$MD5" >> "$GITHUB_ENV"
+
+      - name: Verify release tag matches plugin version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*\([^"]*\)".*/\1/p' plugin/btrfs-integrity-recovery.plg | head -1)
+          echo "plugin version: $VERSION"
+          echo "release tag:    ${GITHUB_REF_NAME}"
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::release tag ${GITHUB_REF_NAME} does not match the .plg version (v${VERSION}); the .plg's bundleURL would 404"
+            exit 1
+          fi
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: btrfs-integrity-recovery-bundle
-          path: plugin/archive/btrfs-integrity-recovery-x86_64-1.txz
+          path: plugin/archive/*.txz
           if-no-files-found: error
 
       - name: Publish to GitHub Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: plugin/archive/btrfs-integrity-recovery-x86_64-1.txz
+          files: plugin/archive/*.txz
           # Auto-generate release notes from the conventional commits since
-          # the last release; the bundle filename is stable so the .plg's
-          # bundleURL (releases/latest/download/...) keeps resolving.
+          # the last release. The asset is named after the .plg version
+          # (pkg_build.sh derives it from the plg) and the verification step
+          # above ensures the tag matches, so the .plg's bundleURL
+          # (.../releases/download/v<version>/<versioned asset>) resolves.
           generate_release_notes: true
           fail_on_unmatched_files: true
         env:

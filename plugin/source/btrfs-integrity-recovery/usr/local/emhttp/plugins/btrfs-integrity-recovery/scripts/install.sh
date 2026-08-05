@@ -13,6 +13,9 @@ PLUGIN_DIR="/usr/local/emhttp/plugins/${PLUGIN}"
 CONFIG_DIR="/boot/config/plugins/${PLUGIN}"
 CONFIG_FILE="${CONFIG_DIR}/config.cfg"
 RC="/etc/rc.d/rc.${PLUGIN}"
+# $1 = current plugin version, passed by the .plg (install.sh &version;),
+# used to prune stale bundles from the flash drive below.
+VERSION="${1:-}"
 
 # Make the shipped binaries and rc script executable / owned by root.
 chown root:root "${PLUGIN_DIR}/bin/scrub-rs" "${PLUGIN_DIR}/bin/craft-corrupt" 2>/dev/null
@@ -43,6 +46,23 @@ EXTRA_OPTIONS=
 EOF
   chmod 644 "${CONFIG_FILE}"
 fi
+
+# Prune stale bundles: the bundle filename is versioned, so keep only the
+# bundle matching the installed version and drop older ones (they would
+# otherwise accumulate on the flash drive across updates). Only act when
+# $1 looks like a real version (guards against a missing/unexpanded
+# argument — then we simply leave the bundles alone).
+case "${VERSION}" in
+  ''|*[!0-9A-Za-z._-]*)
+    ;;
+  *)
+    mkdir -p "${CONFIG_DIR}/install"
+    find "${CONFIG_DIR}/install" -maxdepth 1 -type f \
+      -name "${PLUGIN}-*.txz" \
+      ! -name "${PLUGIN}-${VERSION}-x86_64-1.txz" \
+      -delete 2>/dev/null
+    ;;
+esac
 
 # Apply schedule / hooks.
 "${RC}" restart
