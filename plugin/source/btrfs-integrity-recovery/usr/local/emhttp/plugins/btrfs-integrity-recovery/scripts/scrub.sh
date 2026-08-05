@@ -14,6 +14,10 @@
 #   scrub.sh running  print 1 if a scrub is currently running, else 0.
 #   scrub.sh devices  print the array's data-disk raw rdevs.
 #   scrub.sh stop     terminate a running scrub (kills the runner + scrub-rs).
+#                     Before killing, one snapshot of the live counters is
+#                     fetched and recorded in the run log as a `status:`
+#                     block with state=cancelled, so the UI keeps the aborted
+#                     disk's last known numbers.
 #
 # Both the "Run Scrub Now" button and the scheduled cron job call `run`, so
 # manual and scheduled runs are logged identically and show up the same way
@@ -397,6 +401,13 @@ stop() {
     echo "No scrub is currently running (stale lock removed)."
     return 0
   fi
+  # ONE snapshot before the kill: fetch the live counters while the status
+  # server is still up, then record them as a cancelled status block in the
+  # run log.  This is the only write a stop produces (no per-change state
+  # writes anywhere) — it keeps the aborted disk's last known numbers sticky
+  # in the UI, even after a page reload.  Best-effort: with STATUS_PORT=0 or
+  # a dead server we record a state-only block.
+  local payload; payload="$(status)"
   # Terminate ONLY the runner's process tree (runner + scrub-rs spawned in
   # pipeline subshells). Deliberately NOT the process group: the runner was
   # started as `nohup ... &` from PHP/emhttp, so it shares a process group
@@ -414,6 +425,26 @@ stop() {
   if kill -0 "${pid}" 2>/dev/null; then
     kill_tree "${pid}" KILL
   fi
+  # Record the cancellation in the run log (after the tree is dead, so this
+  # block is the last thing in the file).  status.php parses it like any
+  # other final block; the UI shows the aborted disk as cancelled with the
+  # counters captured above.
+  local run_log; run_log="$(newest_run_log)"
+  if [ -n "${run_log}" ]; then
+    {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] manual stop requested"
+      echo "status:"
+      if [ -n "${payload}" ]; then
+        # Keep the exact last counters; only the state line changes.
+        echo "${payload}" | sed 's/^state=.*/state=cancelled/'
+      else
+        local dev; dev="$(last_scrubbed_device "${run_log}")"
+        echo "state=cancelled"
+        [ -n "${dev}" ] && echo "device=${dev}"
+      fi
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] finished: CANCELLED (manual stop)"
+    } >> "${run_log}"
+  fi
   # The run() EXIT trap clears the lock on its way out; remove it here too in
   # case the runner was killed without running the trap.
   rm -rf "${LOCK_DIR}"
@@ -421,6 +452,19 @@ stop() {
   # scrub was interrupted rather than completed.
   notify_scrub_stopped ""
   echo "Scrub stopped."
+}
+
+# Newest per-run log (same listing the rotation uses; names are
+# tool-generated run-YYYYMMDD-HHMMSS.log, whitespace-free).
+newest_run_log() {
+  ls -1t "${RUNS_DIR}"/run-*.log 2>/dev/null | head -1
+}
+
+# Device of the run's most recently started scrub (last "scrubbing <dev>"
+# line in the log) — the disk that was in flight when a stop killed the run.
+last_scrubbed_device() {
+  local log="$1"
+  awk '/scrubbing[[:space:]]+/{dev=$NF} END{print dev}' "${log}" 2>/dev/null
 }
 
 # Send a signal to a process and every descendant (recursively), so a stop

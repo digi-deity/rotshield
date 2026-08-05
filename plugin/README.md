@@ -179,7 +179,10 @@ never fatal.
 **Final counters survive the process**: every scrub-rs run ends by printing a
 `status:` marker followed by the same `key=value` payload to stdout, so the
 run log (written by `scrub.sh` under `…/runs/run-*.log`) carries each device's
-exact end-of-run numbers. `status.php` merges those final blocks with the live
+exact end-of-run numbers. A manual stop records one extra `status:` block with
+`state=cancelled` and the last live counters (fetched just before the kill),
+so an aborted disk keeps its numbers instead of dropping back to empty.
+`status.php` merges those final blocks with the live
 endpoint, which is how the table keeps finished disks populated even though
 the status server dies with each device's process — and it works even with
 `STATUS_PORT=0`. The payload's `recovery=1|0` tells the table whether the
