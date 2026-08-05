@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.08.05b">
-<!ENTITY bundleversion "2026.08.05b">
+<!ENTITY version       "2026.08.05c">
+<!ENTITY bundleversion "2026.08.05c">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundlefile    "btrfs-integrity-recovery-&version;-x86_64-1.txz">
@@ -15,6 +15,23 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.05c
+- Fixed: final per-disk status blocks were served without their key names
+  (state=/device=/counter=), so the progress table went empty as soon as a
+  run ended — after a manual stop AND after natural completion. The table
+  now keeps every disk's exact final counters for all outcomes (clean,
+  issues found, metadata fatal, runtime error, cancelled).
+- Stop is now robust: it records a cancelled block with the last live
+  counters fetched just before the kill, falling back to the Settings
+  page's last-received payload when the fetch fails (works with
+  STATUS_PORT=0). A stop that arrives after the run already finished is a
+  no-op instead of overwriting the real result, garbage/mismatched status
+  payloads are rejected, and failures to record or kill are reported.
+- No phantom /dev/nmd1p1 default: a fresh install has an empty target list
+  (table shows headers only), an empty selection is saved as-is, and
+  scrubbing is skipped — never retargeted — until at least one disk is
+  selected.
 
 ###2026.08.05b
 - Plugin updates now actually replace the shipped files. The bundle
