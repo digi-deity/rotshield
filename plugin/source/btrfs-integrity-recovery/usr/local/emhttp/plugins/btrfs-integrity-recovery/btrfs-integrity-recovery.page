@@ -172,15 +172,36 @@ pre { max-width: 100%; overflow-x: auto; }
    disk's state, the active column gets a subtle tint, and the progress row
    shows a bar.  Semi-transparent colors keep both light and dark webGui
    themes readable. */
-#progress-table { border-collapse: collapse; margin-top: 6px; }
+#progress-wrap { margin-top: 8px; overflow-x: auto; max-width: 100%; }
+#progress-table {
+  border-collapse: collapse;
+  margin-top: 6px;
+  /* Fixed column widths: the table never stretches with content or page
+     width.  First column = stat labels (220px), each disk column 170px —
+     enough for formatted numbers, the progress bar and the state chip;
+     long disk names ellipsize with a tooltip. */
+  table-layout: fixed;
+  width: auto;
+}
 #progress-table th, #progress-table td {
-  padding: 3px 16px 3px 4px;
+  padding: 3px 8px 3px 4px;
   border-bottom: 1px solid rgba(0,0,0,.08);
   white-space: nowrap;
   font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 #progress-table th { font-weight: bold; }
+#progress-table th:first-child, #progress-table td:first-child { width: 220px; }
+#progress-table th:not(:first-child), #progress-table td:not(:first-child) { width: 170px; }
 #progress-table td:first-child { color: #6c757d; }
+.devname {
+  display: inline-block;
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
 #progress-table td.stat { padding-left: 18px; }   /* indent under the group row */
 #progress-table td.col-active { background: rgba(255,193,7,.07); }
 #progress-table td.col-done   { background: rgba(40,167,69,.05); }
@@ -213,7 +234,7 @@ pre { max-width: 100%; overflow-x: auto; }
 .chip-cancelled { background: rgba(108,117,125,.28); color: #343a40; }
 .pbar {
   display: inline-block;
-  width: 110px;
+  width: 90px;
   height: 8px;
   background: rgba(0,0,0,.12);
   border-radius: 4px;
@@ -289,7 +310,7 @@ pre { max-width: 100%; overflow-x: auto; }
 // the table always matches the execution order.
 $configured_devices = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '/dev/nmd1p1'));
 ?>
-<div id="progress-wrap" style="margin-top:8px">
+<div id="progress-wrap">
   <table id="progress-table"></table>
   <p style="margin-top:8px;color:#6c757d;font-size:12px">Live counters refresh every 5&nbsp;s for the disk being scrubbed; finished disks keep their exact final counters from the run log. <span id="progress-updated"></span></p>
 </div>
@@ -439,8 +460,8 @@ $configured_devices = explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '
       // Chip: real states always show; "pending" only makes sense while a
       // run is active (the disk is queued).  Idle + no data = no chip.
       var chip = d.st !== 'pending' ? CHIP[d.st] : (running ? CHIP.pending : '');
-      html += '<th style="text-align:left" title="' + esc(devs[i]) + '">' +
-              esc(name) + ' ' + chip + '</th>';
+      html += '<th style="text-align:left"><span class="devname" title="' + esc(devs[i]) + '">' +
+              esc(name) + '</span>' + chip + '</th>';
     }
     html += '</tr></thead><tbody>';
     for (var g = 0; g < GROUPS.length; g++) {
