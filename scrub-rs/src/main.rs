@@ -271,9 +271,12 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // server runs on its own background thread; dropping its handle here
     // detaches it — the thread lives until the process exits.
     let status = Arc::new(scrub_rs::status::StatusCounters::new());
+    // `device` is tracked unconditionally (also with the server off): the
+    // final `status:` block printed at the end of the run carries it, so
+    // the plugin can associate the log's final counters with the right disk.
+    status.set_device(&dev);
     if status_port != 0 {
         status.set_state("starting");
-        status.set_device(&dev);
         // A busy port (e.g. a previous run still up) is logged and skipped —
         // the scrub must never fail just because the status port is taken.
         match scrub_rs::status::StatusServer::spawn(status_port, status.clone()) {
@@ -368,6 +371,8 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
                          wrong rdevOffset, or wrong disk). Aborting: any recovery would \
                          be built on a broken array config."
                     );
+                    status.set_state("error");
+                    print_status_block(&status);
                     return ExitCode::from(EXIT_RUNTIME_ERROR);
                 }
             }
@@ -377,6 +382,8 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
                      parity ({e}). The array config or parity is misconfigured. \
                      Aborting: any recovery would be built on a broken array config."
                 );
+                status.set_state("error");
+                print_status_block(&status);
                 return ExitCode::from(EXIT_RUNTIME_ERROR);
             }
         }
@@ -501,6 +508,8 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("error building recovery re-confirm handle: {e}");
+                status.set_state("error");
+                print_status_block(&status);
                 return ExitCode::from(EXIT_RUNTIME_ERROR);
             }
         };
@@ -517,21 +526,26 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             dry_run,
             batch_max,
             std::time::Duration::from_secs_f64(batch_idle),
-            if status_port != 0 {
-                Some(status.clone())
-            } else {
-                None
-            },
+            // Always mirror the writer's counters into the shared bank —
+            // NOT only when the live status server is on: the final
+            // `status:` block printed at the end of the run must carry the
+            // exact recovered/failed/skipped numbers even with
+            // STATUS_PORT=0 (the server is just a live view; the block is
+            // the durable record).  The atomics are cheap and idle.
+            Some(status.clone()),
         ) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("error spawning recovery pipeline: {e}");
+                status.set_state("error");
+                print_status_block(&status);
                 return ExitCode::from(EXIT_RUNTIME_ERROR);
             }
         };
         driver.tx = Some(tx);
         acc_handle = Some(acc);
         writer_handle = Some(handle);
+        status.set_recovery(true);
         println!(
             "recovery       : assessment pipeline (max {} candidates/batch, {}s idle flush){}",
             batch_max,
@@ -558,6 +572,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         Err(e) => {
             status.set_state("error");
             eprintln!("error running scrub: {e}");
+            print_status_block(&status);
             return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
     };
@@ -565,9 +580,17 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // If we spawned a writer thread, signal completion and collect its
     // stats.  The `Done` message flushes any pending batch; joining waits
     // for the final freeze/thaw to finish so the FS is never left frozen.
+    // `had_writer` is captured BEFORE the join below consumes the handle:
+    // the recovery-summary block and the exit-code branches at the end of
+    // this function must know whether the assessment pipeline ran (only
+    // then are `batch_stats` and the recovered/failed classification
+    // meaningful).  Regression fix: the handle was previously `take()`n
+    // here, leaving the later `is_some()` checks permanently false — the
+    // recovery summary never printed and exit codes 4/5 were unreachable.
     status.set_state("done");
+    let had_writer = writer_handle.is_some();
     let mut batch_stats = scrub_rs::batch_recover::BatchStats::default();
-    if writer_handle.is_some() {
+    if had_writer {
         if let Some(tx) = driver.tx.take() {
             let _ = tx.send(scrub_rs::batch_recover::Msg::Done);
         }
@@ -605,7 +628,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // the corruption that was found is actually repairable.  When no array
     // was available the pipeline never ran and the counters are all zero,
     // so we skip the block to avoid implying a reconstruction happened.
-    if writer_handle.is_some() {
+    if had_writer {
         println!("\nrecovery summary:");
         println!("  recovered : {}", batch_stats.recovered);
         println!("  failed    : {}", batch_stats.failed);
@@ -642,7 +665,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // and run `btrfs check --repair` offline.  `metadata_mirror_mismatches`
     // is deliberately NOT fatal here — that is the self-heal-recoverable
     // case (a good copy still exists, data is intact).
-    if stats.metadata_header_errors > 0 {
+    let code = if stats.metadata_header_errors > 0 {
         eprintln!(
             "\n[METADATA FATAL] {} metadata node(s) had NO good copy (all mirrors \
              failed header checksum, no parity recovery attempted). The live \
@@ -650,12 +673,10 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
              (if still mounted) and run `btrfs check --repair` offline.",
             stats.metadata_header_errors
         );
-        return ExitCode::from(EXIT_METADATA_FATAL);
-    }
-
-    if !issues_found {
+        ExitCode::from(EXIT_METADATA_FATAL)
+    } else if !issues_found {
         ExitCode::SUCCESS
-    } else if writer_handle.is_some()
+    } else if had_writer
         && stats.metadata_read_errors == 0
         && batch_stats.failed == 0
     {
@@ -668,7 +689,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         // imply full verification (see the METADATA READ ERRORS message
         // above), so it escalates to exit 5 (some unrecoverable) instead.
         ExitCode::from(EXIT_RECOVERED)
-    } else if writer_handle.is_some() {
+    } else if had_writer {
         // Corruption found AND at least one block could not be rebuilt
         // (parity/gather/write failure).  Needs operator attention.
         ExitCode::from(EXIT_RECOVER_FAILED)
@@ -677,7 +698,24 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         // was attempted or possible.  Distinct outcome from the recovered
         // cases above.
         ExitCode::from(EXIT_ISSUES_FOUND)
-    }
+    };
+
+    // Final status block — always printed, no flag needed.  `status:`
+    // followed by the same key=value payload the live status server serves,
+    // so the plugin reads a device's exact final counters from the run log
+    // with the same parser it uses for the live endpoint.
+    print_status_block(&status);
+    code
+}
+
+/// Print the final status block to stdout: a `status:` marker line followed
+/// by the exact `key=value` payload the live status server serves (see
+/// `status.rs`).  Emitted unconditionally at the end of every run, so the
+/// final counters are always available from the run output — the plugin's
+/// progress table fills a finished disk's column from this block.
+fn print_status_block(status: &scrub_rs::status::StatusCounters) {
+    println!("status:");
+    print!("{}", status.snapshot());
 }
 
 /// Parse a byte offset from a string.  Accepts decimal, 0x-prefixed hex,
@@ -714,6 +752,11 @@ fn print_help() {
     println!("             parity gather error, write-back error, or parity reconstruction the");
     println!("             verifier rejected. (A successful write whose read-back verify");
     println!("             disagreed is logged as a WARNING but NOT counted here.)");
+    println!();
+    println!("At the end of every run scrub-rs prints `status:` followed by the same");
+    println!("key=value payload the --status-port server serves (state, device, all");
+    println!("counters, progress), so the exact final numbers are always available from");
+    println!("the run output — no flag needed.");
 }
 
 /// A leading `-` is rejected loudly — a negative byte offset makes no

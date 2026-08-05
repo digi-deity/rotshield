@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "btrfs-integrity-recovery">
 <!ENTITY author        "iiLaurens">
-<!ENTITY version       "2026.08.02a">
-<!ENTITY bundleversion "2026.08.02a">
+<!ENTITY version       "2026.08.05">
+<!ENTITY bundleversion "2026.08.05">
 <!ENTITY launch        "Settings/btrfs-integrity-recovery">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
 <!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/latest/download/btrfs-integrity-recovery-x86_64-1.txz">
@@ -14,6 +14,27 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.05
+- The Settings page now shows a per-disk **progress table** instead of raw
+  logs (logs are still written under …/runs/ for debugging): rows are the
+  statistics from the status payload, grouped by hierarchy (progress, scrub
+  volume, issues found, metadata, recovery) with color-coded values and
+  relationship hints (e.g. Recovered "3 of 5" shows how corruption was
+  handled), columns are the disks. The disk being scrubbed refreshes live
+  every 5 s; finished disks keep their exact final counters.
+- scrub-rs now prints a final `status:` block to stdout at the end of every
+  run (same key=value payload as the live server, no flag needed), so the
+  exact final counters survive the process and are read back from the run
+  log — the table stays populated even with STATUS_PORT=0.
+- New `recovery=1|0` field in the status payload tells the UI whether the
+  recovered/failed/skipped counters are meaningful (array present or not);
+  writer counters are now mirrored unconditionally so the final block is
+  always accurate.
+- Fixed: recovery summary + exit codes 4/5 were unreachable since the
+  writer handle was consumed before the exit-code decision (recovered runs
+  reported rc=3). The recovery summary now prints and recoverable/
+  unrecoverable outcomes map to their documented exit codes.
 
 ###2026.08.02a
 - Fixed plugin updates: the bundle is now installed with

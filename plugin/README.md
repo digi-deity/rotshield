@@ -1,8 +1,13 @@
 # btrfs-integrity-recovery — unRAID plugin
 
+> This document covers the unRAID plugin half of the project. For the
+> project overview, the `scrub-rs` tool, and the integration-test harness,
+> start at the repository root: [`../README.md`](../README.md).
+
 An unRAID plugin that ships the [`scrub-rs`](../scrub-rs) btrfs scrubber and
 `craft-corrupt` test tool, and exposes them through a **Settings page** where
-you can run a scrub on demand or on a schedule.
+you can run a scrub on demand or on a schedule. The binaries are always
+bundled inside this plugin — there is no separate distribution.
 
 Unlike a typical daemon plugin, this is an **on-demand tool**: there is no
 long-running service. The Settings page (Utilities → btrfs-integrity-recovery)
@@ -124,13 +129,16 @@ fallback, because without a valid offset recovery is impossible anyway.
 | `SCHEDULE` | `disabled` / `weekly` / `monthly` / `custom` | (cron) |
 | `CRON` | 5-field cron time spec (`min hour day month weekday`), used only when `SCHEDULE=custom` (e.g. `0 4 1 * *` = 04:00 on the 1st). `daily` is intentionally not offered — a scrub can take days and would overlap its own previous run. | (cron) |
 
-### Live status endpoint
+### Live status + per-disk progress table
 
-While a scrub runs, scrub-rs can serve the live error counters over a
+While a scrub runs, scrub-rs serves the live error counters over a
 localhost-only HTTP endpoint so the Settings page shows real-time numbers
 instead of just "running / idle". This is on by default (`STATUS_PORT=9101`)
 and binds to `127.0.0.1` only — never the network. `scrub.sh status` prints
-the payload, and the Settings page polls it every 2 s.
+the payload, and the Settings page polls it every 5 s. The page renders the
+counters as a **progress table** (rows = statistics grouped by hierarchy,
+columns = disks): the disk currently being scrubbed gets live values, and
+each finished disk keeps its exact final counters.
 
 ```
 $ curl -s http://127.0.0.1:9101/status
@@ -149,6 +157,7 @@ metadata_read_errors=0
 recovered=1
 failed=0
 skipped=0
+recovery=1
 progress_total=1073741824
 progress_done=268435456
 progress_pct=25.00
@@ -166,6 +175,16 @@ resolution) and only visibly chunky on tiny test images.
 `key=value` lines, shell-parseable (e.g. `curl -s …/status | awk -F= '$1=="recovered"{print $2}'`).
 Set `STATUS_PORT=0` to disable. A busy port is logged and skipped by scrub-rs,
 never fatal.
+
+**Final counters survive the process**: every scrub-rs run ends by printing a
+`status:` marker followed by the same `key=value` payload to stdout, so the
+run log (written by `scrub.sh` under `…/runs/run-*.log`) carries each device's
+exact end-of-run numbers. `status.php` merges those final blocks with the live
+endpoint, which is how the table keeps finished disks populated even though
+the status server dies with each device's process — and it works even with
+`STATUS_PORT=0`. The payload's `recovery=1|0` tells the table whether the
+recovered/failed/skipped counters are meaningful (1 = array present, parity
+recovery ran; 0 = plain scrub, the table shows n/a).
 
 ## Releasing
 

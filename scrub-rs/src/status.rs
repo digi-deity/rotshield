@@ -54,6 +54,7 @@
 //! recovered=1
 //! failed=0
 //! skipped=0
+//! recovery=1
 //! progress_total=1073741824
 //! progress_done=268435456
 //! progress_pct=25.00
@@ -64,6 +65,11 @@
 //! ```sh
 //! curl -s http://127.0.0.1:9101/status | awk -F= '$1=="recovered"{print $2}'
 //! ```
+//!
+//! The same `snapshot()` payload is printed to stdout at the end of every
+//! run (a `status:` marker line in `main.rs`), so the exact final counters
+//! survive the process and the plugin can read them back from the run log
+//! with the same parser.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -107,6 +113,14 @@ pub struct StatusCounters {
     pub failed: AtomicU64,
     pub skipped: AtomicU64,
 
+    /// 1 while the recovery assessment pipeline is attached (array present
+    /// and this device is a recognized data disk), 0 for a plain scrub.
+    /// Tells the UI whether `recovered`/`failed`/`skipped` are meaningful
+    /// (a plain scrub has no writer, so all three stay 0 regardless of how
+    /// many mismatches were found — without this flag the zeros would look
+    /// like "nothing was recovered" instead of "recovery not available").
+    pub recovery: AtomicU64,
+
     /// Coarse progress (dev-tree position).  `progress_total` is the
     /// denominator: the sum of physical lengths of the DATA dev-extents
     /// the scrub will actually scrub, set once by the scrub driver at
@@ -136,6 +150,12 @@ impl StatusCounters {
 
     pub fn set_device(&self, device: impl Into<String>) {
         *self.device.lock().unwrap() = device.into();
+    }
+
+    /// Mark whether the recovery assessment pipeline is attached (see the
+    /// `recovery` field).  Set once by `main` when the writer spawns.
+    pub fn set_recovery(&self, on: bool) {
+        self.recovery.store(u64::from(on), Ordering::Relaxed);
     }
 
     /// Serialise the current counters as shell-parsable `key=value` lines,
@@ -170,6 +190,7 @@ impl StatusCounters {
              bytes_checked={}\nmetadata_header_errors={}\n\
              metadata_mirror_mismatches={}\nmetadata_read_errors={}\n\
              recovered={}\nfailed={}\nskipped={}\n\
+             recovery={}\n\
              progress_total={}\nprogress_done={}\nprogress_pct={:.2}\n",
             self.state.lock().unwrap(),
             self.device.lock().unwrap(),
@@ -186,6 +207,7 @@ impl StatusCounters {
             l(&self.recovered),
             l(&self.failed),
             l(&self.skipped),
+            l(&self.recovery),
             total,
             done,
             pct,
@@ -270,6 +292,7 @@ mod tests {
         counters.stale.store(1, Ordering::Relaxed);
         counters.bytes_checked.store(4096, Ordering::Relaxed);
         counters.recovered.store(1, Ordering::Relaxed);
+        counters.recovery.store(1, Ordering::Relaxed);
         counters
             .progress_total
             .store(1073741824, Ordering::Relaxed);
@@ -310,6 +333,7 @@ mod tests {
             "recovered=1",
             "failed=0",
             "skipped=0",
+            "recovery=1",
             "progress_total=1073741824",
             "progress_done=268435456",
             "progress_pct=25.00",

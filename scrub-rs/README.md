@@ -62,3 +62,16 @@ sudo -E tests/integration/run_matrix.sh \
 The full CI pipeline (array recovery tests + btrfs matrix + cmpUtilities +
 live simulation) is defined at the repo root in
 `.github/workflows/scrub-rs-tests.yml`.
+
+## Run output contract
+
+Every run ends by printing a `status:` marker followed by the same
+`key=value` payload the `--status-port` live server serves (`state`,
+`device`, all counters, `recovery`, `progress_*`). It is emitted
+unconditionally — no flag needed — so scripts (e.g. the unRAID plugin's
+`status.php`) can read a device's exact final counters from the run log
+with the same parser they use for the live endpoint. `state` is `done` for
+a completed run (whatever the exit code) or `error` for a run that failed
+mid-scrub; the `recovery` flag (1 = parity-recovery pipeline attached,
+0 = plain scrub) tells consumers whether `recovered`/`failed`/`skipped` are
+meaningful.

@@ -91,3 +91,12 @@ plugin/source/btrfs-integrity-recovery/usr/local/emhttp/plugins/btrfs-integrity-
 plugin/archive/
 # keep the .gitkeep so the bin/ dir is tracked
 !plugin/source/btrfs-integrity-recovery/usr/local/emhttp/plugins/btrfs-integrity-recovery/bin/.gitkeep
+
+# JS tooling (pi / bun) — stray artifacts from running `pi install` or `bun` in the repo root
+node_modules/
+package.json
+bun.lock
+bun.lockb
+# pi / pi-subagents runtime working data
+.pi-subagents/
+.pi/

@@ -70,7 +70,7 @@ is a dry run that shows what *could* be fixed and changes nothing.
 **It checks its own understanding before it starts.** Before repairing
 anything, the tool proves that its view of the array is correct by
 reconstructing a known block from the other disks and checking it. If
-something is wrong — wrong disk, wrong offset, mismatched setup — it
+something is wrong — wrong disk, wrong offset, misinterpreted setup — it
 refuses to run and tells you, rather than risk repairing on a broken
 foundation.
 
