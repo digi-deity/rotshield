@@ -49,6 +49,29 @@ $devices = array_filter(array_map('trim', explode("\n", trim($devices_raw))));
 // saved DEVICES list is deliberately stored alphabetically here.
 usort($devices, 'strnatcmp');
 
+// Filesystem type per discovered device (btrfs vs other), resolved by
+// scrub.sh fstypes from ONE lsblk call (the udev database).  lsblk never
+// opens a disk, so visiting this page cannot spin up a spun-down drive —
+// unlike blkid, which probes the device on a udev cache miss.  The
+// checkbox list below greys out non-btrfs disks so they can't be selected:
+// Rotshield only supports btrfs, and a selectable-but-useless disk would
+// read as "missing" rather than "unsupported".  Degrade gracefully: if the
+// probe produced no output at all (no lsblk / no udev records), every disk
+// stays selectable — scrub-rs re-validates the superblock at run time and
+// rejects a non-btrfs device with a clear error, so a missing probe can
+// never silently wipe the user's target selection.
+$fstype = [];
+$probe_ok = false;
+$fstypes_raw = shell_exec("$plugin_dir/scripts/scrub.sh fstypes 2>/dev/null") ?: '';
+if (trim($fstypes_raw) !== '') {
+    foreach (preg_split('/\r?\n/', trim($fstypes_raw)) as $fstype_line) {
+        if (preg_match('/^(\S+)\s+(\S+)$/', $fstype_line, $m)) {
+            $fstype[$m[1]] = $m[2];
+        }
+    }
+    $probe_ok = true;
+}
+
 // First use (no config yet): create an EMPTY default config — no target is
 // preselected.  The user picks disks; until then the progress table stays
 // empty (headers only) and scrubbing is skipped (the POST handler and
@@ -275,6 +298,9 @@ pre { max-width: 100%; overflow-x: auto; }
 .ppct { font-size: 12px; vertical-align: middle; }
 .of { color: #6c757d; font-size: 11px; font-weight: normal; }
 .muted { color: #adb5bd; font-style: italic; }
+/* Disabled (non-btrfs) target checkboxes: greyed out so the disk reads as
+   "not supported" rather than missing.  The tooltip explains why. */
+.dev-unsupported { color: #adb5bd; font-style: italic; cursor: not-allowed; }
 </style>
 
 <form method="post">
@@ -295,15 +321,27 @@ pre { max-width: 100%; overflow-x: auto; }
       document.getElementById('cron-row').style.display = (this.value === 'custom') ? '' : 'none';
   });
   </script>
-    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, in the order listed; the whole run is written to a single per-run log (…/runs/run-&lt;ts&gt;.log) with each disk's section and final status block, and the progress table below shows per-disk results. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/sdX). An empty selection is saved as-is: the table stays empty (headers only) and scrubbing is skipped until at least one disk is selected. Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job.</span></span></td>
+    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, in the order listed; the whole run is written to a single per-run log (…/runs/run-&lt;ts&gt;.log) with each disk's section and final status block, and the progress table below shows per-disk results. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/sdX). An empty selection is saved as-is: the table stays empty (headers only) and scrubbing is skipped until at least one disk is selected. Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job. Disks without a btrfs filesystem (e.g. XFS) are greyed out and can't be selected — Rotshield only supports btrfs data disks.</span></span></td>
         <td><div class="devices-list">
             <?php
+            // Current target selection (recomputed after a save refreshed
+            // $config above); a deliberately-saved empty DEVICES renders as
+            // nothing targeted, not an empty-string disk.
             $selected = array_values(array_filter(
                 explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '')),
-                'strlen'   // a deliberately-saved empty DEVICES renders as nothing targeted, not an empty-string disk
+                'strlen'
             ));
-            foreach ($devices as $d): ?>
-            <label style="display:block"><input type="checkbox" name="devices[]" value="<?=htmlspecialchars($d)?>" <?=in_array($d, $selected, true) ? 'checked' : ''?>><?=htmlspecialchars($d)?></label>
+            // Non-btrfs disks render greyed-out and disabled: they can't be
+            // selected (or re-selected), and a stale config entry for one
+            // renders unchecked so a save drops it.  The tooltip sits on
+            // the label, not the disabled input — some browsers suppress
+            // tooltips on disabled form controls.
+            foreach ($devices as $d):
+                $is_btrfs = !$probe_ok || ($fstype[$d] ?? '') === 'btrfs';
+            ?>
+            <label style="display:block" class="<?=$is_btrfs ? '' : 'dev-unsupported'?>"<?=$is_btrfs ? '' : ' title="Not a btrfs filesystem — Rotshield only supports btrfs data disks"'?>>
+              <input type="checkbox" name="devices[]" value="<?=htmlspecialchars($d)?>" <?=in_array($d, $selected, true) && $is_btrfs ? 'checked' : ''?><?=$is_btrfs ? '' : ' disabled'?>><?=htmlspecialchars($d)?><?= $is_btrfs ? '' : ' <span class="muted">(not btrfs)</span>' ?>
+            </label>
             <?php endforeach; ?>
           </div>
 </td></tr>

@@ -13,6 +13,11 @@
 #                     is already active, the second invocation skips.
 #   scrub.sh running  print 1 if a scrub is currently running, else 0.
 #   scrub.sh devices  print the array's data-disk raw rdevs.
+#   scrub.sh fstypes  print "<device> <fstype>" per array data disk (btrfs
+#                     vs other), read from lsblk's udev-database table —
+#                     zero disk I/O, so the Settings page can never spin up
+#                     a spun-down drive. Backs the page's grey-out of
+#                     non-btrfs disks.
 #   scrub.sh stop     terminate a running scrub (kills the runner + scrub-rs).
 #                     Before killing, one snapshot of the live counters is
 #                     fetched and recorded in the run log as a `status:`
@@ -378,6 +383,38 @@ devices() {
   data_devices | cut -d'|' -f1
 }
 
+# Print "<device> <fstype>" (one line per array data disk) for the Settings
+# page, which greys out non-btrfs disks so they can't be selected.  ONE
+# lsblk call returns every block device's filesystem straight from the udev
+# database — lsblk never opens a disk, so visiting the Settings page cannot
+# spin up a spun-down drive (blkid would: it probes the device whenever its
+# udev cache misses).  On unRAID the filesystem lives on the data disk's GPT
+# partition (/dev/sdc1); the raw rdev (/dev/sdc) itself carries no FSTYPE,
+# so each discovered rdev resolves through its direct children: the first
+# child row whose PKNAME equals the rdev and whose FSTYPE is non-empty
+# wins.  Anything else (xfs, reiserfs, unformatted, no udev record) reports
+# "other".  If lsblk is unavailable or produced nothing, fstypes prints
+# nothing and the page keeps every disk selectable — scrub-rs re-validates
+# the superblock at run time and rejects a non-btrfs device with a clear
+# error before scrubbing anything.
+fstypes() {
+  command -v lsblk >/dev/null 2>&1 || return 0
+  local table dev
+  # Raw mode (no --list: newer util-linux rejects combining them), no
+  # header; rows stay in tree order, parent before its children.
+  table="$(lsblk -p -rno FSTYPE,PKNAME 2>/dev/null)"
+  [ -n "${table}" ] || return 0
+  while read -r dev; do
+    local fs
+    fs="$(printf '%s\n' "${table}" | awk -v d="${dev}" '$2==d && $1!="" {print $1; exit}')"
+    if [ "${fs}" = "btrfs" ]; then
+      echo "${dev} btrfs"
+    else
+      echo "${dev} other"
+    fi
+  done < <(devices)
+}
+
 # True for array-partition device names (/dev/nmd<N>p<M>), where the btrfs
 # superblock lives at offset 0 (the array driver strips the per-disk header).
 # Mirrors scrub-rs's own slot_from_array_partition pattern (nmd + one-or-more
@@ -564,7 +601,8 @@ case "${1:-running}" in
   run)     run ;;
   running) running ;;
   devices) devices ;;
+  fstypes) fstypes ;;
   status)  status ;;
   stop)    stop "${2:-}" ;;
-  *) echo "usage: $0 run|running|devices|status|stop" ;;
+  *) echo "usage: $0 run|running|devices|fstypes|status|stop" ;;
 esac
