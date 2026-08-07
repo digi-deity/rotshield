@@ -17,6 +17,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Exit-code contract (kept small and stable so callers — e.g. the
 /// Rotshield unRAID plugin — can branch on meaning, not on
@@ -36,6 +37,11 @@ use std::sync::Arc;
 ///   4  issues found AND all recoverable — corruption detected, but every
 ///      confirmed block was rebuilt successfully (or would-be-written in
 ///      dry-run). The expected good outcome; data is (or would be) intact.
+///      Reachable ONLY when nothing was skipped (unverifiable metadata),
+///      deferred (a batch whose required freeze failed — `not_frozen`), or
+///      read-back-failed — any of those escalates to 5, because "all
+///      recoverable" must mean "everything was actually verified and
+///      written", not "we gave up on some of it silently".
 ///   5  issues found AND some UNRECOVERABLE — at least one confirmed block
 ///      could not be rebuilt (parity/gather/write failure), OR metadata
 ///      coverage was lost to READ (EIO) errors (which are not recovered by
@@ -150,6 +156,13 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // still flushes promptly (idle timer) while bursts are coalesced.
     let mut batch_max: usize = 64;
     let mut batch_idle: f64 = 5.0;
+    // H4: wall-clock guard for the per-batch freeze window.  The freeze
+    // spans every candidate's reconfirm + stripe gather across ALL other
+    // disks + write + read-back; a slow/dying disk inside the gather must
+    // not stall the live filesystem indefinitely.  Once the window exceeds
+    // this many seconds the batch thaws and defers the remainder to the
+    // next batch.
+    let mut freeze_max: f64 = 60.0;
     // Optional localhost HTTP status server for the plugin: when a non-zero
     // `--status-port <n>` is given, scrub-rs serves the live error/progress
     // counters on 127.0.0.1:<n> from a background thread (see `status.rs`).
@@ -227,6 +240,22 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
                     }
                 };
             }
+            "--freeze-max" => {
+                let v = match args.next() {
+                    Some(s) => s,
+                    None => {
+                        eprintln!("error: --freeze-max requires a value");
+                        return ExitCode::from(EXIT_USAGE_ERROR);
+                    }
+                };
+                match v.parse::<f64>() {
+                    Ok(s) if s.is_finite() && s > 0.0 => freeze_max = s,
+                    _ => {
+                        eprintln!("error: --freeze-max must be a positive number of seconds");
+                        return ExitCode::from(EXIT_USAGE_ERROR);
+                    }
+                };
+            }
             "--freeze-mount" => {
                 let v = match args.next() {
                     Some(s) => s,
@@ -245,6 +274,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
                 eprintln!(
                     "usage: scrub-rs <device-or-image> [--offset <bytes>] \
                      [--repair] [--freeze-mount <path>] [--no-freeze] \
+                     [--batch-max <n>] [--batch-idle <s>] [--freeze-max <s>] \
                      [--status-port <n>]"
                 );
                 return ExitCode::from(EXIT_USAGE_ERROR);
@@ -335,7 +365,6 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             }
         }
     };
-
     // Early canary: before committing to a full scrub + recovery pass, prove
     // the array config is actually sound.  We reconstruct the target disk's
     // superblock block from the *other* data disks + primary parity (the
@@ -419,6 +448,12 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         /// thread, which re-confirms + classifies it under a single freeze.
         tx: Option<std::sync::mpsc::SyncSender<scrub_rs::batch_recover::Msg>>,
         scrub_slot: u64,
+        /// Count of candidates successfully handed to the recovery pipeline
+        /// (incremented in `on_event` only on a successful send).  Compared
+        /// against the writer's classified totals after the joins — the C7
+        /// verdict reconciliation: a shortfall means a pipeline thread died
+        /// and the verdict is silently incomplete.
+        sent: Arc<AtomicU64>,
     }
     impl fs::ScrubCallbacks for Driver {
         fn wants_raw_candidates(&self) -> bool {
@@ -458,17 +493,29 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
                 reconfirm: ev.reconfirm.clone(),
                 unreadable: ev.unreadable,
             };
-            // `send` blocks once two batches are buffered (depth-2 channel),
+            // `send` blocks once one batch is buffered (depth-1 channel),
             // naturally pausing the scrub while the writer is frozen/writing.
             if let Err(e) = tx.send(scrub_rs::batch_recover::Msg::Candidate(cand)) {
+                // The pipeline is gone (writer/accumulator died): the
+                // candidate was NOT handed over.  The send-vs-classified
+                // reconciliation after the joins turns this into a hard
+                // error (the join checks catch the thread death itself).
                 eprintln!("error: recovery writer thread gone: {e}");
+            } else {
+                self.sent.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
+    // `sent` counts candidates successfully handed to the recovery
+    // pipeline: the shared `Arc` is cloned into the `Driver` (incremented
+    // per successful send in `on_event`) and read back here after the
+    // joins for the C7 verdict reconciliation.
+    let sent = Arc::new(AtomicU64::new(0));
     let mut driver = Driver {
         cfg: cfg.clone(),
         tx: None,
         scrub_slot,
+        sent: sent.clone(),
     };
 
     // Build the live-filesystem freeze controller.  It only engages when we
@@ -532,6 +579,10 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             dry_run,
             batch_max,
             std::time::Duration::from_secs_f64(batch_idle),
+            // H4: wall-clock guard for the per-batch freeze window — a
+            // slow/dying disk inside a batch's stripe gather must not
+            // stall the live filesystem indefinitely.
+            std::time::Duration::from_secs_f64(freeze_max),
             // Always mirror the writer's counters into the shared bank —
             // NOT only when the live status server is on: the final
             // `status:` block printed at the end of the run must carry the
@@ -601,13 +652,76 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             let _ = tx.send(scrub_rs::batch_recover::Msg::Done);
         }
         // Join the accumulator first (it forwards Done to the writer), then
-        // the writer (which flushes the final batch and thaws the FS).
-        if let Some(acc) = acc_handle.take() {
-            let _ = acc.join();
+        // the writer (which flushes the final batch and thaws the FS).  An
+        // ABNORMAL join (thread panicked) is a hard runtime error (C7): the
+        // verdict is incomplete and must never be reported as a clean scrub
+        // or a partial-looking one.  The early return happens BEFORE
+        // "scrub complete:" is printed, so the plugin's completion-marker
+        // gate reports ERROR rather than trusting a misleading rc.
+        if let Some(acc) = acc_handle.take()
+            && acc.join().is_err()
+        {
+            eprintln!("error: recovery accumulator thread panicked — results are incomplete");
+            status.set_state("error");
+            print_status_block(&status);
+            return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
         match writer_handle.take().unwrap().join() {
-            Ok(s) => batch_stats = s,
-            Err(_) => eprintln!("error: recovery writer thread panicked"),
+            Ok(Ok(s)) => batch_stats = s,
+            Ok(Err(e)) => {
+                // A HARD abort from the writer (H2: a thaw failed and the
+                // filesystem may still be frozen): the verdict is
+                // incomplete and must be reported as an ERROR — never as a
+                // clean or partial scrub.
+                eprintln!("error: recovery pipeline aborted: {e}");
+                status.set_state("error");
+                print_status_block(&status);
+                return ExitCode::from(EXIT_RUNTIME_ERROR);
+            }
+            Err(_) => {
+                eprintln!("error: recovery writer thread panicked — results are incomplete");
+                status.set_state("error");
+                print_status_block(&status);
+                return ExitCode::from(EXIT_RUNTIME_ERROR);
+            }
+        }
+
+        // C7 verdict reconciliation: every candidate handed to the pipeline
+        // must have been classified by the writer into exactly one bucket
+        // (see the invariant documented on `BatchStats`).  A shortfall
+        // means candidates vanished (dead thread, lost batch) and the
+        // verdict is silently incomplete — that must be a hard error, not
+        // a clean run.
+        let classified =
+            batch_stats.mismatch + batch_stats.stale + batch_stats.skipped + batch_stats.deduped;
+        let sent = driver.sent.load(Ordering::Relaxed);
+        if classified != sent {
+            eprintln!(
+                "error: verdict reconciliation failed: {sent} candidate(s) were handed to \
+                 the recovery pipeline but only {classified} were classified (a pipeline \
+                 thread likely died mid-run). Results are INCOMPLETE — this run cannot be \
+                 reported as a complete scrub."
+            );
+            status.set_state("error");
+            print_status_block(&status);
+            return ExitCode::from(EXIT_RUNTIME_ERROR);
+        }
+        // Internal consistency of the mismatch sub-buckets (guards against
+        // future accounting drift in `flush_batch`).
+        let sub_buckets = batch_stats.recovered
+            + batch_stats.failed
+            + batch_stats.not_corrupt
+            + batch_stats.not_frozen
+            + batch_stats.readback_failed;
+        if sub_buckets != batch_stats.mismatch {
+            eprintln!(
+                "error: internal recovery accounting mismatch: mismatch={} but \
+                 recovered+failed+not_corrupt+not_frozen+readback_failed={sub_buckets}",
+                batch_stats.mismatch
+            );
+            status.set_state("error");
+            print_status_block(&status);
+            return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
     }
 
@@ -624,6 +738,8 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         stats.sectors_stale + batch_stats.stale
     );
     println!("  sectors read error : {}", stats.sectors_read_error);
+    println!("  csum branches stale: {}", stats.stale_csum_branches);
+    println!("  isolation truncate : {}", stats.isolation_truncated);
     println!("  metadata hdr errs  : {}", stats.metadata_header_errors);
     println!("  metadata read err  : {}", stats.metadata_read_errors);
     println!("  metadata mirror   : {}", stats.metadata_mirror_mismatches);
@@ -636,15 +752,50 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     // so we skip the block to avoid implying a reconstruction happened.
     if had_writer {
         println!("\nrecovery summary:");
-        println!("  recovered : {}", batch_stats.recovered);
-        println!("  failed    : {}", batch_stats.failed);
-        println!("  skipped   : {}", batch_stats.skipped);
+        println!("  recovered       : {}", batch_stats.recovered);
+        println!("  failed          : {}", batch_stats.failed);
+        println!("  skipped         : {}", batch_stats.skipped);
+        println!("  not_corrupt     : {}", batch_stats.not_corrupt);
+        println!("  not_frozen      : {}", batch_stats.not_frozen);
+        println!("  readback_failed : {}", batch_stats.readback_failed);
+        // C5: repairs written under a live mount leave the mounted
+        // filesystem's FILE page cache potentially serving the OLD corrupt
+        // bytes for ranges cached before the repair (BLKFLSBUF on the raw
+        // rdev only clears the block-device buffer cache, not file pages).
+        // Surface the advisory prominently so the operator knows to reboot
+        // / remount before trusting reads of repaired files.  The affected
+        // raw-rdev offsets are logged in the RECOVERED lines above.
+        if status.repaired_while_mounted.load(Ordering::Relaxed) != 0 {
+            eprintln!(
+                "\n[PAGE-CACHE ADVISORY] {} repaired block(s) were written while the \
+                 filesystem was mounted live. The raw device's buffer cache was flushed, \
+                 but the mounted filesystem's FILE page cache may STILL serve the OLD \
+                 (corrupt) bytes for ranges that were cached before the repair — \
+                 indefinitely, until memory pressure evicts them. Reboot or remount the \
+                 disk before trusting reads of the repaired files. The affected \
+                 raw-rdev offsets are in the RECOVERED lines above.",
+                batch_stats.recovered + batch_stats.readback_failed
+            );
+        }
     }
 
+    // `batch_stats.skipped` is part of the verdict: a candidate whose
+    // re-confirmation metadata was unreadable was NEVER verified or
+    // recovered — a run whose only outcomes were skipped must not report
+    // clean (C3 + C7 review: the C3 fix downgrades unreadable-live-trees
+    // to Unverifiable/skipped, so without this term such a run would exit
+    // 0 "OK (clean)" with confirmed mismatches left unexamined).
+    //
+    // `stats.stale_csum_branches` is a *coverage* term (H8): CSUM_TREE
+    // branches that went stale mid-scrub (normal churn, NOT a metadata
+    // error) had their sectors never verified — "clean" must mean "fully
+    // checked", so a non-zero value refuses exit 0 too.
     let issues_found = stats.sectors_mismatch + batch_stats.mismatch > 0
         || stats.sectors_read_error > 0
         || stats.metadata_header_errors > 0
-        || stats.metadata_read_errors > 0;
+        || stats.metadata_read_errors > 0
+        || stats.stale_csum_branches > 0
+        || batch_stats.skipped > 0;
 
     // Metadata READ errors (device EIO) are hardware, NOT checksum
     // corruption — the operator response differs, so we do NOT trigger the
@@ -659,6 +810,22 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
              data may be UNVERIFIED. Check the disk hardware (SMART, cables, \
              controller), not `btrfs check`.",
             stats.metadata_read_errors
+        );
+    }
+
+    // H8: CSUM-tree branches that went stale mid-scrub (freed/rewritten by
+    // a live transaction while the run was in progress) are normal churn
+    // but a coverage gap — their sectors were never verified this run.
+    // Non-zero refuses exit 0 via `issues_found` above; explain why here.
+    // Deliberately NOT a metadata error: no METADATA FATAL / `btrfs check`
+    // advice, just a rerun.
+    if stats.stale_csum_branches > 0 {
+        eprintln!(
+            "\n[COVERAGE GAP] {} CSUM-tree branch(es) went stale mid-scrub \
+             (freed/rewritten while the run was in progress); their sectors were NOT \
+             verified this run. Rerun the scrub to cover them — exit 0 is refused \
+             while this counter is non-zero.",
+            stats.stale_csum_branches
         );
     }
 
@@ -682,7 +849,30 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         ExitCode::from(EXIT_METADATA_FATAL)
     } else if !issues_found {
         ExitCode::SUCCESS
-    } else if had_writer && stats.metadata_read_errors == 0 && batch_stats.failed == 0 {
+    } else if stats.stale_csum_branches > 0
+        && stats.sectors_mismatch == 0
+        && stats.sectors_read_error == 0
+        && stats.metadata_read_errors == 0
+        && batch_stats.mismatch == 0
+        && batch_stats.skipped == 0
+    {
+        // Coverage-only gap (H8): the run never finished verifying
+        // (CSUM-tree branches went stale mid-scrub — normal churn, not
+        // corruption) and found no corruption, no read errors, no
+        // candidates.  Not "all recoverable" (nothing was recovered) and
+        // not "some unrecoverable" (nothing was lost): plain ISSUES FOUND
+        // (warning severity) — rerun in a quieter window.  The [COVERAGE
+        // GAP] message above explains.
+        ExitCode::from(EXIT_ISSUES_FOUND)
+    } else if had_writer
+        && stats.metadata_read_errors == 0
+        && batch_stats.failed == 0
+        && batch_stats.skipped == 0
+        && batch_stats.not_frozen == 0
+        && batch_stats.readback_failed == 0
+        && batch_stats.not_corrupt == 0
+        && stats.stale_csum_branches == 0
+    {
         // Corruption found, but every confirmed block was rebuilt
         // successfully (or would-be-written in dry-run).  The expected good
         // outcome — the data is (or would be) intact.  Mode-independent:
@@ -691,6 +881,15 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         // this branch: lost metadata coverage means the data result cannot
         // imply full verification (see the METADATA READ ERRORS message
         // above), so it escalates to exit 5 (some unrecoverable) instead.
+        // The new gates (`skipped`/`not_frozen`/`readback_failed` == 0) are
+        // the same principle applied to the recovery path: "all recoverable"
+        // is only true when every confirmed block was actually verified and
+        // written — a skipped/deferred/read-back-failed candidate means we
+        // gave up on it, which is not "all recovered" (C2/C4/C7 + M1).
+        // `stale_csum_branches == 0` extends the same honesty to coverage
+        // (H8): a run whose CSUM-tree branches went stale mid-scrub never
+        // verified those sectors, so "all recoverable" would be a lie — it
+        // falls through to exit 5 with the [COVERAGE GAP] explanation.
         ExitCode::from(EXIT_RECOVERED)
     } else if had_writer {
         // Corruption found AND at least one block could not be rebuilt
@@ -739,6 +938,11 @@ fn print_help() {
     println!("  --no-freeze           disable the freeze (unsafe with --repair on a live FS)");
     println!("  --batch-max <N>       max candidates per recovery batch (default 64)");
     println!("  --batch-idle <X>      flush a batch after Xs of no new candidate (default 5.0)");
+    println!(
+        "  --freeze-max <s>      wall-clock bound for one batch's freeze window; on expiry the"
+    );
+    println!("                        batch thaws and defers the remainder to the next batch");
+    println!("                        (default 60.0; guards a slow/dying disk in the gather)");
     println!("  --status-port <n>     serve live counters on 127.0.0.1:<n> (0 = off)");
     println!("  --help, -h            show this help and the recovery-counter glossary");
     println!();
@@ -748,13 +952,36 @@ fn print_help() {
     println!("             Re-confirm proved it was never genuine corruption — nothing written.");
     println!("  skipped    metadata for THIS sector was unreadable, so we could not safely");
     println!("             re-confirm it. Write skipped for just this candidate (per-sector,");
-    println!("             not a global gate).");
+    println!("             not a global gate). Non-zero blocks exit code 4.");
     println!("  recovered  confirmed corruption rebuilt from parity and written (or would-be");
-    println!("             in dry-run), with a passing read-back verify.");
+    println!("             in dry-run), with a read-back verify that reads the device (the");
+    println!("             raw rdev's cache is invalidated BEFORE the read-back).");
     println!("  failed     confirmed corruption where the fix did not land: stripe read error,");
     println!("             parity gather error, write-back error, or parity reconstruction the");
-    println!("             verifier rejected. (A successful write whose read-back verify");
-    println!("             disagreed is logged as a WARNING but NOT counted here.)");
+    println!("             verifier rejected.");
+    println!("  not_corrupt  reconstruction rejected by the verifier as not-the-original —");
+    println!("             nothing to write (counted so verdict totals reconcile).");
+    println!("  not_frozen   reconstruction succeeded but this batch's required filesystem");
+    println!("             freeze (FIFREEZE) FAILED, so the write was deferred (assess-only).");
+    println!("             Nothing is ever written unfrozen unless --no-freeze is explicit.");
+    println!("             Non-zero blocks exit code 4.");
+    println!("  readback_failed  the write landed but the post-write read-back disagreed with");
+    println!("             the verifier or errored — a lying/failing-disk signal. Non-zero");
+    println!("             blocks exit code 4.");
+    println!();
+    println!("coverage notes (what this scrub does NOT check — the honest gap vs `btrfs scrub`):");
+    println!("  - data written nodatasum / nocow has no csum entries and is never checked;");
+    println!("  - inline extent data lives in METADATA chunk ranges, which the DATA-only");
+    println!("    dev-extent drive never visits — inline data is not checked;");
+    println!("  - metadata trees are verified only where the scrub traverses them");
+    println!("    (chunk/root/dev/csum trees at open/walk time); FS_TREE / EXTENT_TREE");
+    println!("    subtrees not crossed by the walk are not part of this pass;");
+    println!("  - CSUM-tree branches that go stale mid-scrub (freed/rewritten while the run");
+    println!("    is in progress) are skipped and counted in `stale_csum_branches` — a");
+    println!("    non-zero value refuses exit 0 (their sectors were not verified);");
+    println!("  - runs whose EIO isolation budget is exhausted mark the remaining sectors");
+    println!("    unreadable without further probing (counted `isolation_truncated`); they");
+    println!("    still count as read errors, so exit 0 is already refused.");
     println!();
     println!("At the end of every run scrub-rs prints `status:` followed by the same");
     println!("key=value payload the --status-port server serves (state, device, all");

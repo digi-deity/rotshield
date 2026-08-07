@@ -33,7 +33,6 @@ use crate::btrfs::csum_strategy::CsumStrategy;
 use crate::btrfs::dev_extent::build_dev_extents;
 use crate::btrfs::extent::reconfirm_mismatch;
 use crate::btrfs::key::bg_flag;
-use crate::btrfs::open::live_data_tree_roots;
 use crate::btrfs::reader::FsReader;
 use crate::btrfs::scrub::scrub_dev_tree;
 use crate::btrfs::superblock::Superblock;
@@ -169,18 +168,37 @@ impl BtrfsScrub {
         // empty drive set and report 0 mismatches with exit 0.  Count it as
         // metadata_header_errors / metadata_mirror_mismatches so the gap
         // surfaces instead of silently under-scrubbing the device.
-        let dev_tree_root = roots
-            .dev_tree_root
-            .expect("DEV_TREE root missing from btrfs root tree");
-        let dev_extents = build_dev_extents(
-            &mut reader,
-            &chunk_map,
-            dev_tree_root,
-            superblock.devid,
-            &mut metadata_header_errors,
-            &mut metadata_mirror_mismatches,
-            &mut metadata_read_errors,
-        )?;
+        let dev_extents = match roots.dev_tree_root {
+            Some(dev_tree_root) => build_dev_extents(
+                &mut reader,
+                &chunk_map,
+                dev_tree_root,
+                superblock.devid,
+                &mut metadata_header_errors,
+                &mut metadata_mirror_mismatches,
+                &mut metadata_read_errors,
+            )?,
+            // H5: the DEV_TREE ROOT_ITEM can be missing exactly when the
+            // root-tree branch carrying it was skipped because every
+            // mirror copy failed its header checksum — the bitrot scenario
+            // this tool exists to find.  Panicking here (a backtrace + a
+            // generic ERROR in the plugin) is the worst possible response;
+            // count the gap as a metadata header error so the run surfaces
+            // the correct METADATA FATAL (exit 6, "btrfs check --repair")
+            // story, and continue with an EMPTY dev-extent set — the scrub
+            // then reports the metadata-fatal result instead of silently
+            // under-scrubbing the device.
+            None => {
+                metadata_header_errors += 1;
+                eprintln!(
+                    "note: DEV_TREE root could not be resolved (the root-tree branch \
+                     carrying its ROOT_ITEM failed metadata verification). The dev-extent \
+                     set is EMPTY — no data extents can be scrubbed; the run will report \
+                     METADATA FATAL (exit 6)."
+                );
+                Vec::new()
+            }
+        };
 
         Ok(Self {
             reader,
@@ -352,12 +370,14 @@ impl fs::FilesystemScrub for BtrfsScrub {
             batch,
             self.status.as_deref(),
             &mut emit,
-        );
+        )?;
 
-        // `scrub_dev_tree` doesn't surface an io::Error today — it logs
-        // read-errors inline and folds them into the stats — so we return
-        // Ok here.  A future failure that should abort the scrub can be
-        // propagated via the explicit `io::Result` return.
+        // `scrub_dev_tree` returns `Err` only when the pipelined reader
+        // thread died or responses were lost mid-run (C7) — i.e. the
+        // verdict is INCOMPLETE and must not be reported as a clean scrub.
+        // Read-errors on individual sectors are NOT errors here: they are
+        // logged inline and folded into the stats (`sectors_read_error`,
+        // `metadata_read_errors`), which the exit-code logic escalates.
         //
         // `metadata_header_errors` comes from the chunk/root-tree walks in
         // `open.rs` (DUP metadata nodes with no good copy) PLUS any
@@ -380,6 +400,8 @@ impl fs::FilesystemScrub for BtrfsScrub {
             sectors_no_csum: local.sectors_no_csum,
             sectors_read_error: local.sectors_read_error,
             sectors_stale: local.sectors_stale,
+            stale_csum_branches: local.stale_csum_branches,
+            isolation_truncated: local.isolation_truncated,
             bytes_checked: local.bytes_checked,
             metadata_header_errors: self.metadata_header_errors
                 + self.csum_provider.metadata_errors(),
@@ -455,6 +477,22 @@ struct BtrfsReconfirmer {
     reader: FsReader,
     chunk_map: ChunkMap,
     strategy: CsumStrategy,
+    /// Shared status counters (when the run has them): tree-root-level
+    /// metadata failures encountered while re-reading the live trees are
+    /// counted here, so they surface in the status payload / exit path
+    /// exactly like the per-leaf CSUM_TREE failures do.
+    counters: Option<Arc<StatusCounters>>,
+    /// Cache of the live EXTENT_TREE + CSUM_TREE roots, keyed by the
+    /// superblock generation at which they were resolved (H4/M2): resolve
+    /// the live trees ONCE per batch instead of re-walking the entire root
+    /// tree for every candidate.  Under a batch freeze no transaction can
+    /// commit, so the generation is stable for the whole batch and the
+    /// cache is valid throughout; between batches a committed transaction
+    /// bumps the generation and invalidates the cache naturally.  A cache
+    /// hit adds no new metadata failures (the roots were already counted
+    /// when resolved) — which is correct: no new nodes are read, so there
+    /// is nothing new that could fail.
+    cached_roots: Option<(u64, u64, u64)>,
 }
 
 impl BtrfsReconfirmer {
@@ -472,6 +510,10 @@ impl BtrfsReconfirmer {
             reader,
             chunk_map: scrub.chunk_map.clone(),
             strategy: scrub.strategy,
+            // `main` calls `set_status` before `reconfirmer()`, so the
+            // shared counters (if any) are already attached here.
+            counters: scrub.status.clone(),
+            cached_roots: None,
         })
     }
 }
@@ -479,10 +521,54 @@ impl BtrfsReconfirmer {
 impl Reconfirmer for BtrfsReconfirmer {
     fn reconfirm(&mut self, req: &ReconfirmRequest) -> Reconfirm {
         let base_offset = self.reader.base_offset();
-        match live_data_tree_roots(&mut self.reader, &self.chunk_map, base_offset) {
-            // Couldn't re-read the live trees — be conservative and treat
-            // as real corruption (never hide a possible mismatch).
-            None => Reconfirm::Corruption,
+
+        // 1. Read ONLY the live superblock (one cheap 4 KiB positional
+        //    read via a dup'd fd) — this both validates the cached roots'
+        //    generation and, on a cache miss, provides the root-tree
+        //    bytenr for the walk.  A failure is counted as a metadata READ
+        //    error and downgrades this candidate to Unverifiable (C3),
+        //    exactly as the pre-cache path did.
+        let sb = match crate::btrfs::open::read_live_superblock(
+            &self.reader,
+            base_offset,
+            self.counters.as_deref(),
+        ) {
+            Some(sb) => sb,
+            None => return Reconfirm::Unverifiable,
+        };
+
+        // 2. Cache lookup: reuse the previously-resolved live roots when
+        //    the superblock generation is unchanged (see the struct doc
+        //    for the invalidation rule).  On a miss, resolve the roots
+        //    (one bounded root-tree walk with an early exit once both
+        //    ROOT_ITEMs are found) and store them for the rest of the
+        //    batch / until the next transaction.
+        let roots = match cached_roots_at(self.cached_roots, sb.generation) {
+            Some(roots) => Some(roots),
+            None => {
+                let r = crate::btrfs::open::resolve_live_tree_roots(
+                    &mut self.reader,
+                    &self.chunk_map,
+                    self.counters.as_deref(),
+                    &sb,
+                );
+                if let Some((ext_root, csum_root)) = r {
+                    self.cached_roots = Some((sb.generation, ext_root, csum_root));
+                }
+                r
+            }
+        };
+
+        match roots {
+            // Couldn't re-read the live trees — the sector's liveness is
+            // UNVERIFIABLE, not proven corrupt (C3): the sector may have
+            // been freed/reused by a transaction we cannot see, and a
+            // recovery write could overwrite live data with a stale block.
+            // Skip the write for this candidate (the recovery sink counts
+            // it `skipped`); the failure itself was counted into the
+            // metadata-error counters inside `read_live_superblock` /
+            // `resolve_live_tree_roots`.
+            None => Reconfirm::Unverifiable,
             Some((ext_root, csum_root)) => reconfirm_mismatch(
                 &mut self.reader,
                 &self.chunk_map,
@@ -494,5 +580,36 @@ impl Reconfirmer for BtrfsReconfirmer {
                 self.strategy.sector_size,
             ),
         }
+    }
+}
+
+/// Pure cache-decision helper: return the cached `(ext_root, csum_root)`
+/// when the cache was populated at exactly `generation`, else `None`.
+/// Split out so the invalidation rule is unit-testable without a
+/// filesystem.
+fn cached_roots_at(cached: Option<(u64, u64, u64)>, generation: u64) -> Option<(u64, u64)> {
+    match cached {
+        Some((cached_gen, ext, csum)) if cached_gen == generation => Some((ext, csum)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cached_roots_at;
+
+    #[test]
+    fn cache_hit_only_at_exact_generation() {
+        let cached = Some((42u64, 0x1000u64, 0x2000u64));
+        // Same generation → reuse.
+        assert_eq!(cached_roots_at(cached, 42), Some((0x1000, 0x2000)));
+        // Generation bumped (a transaction committed between batches) →
+        // invalidate.
+        assert_eq!(cached_roots_at(cached, 43), None);
+        // Generation went backwards (device re-enumerated / rewound) →
+        // also invalidate.
+        assert_eq!(cached_roots_at(cached, 41), None);
+        // Empty cache → always miss.
+        assert_eq!(cached_roots_at(None, 42), None);
     }
 }

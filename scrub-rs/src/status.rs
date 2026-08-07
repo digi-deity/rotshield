@@ -47,6 +47,8 @@
 //! sectors_stale=0
 //! sectors_no_csum=0
 //! sectors_read_error=0
+//! stale_csum_branches=0
+//! isolation_truncated=0
 //! bytes_checked=505937920
 //! metadata_header_errors=0
 //! metadata_mirror_mismatches=0
@@ -92,6 +94,13 @@ pub struct StatusCounters {
     pub sectors_ok: AtomicU64,
     pub sectors_no_csum: AtomicU64,
     pub sectors_read_error: AtomicU64,
+    /// CSUM_TREE branches skipped as stale mid-scrub (coverage gap — see
+    /// `ScrubStats::stale_csum_branches`).  Bumped live by the lazy csum
+    /// provider's per-range walks, deduplicated per node per run.
+    pub stale_csum_branches: AtomicU64,
+    /// Read-runs where the EIO isolation budget was exhausted (see
+    /// `ScrubStats::isolation_truncated`).  Bumped by `process_isolated`.
+    pub isolation_truncated: AtomicU64,
     pub bytes_checked: AtomicU64,
 
     /// Genuine corruption found.  Mirrored by the scrub loop in inline
@@ -112,6 +121,27 @@ pub struct StatusCounters {
     pub recovered: AtomicU64,
     pub failed: AtomicU64,
     pub skipped: AtomicU64,
+    /// Reconstruction succeeded but the batch's required freeze failed —
+    /// the write was deferred (assess-only).  Never counts as `recovered`;
+    /// a non-zero value blocks exit code 4 in `main`.
+    pub not_frozen: AtomicU64,
+    /// A write landed but the post-write read-back disagreed with the
+    /// verifier or errored — a lying/failing-disk signal.  Never counts as
+    /// `recovered`; a non-zero value blocks exit code 4 in `main`.
+    pub readback_failed: AtomicU64,
+    /// Reconstructed block rejected by the verifier as "not the original"
+    /// (`RecoveryResult::NotCorrupt`) — counted so the sent-vs-classified
+    /// verdict reconciliation in `main` can sum exactly.
+    pub not_corrupt: AtomicU64,
+    /// Candidates collapsed by the writer's per-batch `array_phys` dedup
+    /// (counted for the same reconciliation).
+    pub deduped: AtomicU64,
+    /// 1 once any repair write landed while the run declared a live mount
+    /// (i.e. the mounted filesystem's FILE page cache may still serve the
+    /// OLD corrupt bytes for ranges cached before the repair — see C5 in
+    /// SERIOUS_ISSUES.md).  `main` prints a reboot/remount advisory when
+    /// set; the plugin can escalate its notification.
+    pub repaired_while_mounted: AtomicU64,
 
     /// 1 while the recovery assessment pipeline is attached (array present
     /// and this device is a recognized data disk), 0 for a plain scrub.
@@ -186,9 +216,12 @@ impl StatusCounters {
             "state={}\ndevice={}\n\
              sectors_checked={}\nsectors_ok={}\nsectors_mismatch={}\n\
              sectors_stale={}\nsectors_no_csum={}\nsectors_read_error={}\n\
+             stale_csum_branches={}\nisolation_truncated={}\n\
              bytes_checked={}\nmetadata_header_errors={}\n\
              metadata_mirror_mismatches={}\nmetadata_read_errors={}\n\
              recovered={}\nfailed={}\nskipped={}\n\
+             not_frozen={}\nreadback_failed={}\nnot_corrupt={}\ndeduped={}\n\
+             repaired_while_mounted={}\n\
              recovery={}\n\
              progress_total={}\nprogress_done={}\nprogress_pct={:.2}\n",
             self.state.lock().unwrap(),
@@ -199,6 +232,8 @@ impl StatusCounters {
             l(&self.stale),
             l(&self.sectors_no_csum),
             l(&self.sectors_read_error),
+            l(&self.stale_csum_branches),
+            l(&self.isolation_truncated),
             l(&self.bytes_checked),
             l(&self.metadata_header_errors),
             l(&self.metadata_mirror_mismatches),
@@ -206,6 +241,11 @@ impl StatusCounters {
             l(&self.recovered),
             l(&self.failed),
             l(&self.skipped),
+            l(&self.not_frozen),
+            l(&self.readback_failed),
+            l(&self.not_corrupt),
+            l(&self.deduped),
+            l(&self.repaired_while_mounted),
             l(&self.recovery),
             total,
             done,

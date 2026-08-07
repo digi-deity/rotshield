@@ -207,6 +207,22 @@ pub struct ScrubStats {
     /// affect the exit code (only mismatch / read-error / metadata-header
     /// errors do).
     pub sectors_stale: u64,
+    /// CSUM_TREE branches skipped as **stale mid-scrub** (freed/rewritten
+    /// by a live transaction while the run was in progress): their sectors
+    /// were NEVER verified this run.  This is a *coverage* counter, not a
+    /// metadata error — stale is normal churn (see `csum.rs`), so it does
+    /// NOT trigger METADATA FATAL — but a non-zero value means the run did
+    /// not check everything, so `main` refuses exit 0 while it is non-zero
+    /// (the operator reruns the scrub to cover those sectors).
+    pub stale_csum_branches: u64,
+    /// Read-runs where the EIO divide-and-conquer isolation budget was
+    /// exhausted (see `scrub.rs` `IsolationBudget`): the remaining sectors
+    /// of the run were marked unreadable without further probing.  They are
+    /// counted as `sectors_read_error` (so exit 0 is already blocked) and
+    /// flow through the unreadable parity-recovery path, never silently
+    /// skipped.  This counter just says *how many runs* were truncated, so
+    /// the summary explains why the read-error count is large.
+    pub isolation_truncated: u64,
     pub bytes_checked: u64,
     /// Metadata nodes whose *all* mirror copies failed header-checksum
     /// verification (DUP/RAID1 metadata with no good copy).  A single

@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.07d">
-<!ENTITY bundleversion "2026.08.07d">
+<!ENTITY version       "2026.08.07e">
+<!ENTITY bundleversion "2026.08.07e">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -15,6 +15,22 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.07e
+- Robust parity reconstruction on real arrays: device capacities for all
+  parity/other-disk reads are now queried from the kernel via BLKGETSIZE64
+  (the same source `blockdev --getsize64` uses), so the startup array
+  canary and parity recovery operate reliably on real block devices.
+- Hardened batched recovery: the per-batch freeze window is bounded by a
+  wall-clock guard (`--freeze-max`, default 60s), mid-run array
+  degradation is handled gracefully, and a run aborts cleanly if a frozen
+  filesystem cannot be thawed.
+- Coverage accounting: an EIO isolation budget surfaces read-error gaps
+  instead of silently under-scrubbing, stale-checksum branches are counted
+  once per run, and the final verdict reflects the true state of the data.
+- Open-path hardening: single-device filesystems are enforced with a clear
+  error (multi-device pool members would be misread), and a missing
+  DEV_TREE root can no longer panic the run.
 
 ###2026.08.07d
 - Scrubs now start almost immediately instead of stalling for minutes on

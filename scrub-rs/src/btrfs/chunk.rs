@@ -63,6 +63,33 @@ pub struct ChunkRecord {
     pub chunk: ChunkItem,
 }
 
+/// All profile bits in `btrfs_chunk.type` (the SINGLE profile is the
+/// absence of any profile bit).
+const PROFILE_MASK: u64 = bg_flag::RAID0
+    | bg_flag::RAID1
+    | bg_flag::DUP
+    | bg_flag::RAID10
+    | bg_flag::RAID5
+    | bg_flag::RAID6
+    | bg_flag::RAID1C3
+    | bg_flag::RAID1C4;
+
+/// Human-readable name of a chunk's profile bits (for diagnostics).
+pub fn profile_name(ty: u64) -> &'static str {
+    match ty & PROFILE_MASK {
+        0 => "SINGLE",
+        p if p == bg_flag::RAID0 => "RAID0",
+        p if p == bg_flag::RAID1 => "RAID1",
+        p if p == bg_flag::DUP => "DUP",
+        p if p == bg_flag::RAID10 => "RAID10",
+        p if p == bg_flag::RAID5 => "RAID5",
+        p if p == bg_flag::RAID6 => "RAID6",
+        p if p == bg_flag::RAID1C3 => "RAID1C3",
+        p if p == bg_flag::RAID1C4 => "RAID1C4",
+        _ => "UNKNOWN",
+    }
+}
+
 /// Parse a sequence of (Key, CHUNK_ITEM) records out of a raw byte buffer —
 /// used for the superblock's system-chunk array.
 pub fn parse_sys_chunks(buf: &[u8]) -> Vec<ChunkRecord> {
@@ -234,6 +261,43 @@ impl ChunkMap {
         self.entries.is_empty()
     }
 
+    /// H9: reject any DATA chunk whose profile is not SINGLE or DUP.  A
+    /// striped data chunk (RAID0/RAID10/RAID5/RAID6) cannot be mapped
+    /// linearly by the physical-order scrub — a dev-extent is not a
+    /// contiguous sub-range of the chunk's logical space, so
+    /// `phys - dev_extent.phys_start` would silently point at the wrong
+    /// sectors.  The caller ([`crate::btrfs::open`]) refuses the device
+    /// on the first such chunk.
+    ///
+    /// Metadata/system chunks are deliberately NOT checked: a
+    /// single-device filesystem can legally hold RAID1/RAID1C3 metadata
+    /// (e.g. after a dup→raid1 convert), and those trees are verified at
+    /// walk time rather than linearly mapped.
+    pub fn validate_data_profiles(&self) -> std::io::Result<()> {
+        for e in &self.entries {
+            if e.ty & bg_flag::DATA == 0 {
+                continue;
+            }
+            let profile = e.ty & PROFILE_MASK;
+            // SINGLE is the zero profile; DUP is the only non-SINGLE
+            // profile the linear physical-order scrub supports (both
+            // copies live on the same device, each as a contiguous range).
+            if profile != 0 && profile != bg_flag::DUP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "data chunk at logical 0x{:x} uses profile {} — only SINGLE and DUP \
+                         data chunks are supported (striped RAID profiles cannot be mapped \
+                         linearly by this tool)",
+                        e.begin,
+                        profile_name(profile)
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Debug helper: list every chunk, mirroring the Python output.
     pub fn dump(&self) {
         for e in &self.entries {
@@ -251,5 +315,65 @@ impl ChunkMap {
                 stripes.join(", ")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(logical: u64, ty: u64) -> ChunkRecord {
+        ChunkRecord {
+            logical,
+            chunk: ChunkItem {
+                length: 1 << 20,
+                stripe_len: 64 * 1024,
+                ty,
+                num_stripes: 1,
+                stripes: vec![Stripe {
+                    devid: 1,
+                    offset: 0,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn data_single_and_dup_are_accepted() {
+        let mut m = ChunkMap::default();
+        m.insert(&rec(0x1000_0000, bg_flag::DATA)); // SINGLE data
+        m.insert(&rec(0x2000_0000, bg_flag::DATA | bg_flag::DUP)); // DUP data
+        assert!(m.validate_data_profiles().is_ok());
+    }
+
+    #[test]
+    fn striped_data_chunk_is_rejected() {
+        for profile in [
+            bg_flag::RAID0,
+            bg_flag::RAID1,
+            bg_flag::RAID10,
+            bg_flag::RAID5,
+            bg_flag::RAID6,
+            bg_flag::RAID1C3,
+            bg_flag::RAID1C4,
+        ] {
+            let mut m = ChunkMap::default();
+            m.insert(&rec(0x1000_0000, bg_flag::DATA | profile));
+            let err = m.validate_data_profiles().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("logical 0x1000000"), "{msg}");
+            assert!(msg.contains("RAID"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn metadata_raid1_is_not_rejected() {
+        // A single-device FS can legally hold RAID1 metadata (dup→raid1
+        // convert); the tree-walk verification handles it — only DATA
+        // chunk profiles are gated.
+        let mut m = ChunkMap::default();
+        m.insert(&rec(0x1000_0000, bg_flag::METADATA | bg_flag::RAID1));
+        m.insert(&rec(0x2000_0000, bg_flag::DATA)); // healthy data chunk
+        assert!(m.validate_data_profiles().is_ok());
     }
 }

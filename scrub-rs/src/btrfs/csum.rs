@@ -167,8 +167,8 @@ pub fn build_csum_map(
 /// (self-heal-recoverable).  Reported as `metadata_mirror_mismatches` so a
 /// single corrupt DUP metadata copy is not silently healed.
 ///
-/// The three dedup sets hold one `u64` (node bytenr) per *failed* node —
-/// O(#failed nodes) memory, zero on a healthy filesystem.
+/// The four dedup sets hold one `u64` (node bytenr) per *skipped/failed*
+/// node — O(#skipped nodes) memory, zero on a healthy filesystem.
 pub struct LazyCsumProvider {
     /// Independent file handle dup'd from the main reader so the walker's
     /// seek position never races the main reader's metadata reads.
@@ -191,6 +191,18 @@ pub struct LazyCsumProvider {
     /// bytes could not be fetched at all.  Folded into the scrub's
     /// `metadata_read_errors` by the driver.
     metadata_read_errors: u64,
+    /// Distinct CSUM_TREE nodes skipped as **stale** by the per-`range`
+    /// walks (only verifiable copies have wrong generation/owner — the
+    /// block was freed and repurposed by a live transaction).  A stale
+    /// branch is normal churn, NOT a metadata error: its data was retired
+    /// or rewritten, so there is nothing to check.  But it IS a coverage
+    /// gap — the sectors it covered were never verified this run — so it
+    /// is counted into [`stale_branches`] (surfaced as
+    /// `ScrubStats::stale_csum_branches`, which refuses exit 0) rather
+    /// than silently dropped.
+    stale_branches: u64,
+    /// Bytenrs of CSUM_TREE nodes already counted in `stale_branches`.
+    reported_stale: HashSet<u64>,
     /// Bytenrs of CSUM_TREE nodes already counted in `metadata_errors`
     /// (header-verify failure).  Both DUP mirrors of a node share its
     /// logical bytenr, so this is the exact node identity; `insert`
@@ -251,6 +263,8 @@ impl LazyCsumProvider {
             metadata_errors: 0,
             mirror_mismatches: 0,
             metadata_read_errors: 0,
+            stale_branches: 0,
+            reported_stale: HashSet::new(),
             reported_header: HashSet::new(),
             reported_mirror: HashSet::new(),
             reported_read: HashSet::new(),
@@ -279,6 +293,15 @@ impl LazyCsumProvider {
     /// of the run.
     pub fn metadata_read_errors(&self) -> u64 {
         self.metadata_read_errors
+    }
+
+    /// Number of distinct CSUM_TREE nodes skipped as **stale** by the
+    /// per-`range` walks (deduplicated by node bytenr).  A coverage gap,
+    /// not a metadata error: the branches' sectors were never verified
+    /// this run.  Folded into the scrub's `stale_csum_branches` at the end
+    /// of the run (which refuses exit 0 while non-zero).
+    pub fn stale_branches(&self) -> u64 {
+        self.stale_branches
     }
 
     /// Stream `(logical, csum)` entries in ascending logical order for the
@@ -368,9 +391,11 @@ impl LazyCsumProvider {
             reported_header,
             reported_mirror,
             reported_read,
+            reported_stale,
             metadata_errors,
             mirror_mismatches,
             metadata_read_errors,
+            stale_branches,
             ..
         } = self;
         let res = walk_leaves_range(
@@ -419,11 +444,22 @@ impl LazyCsumProvider {
             // owner — the block was freed and repurposed by a live
             // transaction): an *expired branch*, i.e. normal churn.  The
             // data it covered was retired or rewritten, so there is
-            // nothing to check and nothing to report — silently skipped,
-            // never counted (see tree.rs `on_stale`).  Counting this would
-            // turn routine filesystem activity on a busy live array into
-            // false metadata-fatal results.
-            |_logical| {},
+            // nothing to check and nothing to report as a metadata ERROR
+            // (counting it as one would turn routine filesystem activity
+            // on a busy live array into false metadata-fatal results).  It
+            // IS a coverage gap, though: those sectors were never verified
+            // this run.  Count the branch once per run (deduplicated like
+            // the failure sets) into `stale_branches` / the live status
+            // counter, so `main` refuses exit 0 while any sectors were
+            // skipped this way.
+            |logical| {
+                if reported_stale.insert(logical) {
+                    *stale_branches += 1;
+                    if let Some(c) = counters {
+                        c.stale_csum_branches.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            },
             // Mirror divergence (good copy recovered): counted once per
             // distinct node, live-bumped the same way.
             |logical| {

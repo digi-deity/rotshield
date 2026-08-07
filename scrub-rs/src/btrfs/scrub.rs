@@ -40,6 +40,7 @@
 //! (512 MiB at depth 4 / the default `MAX_RUN_SECTORS` cap), independent
 //! of disk size.
 
+use std::io;
 use std::sync::mpsc;
 use std::thread;
 
@@ -81,6 +82,66 @@ const MAX_RUN_SECTORS: usize = 16384; // 16384 * 4096 = 64 MiB at default sector
 /// case) isolate in a single level regardless of this value.  See
 /// `docs/EIO-robustness-design.md` §5.1.
 const EIO_SPLIT_FACTOR: usize = 8;
+
+/// Upper bound on FAILING reads one run's EIO divide-and-conquer may
+/// consume before the remaining sectors of the run are marked bad
+/// wholesale (H1 — see [`IsolationBudget`]).  A full 64 MiB run whose
+/// every sector fails would otherwise expand to ~18k failing reads, each
+/// costing seconds of firmware retries on a dying disk; 64 caps that
+/// storm while leaving plenty of headroom for the common case (each
+/// truly-bad sector costs ~`log8(16384)` ≈ 5 failing reads, so 64
+/// isolates ~12 bad sectors precisely before giving up and downgrading
+/// the rest of the region to unreadable).
+///
+/// Overridable with `ROTSHIELD_ISOLATION_BUDGET` (a positive integer),
+/// parsed once per process; anything invalid falls back to this default.
+const MAX_ISOLATION_FAILING_READS: usize = 64;
+
+/// Per-run budget for the EIO divide-and-conquer.  Bounds how many
+/// failing reads one run's isolation may spend before it stops probing
+/// and marks every remaining sector of the run bad (unreadable) instead
+/// of recursing down to sector granularity forever — a large bad region
+/// on a dying disk must not turn a single 64 MiB run into ~18k firmware-
+/// retry reads that stall the scrub, the pipeline, and (via the plugin
+/// lock) all future runs for hours.
+///
+/// Marking sectors bad without probing is safe by design: they flow into
+/// the same unreadable-candidate machinery as genuinely-EIO sectors
+/// (counted as read errors; in batch mode parity-recovered with the
+/// write gated by the stored-csum verifier), never silently skipped.
+/// The exact-partition invariants of [`isolate_run`] are preserved — the
+/// whole run is still covered exactly once (good regions + bad sectors),
+/// just with the unprobed tail recorded as bad.
+struct IsolationBudget {
+    /// Failing reads remaining before the budget is exhausted.
+    remaining: usize,
+    /// Set once the budget ran out mid-run; remaining sectors were marked
+    /// bad without probing.
+    exhausted: bool,
+}
+
+impl IsolationBudget {
+    fn new() -> Self {
+        Self {
+            remaining: isolation_budget_limit(),
+            exhausted: false,
+        }
+    }
+}
+
+/// Resolve the isolation budget limit: [`MAX_ISOLATION_FAILING_READS`]
+/// unless `ROTSHIELD_ISOLATION_BUDGET` (parsed once) overrides it.
+fn isolation_budget_limit() -> usize {
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("ROTSHIELD_ISOLATION_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(MAX_ISOLATION_FAILING_READS)
+    })
+}
 
 /// Pipeline depth (number of in-flight `ReadCmd`s / `ReadRsp`s on each
 /// side of the scrub reader thread).  Greater than 1 lets the reader
@@ -165,6 +226,12 @@ enum ReadRsp {
         good: Vec<(usize, Vec<u8>)>,
         /// Sector-aligned byte starts of the sectors that failed (EIO set).
         bad: Vec<usize>,
+        /// True when the run's EIO isolation budget was exhausted (H1):
+        /// probing stopped early and the remaining sectors were marked
+        /// `bad` without being read.  The main thread counts it into
+        /// `ScrubStats::isolation_truncated` and surfaces it in the
+        /// summary.
+        isolation_truncated: bool,
     },
 }
 
@@ -229,6 +296,15 @@ pub struct ScrubStats {
     /// `sectors_mismatch` and does not trigger recovery.  Folded into
     /// [`crate::fs::ScrubStats::sectors_stale`] by the driver.
     pub sectors_stale: u64,
+    /// CSUM_TREE branches skipped as stale mid-scrub (coverage gap, H8):
+    /// set once at the end of the walk from the csum provider's
+    /// per-run count; folded into
+    /// [`crate::fs::ScrubStats::stale_csum_branches`] by the driver.
+    pub stale_csum_branches: u64,
+    /// Read-runs where the EIO isolation budget was exhausted (H1):
+    /// incremented by [`process_isolated`]; folded into
+    /// [`crate::fs::ScrubStats::isolation_truncated`] by the driver.
+    pub isolation_truncated: u64,
     pub bytes_checked: u64,
     /// Metadata nodes whose *all* mirror copies failed header-checksum
     /// verification (DUP/RAID1 metadata with no good copy).  The data-scrub
@@ -302,7 +378,7 @@ pub fn scrub_dev_tree<F>(
     batch: bool,
     counters: Option<&StatusCounters>,
     mut on_sector: F,
-) -> ScrubStats
+) -> io::Result<ScrubStats>
 where
     F: FnMut(&SectorResult),
 {
@@ -363,7 +439,7 @@ where
             // never; the loop below will detect cmd_tx is None and use the
             // main `reader` directly.  Keep the function correct at the
             // cost of throughput when fd dup fails (rare on Linux).
-            return scrub_dev_tree_inline(
+            return Ok(scrub_dev_tree_inline(
                 reader,
                 chunk_map,
                 csum_provider,
@@ -372,7 +448,7 @@ where
                 batch,
                 counters,
                 on_sector,
-            );
+            ));
         }
     };
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<ReadCmd>(prefetch_depth);
@@ -495,6 +571,16 @@ where
     // preserving strict FIFO response ordering.
     let mut inflight: usize = 0;
 
+    // Set when the pipelined reader thread dies or a response is lost
+    // mid-run.  The run must then be reported as a HARD failure (`Err`)
+    // instead of returning partial stats that look internally consistent
+    // (the C7 verdict-integrity fix: a dead reader must never shrink the
+    // verdict into a false "clean").  `Cell` (interior mutability) so both
+    // the `flush` closure (sets it) and the csum range closure (reads it)
+    // can capture it without a borrow conflict — this is single-threaded
+    // (the main/scrub thread), so `Cell` is safe here.
+    let pipeline_failed = std::cell::Cell::new(false);
+
     for (dev_extent_idx, dext) in dev_extents.iter().enumerate() {
         // Resolve the owning chunk.  Every dev-extent must have a matching
         // chunk item; if not, the chunk map is inconsistent with the dev
@@ -591,7 +677,7 @@ where
         // reconfirm walk, `on_sector` for the mismatch emit, `stats` for
         // counters, plus the channel endpoints.
         let mut flush = |run: &mut Vec<(u64, Vec<u8>)>| {
-            if run.is_empty() {
+            if run.is_empty() || pipeline_failed.get() {
                 return;
             }
             let run_phys = dext.phys_start + (run[0].0 - dext.chunk_offset);
@@ -605,8 +691,15 @@ where
             };
             // 1. Send the cmd.  The command channel itself is bounded to
             //    `prefetch_depth` slots, so this blocks only if the
-            //    reader thread is already that far behind.
+            //    reader thread is already that far behind.  A send error
+            //    means the reader thread is GONE (its `cmd_rx` was
+            //    dropped, only possible via thread exit/panic while we
+            //    still own `cmd_tx`) — the pending run must NOT be
+            //    silently dropped as if it never existed: mark the
+            //    pipeline failed so the whole scrub is reported as a hard
+            //    error instead of partial-looking stats (C7).
             if cmd_tx.send(cmd).is_err() {
+                pipeline_failed.set(true);
                 return;
             }
             inflight += 1;
@@ -614,20 +707,32 @@ where
             //    cmds accumulate — this is what lets the reader thread
             //    read several runs ahead of the checksum work instead of
             //    stalling on a 1:1 send/recv lockstep.
-            if inflight >= prefetch_depth
-                && let Ok(rsp) = rsp_rx.recv()
-            {
-                inflight -= 1;
-                process_rsp(
-                    rsp,
-                    reader,
-                    chunk_map,
-                    strategy,
-                    batch,
-                    counters,
-                    &mut on_sector,
-                    &mut stats,
-                );
+            if inflight >= prefetch_depth {
+                match rsp_rx.recv() {
+                    Ok(rsp) => {
+                        inflight -= 1;
+                        process_rsp(
+                            rsp,
+                            reader,
+                            chunk_map,
+                            strategy,
+                            batch,
+                            counters,
+                            &mut on_sector,
+                            &mut stats,
+                        );
+                    }
+                    Err(_) => {
+                        // Reader thread died mid-flight: a response we are
+                        // owed will never arrive.  Mark the pipeline failed
+                        // (the drain/join below surface it as a hard Err)
+                        // and stop issuing further cmds — the caller's
+                        // `pipeline_failed` guards stop buffering.  (This
+                        // arm is the closure's last statement, so the
+                        // closure ends here.)
+                        pipeline_failed.set(true);
+                    }
+                }
             }
         };
 
@@ -638,6 +743,12 @@ where
         // CSUM_TREE metadata failures discovered by this walk are counted
         // (deduplicated) and live-bumped into the shared status counters.
         csum_provider.range(logical_lo, logical_hi, counters, |e| {
+            if pipeline_failed.get() {
+                // Pipeline died: stop buffering.  (Flush refuses to take
+                // the run while failed, so pushing here would grow `run`
+                // without bound past MAX_RUN_SECTORS.)
+                return;
+            }
             let contiguous = match prev_logical {
                 Some(p) => e.logical == p + sector_size,
                 None => true,
@@ -650,6 +761,12 @@ where
         });
         // Flush the trailing run for this dev-extent.
         flush(&mut run);
+        if pipeline_failed.get() {
+            // Abort the physical pass: the reader thread is gone; further
+            // dev-extents would only accumulate unprocessed runs.  The
+            // final drain/join below reports the failure as a hard Err.
+            break;
+        }
 
         // Coarse progress: this DATA dev-extent's physical bytes are now
         // fully scrubbed.  Bump the numerator by the extent's full length
@@ -668,6 +785,9 @@ where
     // knows no more cmds are coming, then block-receive (in strict FIFO
     // order — never `try_recv`, see `docs/PROGRESS_HDD_BURST.md`) every
     // remaining outstanding response before joining the reader thread.
+    // A response lost here (recv error while responses are still owed)
+    // means the reader thread died mid-flight — the run is incomplete and
+    // must be reported as a hard error (C7), not as partial-looking stats.
     drop(cmd_tx);
     while inflight > 0 {
         match rsp_rx.recv() {
@@ -684,12 +804,32 @@ where
                     &mut stats,
                 );
             }
-            Err(_) => break,
+            Err(_) => {
+                pipeline_failed.set(true);
+                break;
+            }
         }
     }
-    let _ = reader_handle.join();
-
-    stats
+    // An abnormal join (the reader thread panicked) is a hard failure too:
+    // whatever the reader did not ship is missing from the verdict, and the
+    // remaining stats must not be reported as a complete scrub.
+    if reader_handle.join().is_err() {
+        eprintln!("error: scrub reader thread panicked — results are incomplete");
+        pipeline_failed.set(true);
+    }
+    if pipeline_failed.get() {
+        return Err(io::Error::other(
+            "scrub pipeline failed: the reader thread died or responses were lost — \
+             results are incomplete (not a clean scrub)",
+        ));
+    }
+    // Fold the csum provider's per-run stale-branch coverage counter into
+    // the stats (H8): CSUM_TREE branches skipped as stale mid-scrub were
+    // never verified — a coverage gap that must refuse exit 0.  The
+    // provider is per-run and only mutated by the `range` walks above, so
+    // its total is exact for this scrub call.
+    stats.stale_csum_branches = csum_provider.stale_branches();
+    Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +887,7 @@ where
             // region, no bad sectors — the degenerate happy path.
             let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
             let mut bad: Vec<usize> = Vec::new();
+            let mut budget = IsolationBudget::new();
             {
                 let mut read = |phys: u64, len: usize| reader.read_physical(dext.devid, phys, len);
                 isolate_run(
@@ -755,6 +896,7 @@ where
                     0,
                     run_len,
                     sector_size,
+                    &mut budget,
                     &mut good,
                     &mut bad,
                 );
@@ -762,6 +904,7 @@ where
             process_isolated(
                 good,
                 bad,
+                budget.exhausted,
                 dext,
                 run,
                 strategy,
@@ -794,6 +937,8 @@ where
         }
     }
 
+    // Same stale-branch coverage fold as the pipelined path (H8).
+    stats.stale_csum_branches = csum_provider.stale_branches();
     stats
 }
 
@@ -882,6 +1027,7 @@ fn process_buf(
                 reader,
                 chunk_map,
                 reader.base_offset(),
+                counters,
             ) {
                 Some((ext_root, csum_root)) => {
                     use crate::btrfs::extent::reconfirm_mismatch;
@@ -899,7 +1045,23 @@ fn process_buf(
                         crate::fs::Reconfirm::Corruption
                     )
                 }
-                None => true,
+                None => {
+                    // The live trees could not be re-read at all (C3):
+                    // this is NOT proof of corruption — the sector may
+                    // have been freed/reused by a transaction we cannot
+                    // see.  Report it as a READ error (coverage gap) —
+                    // never as a mismatch (which would trigger a
+                    // recovery write) and never as stale (which would
+                    // hide it) — and do not emit a candidate.  The
+                    // metadata-error counters for the root-level
+                    // failure itself were already bumped inside
+                    // `live_data_tree_roots`.
+                    stats.sectors_read_error += 1;
+                    if let Some(c) = counters {
+                        c.sectors_read_error.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
             };
             // `reconfirm_mismatch` only checks TREE state (does the live
             // CSUM_TREE still expect `stored` here?) — it never re-reads
@@ -967,9 +1129,21 @@ fn process_rsp(
         entries,
         good,
         bad,
+        isolation_truncated,
     } = rsp;
     process_isolated(
-        good, bad, &dext, &entries, strategy, batch, counters, reader, chunk_map, on_sector, stats,
+        good,
+        bad,
+        isolation_truncated,
+        &dext,
+        &entries,
+        strategy,
+        batch,
+        counters,
+        reader,
+        chunk_map,
+        on_sector,
+        stats,
     );
 }
 
@@ -990,12 +1164,14 @@ fn process_rsp(
 fn isolate_run_read(f: &std::fs::File, off: u64, cmd: ReadCmd) -> ReadRsp {
     let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut bad: Vec<usize> = Vec::new();
+    let mut budget = IsolationBudget::new();
     isolate_run(
         &mut |phys: u64, len: usize| pread_at(f, phys, len),
         off,
         0,
         cmd.len,
         cmd.sector_size,
+        &mut budget,
         &mut good,
         &mut bad,
     );
@@ -1004,6 +1180,10 @@ fn isolate_run_read(f: &std::fs::File, off: u64, cmd: ReadCmd) -> ReadRsp {
         entries: cmd.entries,
         good,
         bad,
+        // The reader thread is where the budget lives; the flag rides the
+        // response so the main thread can count the truncated run into
+        // `ScrubStats::isolation_truncated` (H1).
+        isolation_truncated: budget.exhausted,
     }
 }
 
@@ -1045,14 +1225,34 @@ fn isolate_run_read(f: &std::fs::File, off: u64, cmd: ReadCmd) -> ReadRsp {
 /// - Pieces are visited strictly left-to-right, so `good`/`bad` stay
 ///   ascending (which `process_isolated` relies on to slice `entries`).
 ///
+/// ## Isolation budget (H1)
+///
+/// `budget` bounds the number of FAILING reads the run may spend.  When
+/// the budget is exhausted mid-recursion, probing stops and **every
+/// remaining sector of the run is recorded as bad** (unreadable) without
+/// further reads — the recursion never continues past the budget.  The
+/// exact-partition guarantee is preserved: the unprobed tail is still
+/// covered exactly once (as bad sectors), so no sector is skipped or
+/// double-counted.  A bad sector here means "treated as unreadable", the
+/// same treatment a genuinely-EIO sector gets: counted as a read error
+/// and (in batch mode) parity-recovered with the write gated by the
+/// stored-csum verifier.  `budget.exhausted` tells the caller the run was
+/// truncated so it can be surfaced in the summary.
+///
 /// This guarantees the bad set is exactly the physically-bad sectors and
-/// the good set is everything else — no whole-run discard, no blast radius.
+/// the good set is everything else — no whole-run discard, no blast radius
+/// — except that a budget-truncated run records its unprobed tail as bad
+/// instead of probing it (a deliberate trade: a dying disk's firmware
+/// retry storm is worse than treating a region as unreadable, and the
+/// unreadable machinery is verifier-gated).
+#[allow(clippy::too_many_arguments)]
 fn isolate_run(
     read: &mut impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
     phys: u64,
     start: usize,
     len: usize,
     sector_size: u64,
+    budget: &mut IsolationBudget,
     good: &mut Vec<(usize, Vec<u8>)>,
     bad: &mut Vec<usize>,
 ) {
@@ -1072,22 +1272,57 @@ fn isolate_run(
     if len == 0 {
         return;
     }
+    // Budget already exhausted by an earlier piece of this run: stop
+    // probing entirely and mark the rest of the range bad wholesale.
+    // Exact-partition preserved (see the doc): the range is sector-aligned
+    // on both ends, so `nsec` is exact and the starts stay ascending.
+    if budget.exhausted {
+        let nsec = len / sz;
+        for i in 0..nsec {
+            bad.push(start + i * sz);
+        }
+        return;
+    }
     // Base case: this range is exactly one sector.  Try to read it; a
     // failure is a true EIO sector.
     if len <= sz {
         match read(phys, len) {
             Ok(buf) => good.push((start, buf)),
-            Err(_) => bad.push(start),
+            Err(_) => {
+                budget.remaining = budget.remaining.saturating_sub(1);
+                if budget.remaining == 0 {
+                    budget.exhausted = true;
+                }
+                bad.push(start);
+            }
         }
         return;
     }
     // Try the whole range first — a transient failure that reads fine on
     // retry is simply good data (exactly what we want).
-    if let Ok(buf) = read(phys, len) {
-        // Only accept as a good region when sector-aligned on both ends.
-        if start.is_multiple_of(sz) && len.is_multiple_of(sz) {
-            good.push((start, buf));
-            return;
+    match read(phys, len) {
+        Ok(buf) => {
+            // Only accept as a good region when sector-aligned on both ends.
+            if start.is_multiple_of(sz) && len.is_multiple_of(sz) {
+                good.push((start, buf));
+                return;
+            }
+        }
+        Err(_) => {
+            budget.remaining = budget.remaining.saturating_sub(1);
+            if budget.remaining == 0 {
+                // Budget exhausted: stop probing.  Mark every sector of
+                // this range bad (the unreadable treatment) — the
+                // recursion ends here and later pieces hit the
+                // `budget.exhausted` guard above, so the whole run is
+                // still covered exactly once.
+                budget.exhausted = true;
+                let nsec = len / sz;
+                for i in 0..nsec {
+                    bad.push(start + i * sz);
+                }
+                return;
+            }
         }
     }
     // Split into `k` sector-aligned pieces and recurse left-to-right so
@@ -1110,6 +1345,7 @@ fn isolate_run(
             start + off,
             piece_len,
             sector_size,
+            budget,
             good,
             bad,
         );
@@ -1131,6 +1367,7 @@ fn isolate_run(
 fn process_isolated(
     good: Vec<(usize, Vec<u8>)>,
     bad: Vec<usize>,
+    isolation_truncated: bool,
     dext: &DevExtent,
     entries: &[(u64, Vec<u8>)],
     strategy: &CsumStrategy,
@@ -1142,6 +1379,24 @@ fn process_isolated(
     stats: &mut ScrubStats,
 ) {
     let sz = strategy.sector_size as usize;
+
+    // 0. Budget-truncated run (H1): the EIO isolation gave up probing
+    //    after `MAX_ISOLATION_FAILING_READS` failing reads and marked the
+    //    remaining sectors bad wholesale.  They are counted as read errors
+    //    (step 2) and flow through the unreadable recovery path, never
+    //    silently skipped — but surface the truncation once per run so the
+    //    summary explains the large read-error count.
+    if isolation_truncated {
+        stats.isolation_truncated += 1;
+        if let Some(c) = counters {
+            c.isolation_truncated.fetch_add(1, Ordering::Relaxed);
+        }
+        eprintln!(
+            "note: EIO isolation budget exhausted for this run — remaining sectors \
+             marked unreadable without further probing (device likely failing; \
+             unreadable sectors are parity-recovered with verifier-gated writes)"
+        );
+    }
 
     // 1. Re-verify every good region (restore the coverage the old whole-run
     //    discard lost).  Each good region is sector-aligned, so slice it
@@ -1255,12 +1510,14 @@ mod tests {
         };
         let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut bad: Vec<usize> = Vec::new();
+        let mut budget = IsolationBudget::new();
         isolate_run(
             &mut |p, l| r.read(p, l),
             0,
             0,
             8 * 4096,
             4096,
+            &mut budget,
             &mut good,
             &mut bad,
         );
@@ -1300,12 +1557,14 @@ mod tests {
         };
         let mut good = Vec::new();
         let mut bad = Vec::new();
+        let mut budget = IsolationBudget::new();
         isolate_run(
             &mut |p, l| r.read(p, l),
             0,
             0,
             4 * 4096,
             4096,
+            &mut budget,
             &mut good,
             &mut bad,
         );
@@ -1331,12 +1590,14 @@ mod tests {
         };
         let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut bad: Vec<usize> = Vec::new();
+        let mut budget = IsolationBudget::new();
         isolate_run(
             &mut |p, l| r.read(p, l),
             0,
             0,
             10 * 4096,
             4096,
+            &mut budget,
             &mut good,
             &mut bad,
         );
@@ -1383,12 +1644,14 @@ mod tests {
         };
         let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut bad: Vec<usize> = Vec::new();
+        let mut budget = IsolationBudget::new();
         isolate_run(
             &mut |p, l| r.read(p, l),
             0,
             0,
             3 * 4096,
             4096,
+            &mut budget,
             &mut good,
             &mut bad,
         );
@@ -1408,5 +1671,87 @@ mod tests {
             "good sectors 0 and 2 must be covered"
         );
         assert!(!covered.contains(&1), "sector 1 must be bad");
+    }
+
+    #[test]
+    fn isolate_budget_exhaustion_marks_every_remaining_sector_bad_once() {
+        // A fully-failing 32-sector run with a tiny budget (4 failing
+        // reads): after the budget runs out, probing must stop and EVERY
+        // remaining sector must still be recorded bad exactly once — the
+        // exact-partition guarantee holds even when the recursion is cut
+        // short, so nothing is skipped or double-counted.
+        let data: Vec<u8> = vec![0u8; 32 * 4096];
+        let mut r = FaultyRead {
+            data,
+            fault: (0, usize::MAX),
+        };
+        let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut bad: Vec<usize> = Vec::new();
+        let mut budget = IsolationBudget {
+            remaining: 4,
+            exhausted: false,
+        };
+        isolate_run(
+            &mut |p, l| r.read(p, l),
+            0,
+            0,
+            32 * 4096,
+            4096,
+            &mut budget,
+            &mut good,
+            &mut bad,
+        );
+
+        assert!(budget.exhausted, "budget must be exhausted");
+        assert!(good.is_empty(), "no good regions when everything faults");
+        // Every sector 0..32 marked bad exactly once, ascending.
+        let mut seen = std::collections::BTreeSet::new();
+        for &s in &bad {
+            assert_eq!(s % 4096, 0, "bad start not sector-aligned: {s}");
+            assert!(
+                seen.insert(s / 4096),
+                "sector {} marked bad twice",
+                s / 4096
+            );
+        }
+        assert_eq!(seen.len(), 32, "every sector must be covered exactly once");
+    }
+
+    #[test]
+    fn isolate_budget_untouched_on_healthy_range() {
+        // A healthy run consumes zero failing reads: the budget is
+        // untouched and nothing is marked bad.
+        let mut data = Vec::new();
+        for i in 0..8u8 {
+            data.extend_from_slice(&sector(i));
+        }
+        // Fault outside the range (saturating, so it can never overlap).
+        let mut r = FaultyRead {
+            data,
+            fault: (usize::MAX, 1),
+        };
+        let mut good: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut bad: Vec<usize> = Vec::new();
+        let mut budget = IsolationBudget {
+            remaining: 4,
+            exhausted: false,
+        };
+        isolate_run(
+            &mut |p, l| r.read(p, l),
+            0,
+            0,
+            8 * 4096,
+            4096,
+            &mut budget,
+            &mut good,
+            &mut bad,
+        );
+
+        assert!(!budget.exhausted, "healthy run must not exhaust the budget");
+        assert_eq!(budget.remaining, 4, "no failing reads consumed");
+        assert!(bad.is_empty(), "no bad sectors on a healthy run");
+        // And the whole run came back as one good region.
+        let covered: usize = good.iter().map(|(_, b)| b.len()).sum();
+        assert_eq!(covered, 8 * 4096, "all sectors covered as good");
     }
 }

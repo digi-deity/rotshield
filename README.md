@@ -56,7 +56,22 @@ on a full test array in a controlled environment with parity disk(s).
 
 **Every fix is verified after it's written.** After a repaired block is
 written back, the tool reads it again and confirms the fix actually
-landed on the disk.
+landed on the disk. The read-back deliberately invalidates the raw
+rdev's buffer cache first, so the verification reads the device — not a
+page-cache echo of the write. A read-back that disagrees is counted
+`readback_failed` (never `recovered`) and escalates the run: it is the
+clearest "this disk is lying / failing" signal there is.
+
+**One honest caveat about live mounts.** The read-back proves the *raw
+device* holds the right bytes. It cannot update the mounted filesystem's
+*file* page cache: if the live mount already had a corrupt file range
+cached in memory before the repair, that cached copy can keep serving the
+old bytes to applications until memory pressure evicts it — even though
+the disk is now correct. When repairs are written under a live mount the
+tool prints a prominent advisory and the run's `status:` block carries
+`repaired_while_mounted=1`; the plugin escalates its notification. The
+safe play after any live-mount repair is to reboot or remount the disk
+(or drop caches) before trusting reads of the repaired files.
 
 **A repair only touches the targeted disk.** The other disks and the
 parity disk(s) are never modified because it bypasses the array. If a disk
