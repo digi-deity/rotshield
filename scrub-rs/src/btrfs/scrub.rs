@@ -634,8 +634,10 @@ where
         // The csum-provider callback drives the run coalescer: it streams
         // `(logical, csum)` pairs in ascending order for this dev-extent's
         // span, and the closure above flushes each completed run into the
-        // reader pipeline as it fills.
-        csum_provider.range(logical_lo, logical_hi, |e| {
+        // reader pipeline as it fills.  `counters` is threaded through so
+        // CSUM_TREE metadata failures discovered by this walk are counted
+        // (deduplicated) and live-bumped into the shared status counters.
+        csum_provider.range(logical_lo, logical_hi, counters, |e| {
             let contiguous = match prev_logical {
                 Some(p) => e.logical == p + sector_size,
                 None => true,
@@ -771,7 +773,7 @@ where
                 &mut stats,
             );
         };
-        csum_provider.range(logical_lo, logical_hi, |e| {
+        csum_provider.range(logical_lo, logical_hi, counters, |e| {
             let contiguous = match prev_logical {
                 Some(p) => e.logical == p + sector_size,
                 None => true,

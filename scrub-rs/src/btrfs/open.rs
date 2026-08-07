@@ -78,8 +78,8 @@ pub struct BtrfsContext {
     /// counterpart to `metadata_header_errors`: the filesystem can still
     /// read the good copy, but a correct scrub reports the divergence (as
     /// the kernel's `btrfs scrub` does) rather than healing it silently.
-    /// Filled in by [`verify_metadata_mirrors`] after the chunk/root-tree
-    /// walks; surfaced for visibility (does not affect the exit code on its
+    /// Filled in by the chunk-tree/root-tree walk callbacks during `open`;
+    /// surfaced for visibility (does not affect the exit code on its
     /// own, since the good copy means the data is intact).
     pub metadata_mirror_mismatches: u64,
     /// Number of metadata nodes that failed with a **read (device `EIO`)**
@@ -207,6 +207,12 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
             metadata_header_errors += 1;
         },
         |_logical| {
+            // A chunk-tree node whose only verifiable copies are stale
+            // (block freed/repurposed by a concurrent transaction): the
+            // filesystem moved on — normal churn, not an error.  Skip
+            // silently; staleness is never counted (see tree.rs `on_stale`).
+        },
+        |_logical| {
             // A mirrored (DUP) chunk-tree node whose copies disagree but
             // still has a good copy — self-heal-recoverable divergence.
             metadata_mirror_mismatches += 1;
@@ -250,6 +256,12 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         |_logical| {
             // A mirrored (DUP) root-tree node with no good copy — count it.
             metadata_header_errors += 1;
+        },
+        |_logical| {
+            // A root-tree node whose only verifiable copies are stale
+            // (block freed/repurposed by a concurrent transaction): the
+            // filesystem moved on — normal churn, not an error.  Skip
+            // silently.
         },
         |_logical| {
             // A mirrored (DUP) root-tree node whose copies disagree but
@@ -371,6 +383,12 @@ pub fn live_data_tree_roots(
         |_logical| {
             // A root-tree node with no good copy — we can't trust the walk;
             // treat as unverifiable and let the caller be conservative.
+        },
+        |_logical| {
+            // A root-tree node whose only verifiable copies are stale
+            // (concurrent churn): this walk only resolves tree roots, so a
+            // failure is conservative (the caller treats the sector as
+            // corruption) and not counted here.
         },
         |_logical| {
             // Mirror divergence on the live root tree: not counted here

@@ -82,10 +82,13 @@ pub struct BtrfsScrub {
     metadata_header_errors: u64,
     /// Mirrored (DUP/RAID1/…) metadata nodes whose copies disagree — at
     /// least one copy is header-valid but the copies are not byte-identical.
-    /// Counted by [`crate::btrfs::open::verify_metadata_mirrors`] during
-    /// `open()`; surfaced as `metadata_mirror_mismatches` so a single
-    /// corrupt DUP metadata copy is reported (self-heal-recoverable) rather
-    /// than silently healed by the good-copy cross-check.
+    /// Counted by the chunk/root/DEV-tree walk callbacks in
+    /// [`crate::btrfs::open`] during `open()` (plus CSUM_TREE mirror
+    /// divergences the per-range walks discover during the run, folded in
+    /// at the end of `run`); surfaced as `metadata_mirror_mismatches` so a
+    /// single corrupt DUP metadata copy is reported
+    /// (self-heal-recoverable) rather than silently healed by the good-copy
+    /// cross-check.
     metadata_mirror_mismatches: u64,
     /// Metadata nodes that failed with a READ (EIO) error during the
     /// chunk/root/DEV-tree walks — the bytes could not be fetched at all.
@@ -196,10 +199,13 @@ impl BtrfsScrub {
 
     /// Attach the shared live-status counters for the plugin's status
     /// server.  Glue — set by `main` before `run`; `None` by default so a
-    /// standalone scrub-rs behaves exactly as before.  The metadata-error
-    /// counters are already final after `open` (the chunk/root-tree walks
-    /// and the CSUM-tree header sweep run in the constructor), so they are
-    /// mirrored here immediately rather than only at the end of `run`.
+    /// standalone scrub-rs behaves exactly as before.  The open-time
+    /// metadata-error counters (chunk/root/DEV-tree walks in the
+    /// constructor) are final here, so they are mirrored immediately;
+    /// CSUM_TREE failures are discovered *during* the run by the per-range
+    /// walks, which live-bump the same shared counters via the `counters`
+    /// handle passed into [`crate::btrfs::scrub::scrub_dev_tree`] (and the
+    /// totals are folded into the final `ScrubStats` by `run`).
     pub fn set_status(&mut self, counters: Arc<StatusCounters>) {
         // Coarse progress denominator: the total physical length of the
         // DATA dev-extents the scrub loop will actually scrub, summed
@@ -235,6 +241,11 @@ impl BtrfsScrub {
             self.metadata_read_errors + self.csum_provider.metadata_read_errors(),
             Ordering::Relaxed,
         );
+        // Note: the csum-provider addends are 0 at this point (before
+        // `run`), since the provider does no work at construction — the
+        // per-range walks bump these atomics live during the run.  The
+        // adds are kept so the mirror is correct regardless of when
+        // `set_status` is called relative to `run`.
         self.status = Some(counters);
     }
 }
@@ -357,6 +368,11 @@ impl fs::FilesystemScrub for BtrfsScrub {
         // have been silently skipped — surfaced here as a single combined
         // counter so main.rs treats it as a hard error (non-zero →
         // non-zero exit).
+        //
+        // `metadata_mirror_mismatches` combines the open-time walks' count
+        // with the provider's per-walk mirror divergences
+        // ([`LazyCsumProvider::mirror_mismatches`]) — previously that
+        // second addend was collected but never folded into the stats.
         Ok(ScrubStats {
             sectors_checked: local.sectors_checked,
             sectors_ok: local.sectors_ok,
@@ -367,7 +383,8 @@ impl fs::FilesystemScrub for BtrfsScrub {
             bytes_checked: local.bytes_checked,
             metadata_header_errors: self.metadata_header_errors
                 + self.csum_provider.metadata_errors(),
-            metadata_mirror_mismatches: self.metadata_mirror_mismatches,
+            metadata_mirror_mismatches: self.metadata_mirror_mismatches
+                + self.csum_provider.mirror_mismatches(),
             metadata_read_errors: self.metadata_read_errors
                 + self.csum_provider.metadata_read_errors(),
         })

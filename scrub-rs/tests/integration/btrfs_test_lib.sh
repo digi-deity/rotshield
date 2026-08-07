@@ -507,6 +507,54 @@ with open('$img', 'r+b') as f:
   return 0
 }
 
+# corrupt_csum_tree_one_mirror <img> [leaf_bytenr]
+#
+# Like corrupt_csum_tree_whole, but corrupts ONLY the FIRST physical copy
+# of the chosen CSUM_TREE leaf (one DUP mirror).  The good mirror still
+# serves the leaf's csums, so the data scrub completes cleanly; the DUP
+# cross-check in read_node must surface the divergence as a recoverable
+# metadata mirror mismatch (metadata mirror : 1), never as a clean scrub
+# and never as data corruption.
+corrupt_csum_tree_one_mirror() {
+  local img="$1" leaf="${2:-}"
+  require_map_logical
+  if [[ -z "$leaf" ]]; then
+    # Same leaf selection as corrupt_csum_tree_whole: the 2nd csum leaf
+    # dump-tree walks (falls back to the first if there is only one).
+    leaf="$(btrfs inspect-internal dump-tree -t "$TREE_CSUM" "$img" 2>/dev/null \
+      | awk '/^leaf [0-9]+/{n++; if (n==2) {print $2; exit}} END{if (n<2) exit}')"
+    if [[ -z "$leaf" ]]; then
+      leaf="$(btrfs inspect-internal dump-tree -t "$TREE_CSUM" "$img" 2>/dev/null \
+        | awk '/^leaf [0-9]+/{print $2; exit}')"
+    fi
+  fi
+  if [[ -z "$leaf" ]]; then
+    log "corrupt_csum_tree_one_mirror: no CSUM_TREE leaf found"
+    return 1
+  fi
+  # Flip the first byte of the FIRST physical copy only (NR==1 of
+  # btrfs-map-logical's per-stripe listing).
+  local p
+  p="$(btrfs-map-logical -l "$leaf" "$img" 2>/dev/null | awk 'NR==1{print $6}')"
+  if [[ -z "$p" ]]; then
+    log "corrupt_csum_tree_one_mirror: no physical mapping for leaf $leaf"
+    return 1
+  fi
+  python3 - "$img" "$p" <<'PYEOF' 2>/dev/null
+import sys
+path, off = sys.argv[1], int(sys.argv[2])
+with open(path, 'r+b') as f:
+    f.seek(off)
+    b = f.read(1)
+    if not b:
+        sys.exit(1)
+    f.seek(off)
+    f.write(bytes([b[0] ^ 0xFF]))
+PYEOF
+  log "corrupt_csum_tree_one_mirror: corrupted first mirror of CSUM_TREE leaf $leaf"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Data population helpers
 # ---------------------------------------------------------------------------

@@ -29,6 +29,22 @@ use super::reader::FsReader;
 /// could not be recovered via the DUP cross-check; a single corrupt copy
 /// that has a good sibling is transparently skipped and never reported.
 ///
+/// `on_stale` is invoked for every node whose only verifiable copies are
+/// **stale**: header-checksum-valid but with bytenr/fsid/level/owner/
+/// generation fields that do not match what the parent pointer expects —
+/// i.e. the block was freed and repurposed by a later transaction after
+/// this walk's snapshot was taken.  On a live, churning filesystem that is
+/// normal retirement, not corruption: the branch has expired, the data it
+/// covered was retired or rewritten by the filesystem, and there is
+/// nothing left to check.  **Staleness is never an error** — every current
+/// call site passes a no-op here (the open-time walks included): the walk
+/// skips the expired branch silently, and the recovery path's
+/// deliberate re-check of live trees (`Reconfirm::Stale`) is the only
+/// place a stale classification is reported (as a resolved false
+/// positive).  The callback exists purely so the walk can route the two
+/// failure classes separately and so a caller could observe expiry in the
+/// future.
+///
 /// `on_mirror_mismatch` is invoked for every *mirrored* (DUP/RAID1/…) node
 /// whose copies **disagree** — at least one mirror is header-valid (so the
 /// block is still readable / self-healable) but not *every* mirror validated
@@ -73,18 +89,20 @@ struct NodeRef {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn walk_leaves<F, E, M, R>(
+pub fn walk_leaves<F, E, S, M, R>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
     f: F,
     on_metadata_error: E,
+    on_stale: S,
     on_mirror_mismatch: M,
     on_read_error: R,
 ) -> std::io::Result<()>
 where
     F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
     E: FnMut(u64),
+    S: FnMut(u64),
     M: FnMut(u64),
     R: FnMut(u64),
 {
@@ -95,6 +113,7 @@ where
         None,
         f,
         on_metadata_error,
+        on_stale,
         on_mirror_mismatch,
         on_read_error,
     )
@@ -119,7 +138,7 @@ where
 /// the whole scrub. Bounding the descent to the requested key window
 /// turns each call into O(range_size + log(tree_size)), independent of N.
 #[allow(clippy::too_many_arguments)]
-pub fn walk_leaves_range<F, E, M, R>(
+pub fn walk_leaves_range<F, E, S, M, R>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
@@ -127,12 +146,14 @@ pub fn walk_leaves_range<F, E, M, R>(
     key_hi: Key,
     f: F,
     on_metadata_error: E,
+    on_stale: S,
     on_mirror_mismatch: M,
     on_read_error: R,
 ) -> std::io::Result<()>
 where
     F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
     E: FnMut(u64),
+    S: FnMut(u64),
     M: FnMut(u64),
     R: FnMut(u64),
 {
@@ -143,25 +164,28 @@ where
         Some((key_lo, key_hi)),
         f,
         on_metadata_error,
+        on_stale,
         on_mirror_mismatch,
         on_read_error,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn walk_leaves_impl<F, E, M, R>(
+fn walk_leaves_impl<F, E, S, M, R>(
     reader: &mut FsReader,
     chunk_map: &ChunkMap,
     root_logical: u64,
     bounds: Option<(Key, Key)>,
     mut f: F,
     mut on_metadata_error: E,
+    mut on_stale: S,
     mut on_mirror_mismatch: M,
     mut on_read_error: R,
 ) -> std::io::Result<()>
 where
     F: FnMut(&mut FsReader, &Leaf, u64) -> std::io::Result<()>,
     E: FnMut(u64),
+    S: FnMut(u64),
     M: FnMut(u64),
     R: FnMut(u64),
 {
@@ -205,18 +229,30 @@ where
                 continue;
             }
         };
-        if res.all_mirrors_failed || res.generation_mismatch {
-            // We cannot verify this node's header against any mirror copy,
-            // or the only verifiable copy is stale (generation mismatch) — in
-            // either case we cannot trust it.  Skip this branch: do NOT
-            // descend into its children (an internal node would otherwise
-            // silently drop a subtree) and do NOT hand its items to the
-            // caller (a leaf would feed garbage).  The DUP cross-check already
-            // preferred a good copy when one existed, so reaching here means
-            // this branch is untrustworthy.  Report the error and continue
-            // with the rest of the queue so the other, still-reachable
-            // branches are still scrubbed.
+        if res.all_mirrors_failed {
+            // We cannot verify this node's header checksum against any
+            // mirror copy.  The bytes themselves are corrupt.  Skip this
+            // branch: do NOT descend into its children (an internal node
+            // would otherwise silently drop a subtree) and do NOT hand its
+            // items to the caller (a leaf would feed garbage).  Report the
+            // error and continue with the rest of the queue so the other,
+            // still-reachable branches are still scrubbed.
             on_metadata_error(logical);
+            continue;
+        }
+        if res.generation_mismatch {
+            // The only verifiable copies are header-valid but *stale*: the
+            // block at this bytenr is not the node this tree's parent
+            // pointer expects (its bytenr/fsid/level/owner/generation
+            // differ).  The filesystem freed and repurposed this block
+            // after this walk's snapshot was taken — an *expired branch*
+            // from live churn, not corruption.  The data it covered was
+            // retired or rewritten by the live filesystem, so there is
+            // nothing left to check and nothing to report: skip it
+            // silently via `on_stale`, which every current caller leaves
+            // as a no-op (staleness is the filesystem doing its job, not
+            // an error signal).
+            on_stale(logical);
             continue;
         }
         // The node is trustworthy (a good copy exists).  If its mirror

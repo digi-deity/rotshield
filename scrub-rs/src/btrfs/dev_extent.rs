@@ -107,6 +107,11 @@ pub fn build_dev_extents(
         // and report 0 mismatches with exit 0. Count it as a metadata
         // header error so the gap surfaces in the summary and exit code.
         |_logical| *metadata_header_errors += 1,
+        // A DEV_TREE node whose only verifiable copies are stale (block
+        // freed/repurposed by a concurrent transaction): the filesystem
+        // moved on — normal churn, not an error.  Skip silently (see
+        // tree.rs `on_stale`).
+        |_logical| {},
         |_logical| *metadata_mirror_mismatches += 1,
         // A DEV_TREE leaf that failed with a READ (EIO) error — the bytes
         // could not be fetched at all.  Skip + count so the gap surfaces

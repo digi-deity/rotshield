@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.07c">
-<!ENTITY bundleversion "2026.08.07c">
+<!ENTITY version       "2026.08.07d">
+<!ENTITY bundleversion "2026.08.07d">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -15,6 +15,25 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.07d
+- Scrubs now start almost immediately instead of stalling for minutes on
+  large disks. The old pre-scrub pass that read the entire CSUM_TREE to
+  count bad metadata leaves up front is gone (on a 12 TB disk that pass
+  read ~12-100 GB of checksum metadata before the first status update);
+  metadata failures are now counted live, as a side effect of the scrub
+  itself, deduplicated per node so the counts stay exact. Coverage
+  statistics and exit codes are unchanged.
+- Churn-proof metadata accounting: on a busy live filesystem, tree
+  branches that the filesystem retired mid-scrub are recognised as normal
+  churn and skipped silently — they no longer risk being reported as
+  metadata corruption. Only genuinely corrupt metadata (checksum-valid
+  copies gone) is reported; DUP mirror divergences continue to surface as
+  recoverable metadata mirror mismatches, including checksum-tree nodes.
+- Fix: a cancelled run no longer shows a phantom "dry-run):cancelled"
+  column — the status page and stop handler now match only the runner's
+  own per-device markers, so the interrupted disk's counters are shown
+  correctly after a manual stop.
 
 ###2026.08.07c
 - The status table now explains itself: every statistic row and every

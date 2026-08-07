@@ -285,6 +285,9 @@ fn find_file_sector(ctx: &mut FsContext, sector: usize) -> io::Result<(u64, u64,
         // craft-corrupt only needs the file's extents; it doesn't count
         // metadata-header errors.
         |_logical| {},
+        // Stale (freed/repurposed) nodes are normal churn, never errors —
+        // not counted here either.
+        |_logical| {},
         // Mirror-divergence reporting is not needed for extent enumeration.
         |_logical| {},
         // Read (EIO) errors are not counted for extent enumeration either.

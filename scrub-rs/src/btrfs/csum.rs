@@ -28,20 +28,33 @@
 //! (one CSUM leaf) keeps the next read overlapping with the previous
 //! dev-extent's data read.  Peak memory is bounded by the largest single
 //! block group's csum span (and an O(1) leaf buffer) — independent of disk
-//! size.  A separate open-time / per-walk counter increments
-//! [`LazyCsumProvider::metadata_errors`] for every CSUM_TREE leaf whose
-//! *all* mirror copies failed header-checksum verification (DUP/RAID1
-//! metadata with no good copy), preserving the previous undercoverage
+//! size.
+//!
+//! **Metadata-failure accounting is a side effect of the per-range walks —
+//! there is no open-time tree pass.**  CSUM_TREE nodes whose *all* mirror
+//! copies fail header-checksum verification (DUP/RAID1 metadata with no
+//! good copy) are counted by [`LazyCsumProvider::metadata_errors`] as the
+//! `range()` walks encounter them, deduplicated by node bytenr so each
+//! node is counted exactly once per run even when several dev-extents'
+//! range walks re-read the same leaf.  This preserves the undercoverage
 //! semantics (a corrupted CSUM_TREE leaf yielding fewer/no csums surfaces
-//! as `metadata_header_errors`, never as silent exit 0).
+//! as `metadata_header_errors`, never as silent exit 0) without paying a
+//! full-tree I/O pass up front: a node is counted iff a range walk
+//! actually needed to read it.  Bad leaves whose entire span lies in a
+//! freed block group (no dev-extent exists for them) are never read and
+//! therefore never counted — they cover no live data, so no coverage gap
+//! occurred.  Dedup-set memory is O(#failed nodes): zero on a healthy
+//! filesystem, bounded by tree size only in the pathological case.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::Ordering;
 
 use super::chunk::ChunkMap;
 use super::csum_strategy::CsumStrategy;
 use super::key::{Key, key_type, objectid};
 use super::reader::FsReader;
 use super::tree::{walk_leaves, walk_leaves_range};
+use crate::status::StatusCounters;
 
 /// Map from sector-aligned logical address → stored checksum bytes.
 ///
@@ -112,6 +125,9 @@ pub fn build_csum_map(
         // count them (they would otherwise cause silent undercoverage with
         // exit 0 — a corrupted CSUM_TREE leaf yielding fewer/no csums).
         |_logical| *metadata_header_errors += 1,
+        // Stale (freed/repurposed) nodes are normal churn, never errors —
+        // not counted (see tree.rs `on_stale`).
+        |_logical| {},
         |_logical| *metadata_mirror_mismatches += 1,
         |_logical| *metadata_read_errors += 1,
     )?;
@@ -123,29 +139,36 @@ pub fn build_csum_map(
 // ---------------------------------------------------------------------------
 
 /// An on-demand, bounded-memory CSUM_TREE walker.  The scrub calls
-/// [`LazyCsumProvider::range`] (or the streaming [`range_iter`]) once per
-/// dev-extent's logical `[lo, hi)` span; the provider walks just the
-/// CSUM_TREE leaves overlapping that span and yields `(logical, csum)`
-/// pairs in ascending logical order, in O(1) memory beyond a small leaf
-/// read-ahead buffer.
+/// [`LazyCsumProvider::range`] once per dev-extent's logical `[lo, hi)`
+/// span; the provider walks just the CSUM_TREE leaves overlapping that
+/// span and yields `(logical, csum)` pairs in ascending logical order, in
+/// O(1) memory beyond a small leaf read-ahead buffer.
 ///
 /// Memory bound: the largest single walk yields at most `ceil((hi - lo)
-/// / sector_size)` pairs in one `range_iter` call, but `scrub_dev_tree`
+/// / sector_size)` pairs in one `range` call, but `scrub_dev_tree`
 /// consumes them as it goes (no materialisation), so steady-state RAM is
 /// just one [`CsumEntry`] per sector currently in flight * the consumer's
 /// window.  This is independent of disk size and unequal to the eager
-/// `CsumMap` which held every sector's csum for the whole disk.
+/// `CsumMap` which held every sector's csum for the whole disk.  The only
+/// additional memory is the metadata-failure dedup sets (see the struct
+/// docs): O(#failed nodes), zero on a healthy filesystem.
 ///
-/// `metadata_errors` counts CSUM_TREE leaves that failed header-checksum
-/// verification on every mirror copy (DUP / RAID1 metadata with no good
-/// copy).  Surfaced via [`metadata_errors`] so the gap surfaces as
+/// `metadata_errors` counts distinct CSUM_TREE nodes that failed
+/// header-checksum verification on every mirror copy (DUP / RAID1 metadata
+/// with no good copy) *and were read by a `range` walk* — deduplicated by
+/// node bytenr, so each node counts exactly once per run regardless of how
+/// many dev-extents' range walks re-read it.  Surfaced via
+/// [`metadata_errors`] so the coverage gap surfaces as
 /// `metadata_header_errors` rather than the silent undercoverage that
 /// would otherwise let a corrupted CSUM_TREE yield exit 0.
 ///
-/// `mirror_mismatches` counts CSUM_TREE leaves where the copies disagreed
-/// but a good copy was recovered (self-heal-recoverable).  Reported as
-/// `metadata_mirror_mismatches` so a single corrupt DUP metadata copy is
-/// not silently healed.
+/// `mirror_mismatches` counts distinct CSUM_TREE nodes (deduplicated the
+/// same way) where the copies disagreed but a good copy was recovered
+/// (self-heal-recoverable).  Reported as `metadata_mirror_mismatches` so a
+/// single corrupt DUP metadata copy is not silently healed.
+///
+/// The three dedup sets hold one `u64` (node bytenr) per *failed* node —
+/// O(#failed nodes) memory, zero on a healthy filesystem.
 pub struct LazyCsumProvider {
     /// Independent file handle dup'd from the main reader so the walker's
     /// seek position never races the main reader's metadata reads.
@@ -156,21 +179,30 @@ pub struct LazyCsumProvider {
     chunk_map: ChunkMap,
     strategy: CsumStrategy,
     csum_root: u64,
-    /// CSUM_TREE leaves whose *all* mirror copies failed header-csum
-    /// verification, accumulated across all `range` calls.  Folded into
+    /// Distinct CSUM_TREE nodes whose *all* mirror copies failed header-csum
+    /// verification, discovered by the per-`range` walks.  Folded into
     /// the scrub's `metadata_header_errors` by the driver.
     metadata_errors: u64,
-    /// Mirrored CSUM_TREE leaves whose copies disagreed but a good copy
-    /// was recovered, accumulated across all `range` calls.  Folded into
-    /// the scrub's `metadata_mirror_mismatches` by the driver.
+    /// Distinct mirrored CSUM_TREE nodes whose copies disagreed but a good
+    /// copy was recovered, discovered by the per-`range` walks.  Folded
+    /// into the scrub's `metadata_mirror_mismatches` by the driver.
     mirror_mismatches: u64,
-    /// CSUM_TREE leaves that failed with a READ (EIO) error — the bytes
-    /// could not be fetched at all.  Folded into the scrub's
+    /// Distinct CSUM_TREE nodes that failed with a READ (EIO) error — the
+    /// bytes could not be fetched at all.  Folded into the scrub's
     /// `metadata_read_errors` by the driver.
     metadata_read_errors: u64,
+    /// Bytenrs of CSUM_TREE nodes already counted in `metadata_errors`
+    /// (header-verify failure).  Both DUP mirrors of a node share its
+    /// logical bytenr, so this is the exact node identity; `insert`
+    /// returning `true` means "first time this node failed in this run".
+    reported_header: HashSet<u64>,
+    /// Bytenrs already counted in `mirror_mismatches`.
+    reported_mirror: HashSet<u64>,
+    /// Bytenrs already counted in `metadata_read_errors` (EIO).
+    reported_read: HashSet<u64>,
 }
 
-/// One `(logical, csum)` pair yielded by [`LazyCsumProvider::range_iter`].
+/// One `(logical, csum)` pair yielded by [`LazyCsumProvider::range`].
 ///
 /// `csum` is the raw on-disk checksum bytes (length == `strategy.hash_len`):
 /// 4 bytes for CRC32C, 8 for XXHASH, 32 for SHA256/BLAKE2.
@@ -181,14 +213,15 @@ pub struct CsumEntry {
 }
 
 impl LazyCsumProvider {
-    /// Construct a lazy CSUM-tree walker and run a once-only **header-only**
-    /// sweep over the CSUM_TREE so that the metadata-error counters fire
-    /// exactly once per bad leaf regardless of how many `range()` calls
-    /// later walk past it.  This preserves the undercoverage semantics of
-    /// the previous eager `build_csum_map` (which walked the tree once at
-    /// open and counted each bad leaf once) without materialising the
-    /// csum payloads — peak RAM stays bounded by the chunk map + a single
-    /// leaf's worth of read buffer, independent of disk size.
+    /// Construct a lazy CSUM-tree walker.  **Cheap: performs no tree I/O.**
+    /// The CSUM_TREE is only read when a later [`range`] walk descends into
+    /// the spans the scrub asks for, and metadata-failure accounting happens
+    /// then too (deduplicated per node, see the struct docs) — there is no
+    /// open-time header sweep.  The previous implementation walked the
+    /// entire CSUM_TREE in the constructor to count bad leaves up front;
+    /// on a multi-TB disk that pass reads ~12–100 GB of metadata (hash
+    /// dependent) *before* the scrub could start, doubling the tree's I/O
+    /// for a diagnostic the per-range walks produce anyway.
     ///
     /// `file` should be a dup of the main reader's backing fd (see
     /// [`FsReader::reopen`](super::reader::FsReader::reopen)); the walker
@@ -210,7 +243,7 @@ impl LazyCsumProvider {
         let reader = FsReader::new(file, node_size, base_offset, Some(strategy))
             .with_devid(devid)
             .with_fsid(fsid);
-        let mut me = Self {
+        Self {
             reader,
             chunk_map,
             strategy,
@@ -218,52 +251,32 @@ impl LazyCsumProvider {
             metadata_errors: 0,
             mirror_mismatches: 0,
             metadata_read_errors: 0,
-        };
-        // Header-only sweep — verify every CSUM_TREE node's header checksum
-        // (via `walk_leaves` → `FsReader::read_node`'s DUP cross-check) and
-        // count unrecoverable leaves / mirror mismatches once.  The leaf
-        // body is discarded (we do NOT collect csums); the per-`range()`
-        // walks re-read the same leaves to emit csums.  This double-read
-        // of CSUM_TREE leaves is the price of bounded memory: the upfront
-        // walk gives us correct once-per-leaf counters, the per-range walks
-        // give us streamable csums, neither holds a BTreeMap of every
-        // sector's csum on the heap.
-        let metadata_errors = &mut me.metadata_errors;
-        let mirror_mismatches = &mut me.mirror_mismatches;
-        let metadata_read_errors = &mut me.metadata_read_errors;
-        let _ = walk_leaves(
-            &mut me.reader,
-            &me.chunk_map,
-            csum_root,
-            |_r, _leaf, _logical| Ok(()), // discard payload; this pass is for counters
-            |_logical| *metadata_errors += 1,
-            |_logical| *mirror_mismatches += 1,
-            |_logical| *metadata_read_errors += 1,
-        );
-        me
+            reported_header: HashSet::new(),
+            reported_mirror: HashSet::new(),
+            reported_read: HashSet::new(),
+        }
     }
 
-    /// Number of CSUM_TREE leaves that failed header-checksum verification
-    /// on every mirror copy, found during the open-time header-only sweep.
-    /// Folded into the scrub's `metadata_header_errors` at the end of the
-    /// run.  Counted once per bad leaf regardless of how many `range()`
-    /// calls later overlap its span — preserves the previous eager
-    /// `build_csum_map` undercoverage semantics.
+    /// Number of distinct CSUM_TREE nodes that failed header-checksum
+    /// verification on every mirror copy, discovered by the per-`range`
+    /// walks (deduplicated by node bytenr).  Folded into the scrub's
+    /// `metadata_header_errors` at the end of the run.
     pub fn metadata_errors(&self) -> u64 {
         self.metadata_errors
     }
 
-    /// Number of mirrored CSUM_TREE leaves whose copies disagreed but a
-    /// good copy was recovered, found during the open-time header-only
-    /// sweep.  Folded into the scrub's `metadata_mirror_mismatches` at the
-    /// end of the run.
+    /// Number of distinct mirrored CSUM_TREE nodes whose copies disagreed
+    /// but a good copy was recovered, discovered by the per-`range` walks
+    /// (deduplicated by node bytenr).  Folded into the scrub's
+    /// `metadata_mirror_mismatches` at the end of the run.
     pub fn mirror_mismatches(&self) -> u64 {
         self.mirror_mismatches
     }
 
-    /// Number of CSUM_TREE leaves that failed with a READ (EIO) error,
-    /// found during the open-time header-only sweep.  Folded into the
-    /// scrub's `metadata_read_errors` at the end of the run.
+    /// Number of distinct CSUM_TREE nodes that failed with a READ (EIO)
+    /// error, discovered by the per-`range` walks (deduplicated by node
+    /// bytenr).  Folded into the scrub's `metadata_read_errors` at the end
+    /// of the run.
     pub fn metadata_read_errors(&self) -> u64 {
         self.metadata_read_errors
     }
@@ -281,11 +294,19 @@ impl LazyCsumProvider {
     /// **Bad-header leaves are skipped silently** — their csums simply do
     /// not appear in the stream, producing the same undercoverage surface
     /// the eager map produced (a corrupted CSUM_TREE leaf yields fewer csums).
-    /// The metadata-error count for those leaves was already accumulated by
-    /// the open-time sweep in [`LazyCsumProvider::new`]; we deliberately pass
-    /// no-op callbacks to [`walk_leaves`] here so the counters are not
-    /// re-incremented on every per-range walk (which would inflate the count
-    /// by the number of dev-extents overlapping each bad leaf).
+    /// The failure is *counted* here (this is the accounting site): the
+    /// error callbacks increment `metadata_errors` / `mirror_mismatches` /
+    /// `metadata_read_errors`, deduplicated by node bytenr via the
+    /// `reported_*` sets, so a node re-read by several dev-extents' range
+    /// walks is counted exactly once per run.  The walk errors themselves
+    /// are not propagated (matching the eager map behaviour of simply
+    /// having fewer entries on a partial-read CSUM tree) — the counts are
+    /// what make the gap visible.
+    ///
+    /// `counters` is the optional shared live-status counters (the
+    /// plugin's status server): each newly-counted failure is bumped into
+    /// the corresponding atomic so a `GET /status` shows metadata errors
+    /// appearing live during the run.  `None` for standalone runs.
     ///
     /// The closure `emit` is called once per in-range sector; the walk
     /// stops at `logical_hi`.  This callback shape (rather than returning
@@ -306,8 +327,13 @@ impl LazyCsumProvider {
     /// item that starts before `logical_lo` but extends into the range is
     /// never pruned away — see [`walk_leaves_range`] for the pruning
     /// contract.
-    pub fn range<F>(&mut self, logical_lo: u64, logical_hi: u64, mut emit: F)
-    where
+    pub fn range<F>(
+        &mut self,
+        logical_lo: u64,
+        logical_hi: u64,
+        counters: Option<&StatusCounters>,
+        mut emit: F,
+    ) where
         F: FnMut(CsumEntry),
     {
         let hash_len = self.strategy.hash_len;
@@ -333,9 +359,23 @@ impl LazyCsumProvider {
             logical_hi,
         );
         let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
+        // Split borrows: the walk owns `reader`/`chunk_map` mutably while
+        // the error callbacks own the dedup sets and counters — disjoint
+        // fields, so no aliasing.
+        let Self {
+            reader,
+            chunk_map,
+            reported_header,
+            reported_mirror,
+            reported_read,
+            metadata_errors,
+            mirror_mismatches,
+            metadata_read_errors,
+            ..
+        } = self;
         let res = walk_leaves_range(
-            &mut self.reader,
-            &self.chunk_map,
+            reader,
+            chunk_map,
             csum_root,
             key_lo,
             key_hi,
@@ -364,14 +404,51 @@ impl LazyCsumProvider {
                 }
                 Ok(())
             },
-            |_logical| {}, // open-time sweep already counted these
+            // Header-verify failure (no good mirror copy): count once per
+            // distinct node across all range walks of this run, and bump
+            // the live status counters.
+            |logical| {
+                if reported_header.insert(logical) {
+                    *metadata_errors += 1;
+                    if let Some(c) = counters {
+                        c.metadata_header_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            },
+            // Stale node (only verifiable copies have wrong generation /
+            // owner — the block was freed and repurposed by a live
+            // transaction): an *expired branch*, i.e. normal churn.  The
+            // data it covered was retired or rewritten, so there is
+            // nothing to check and nothing to report — silently skipped,
+            // never counted (see tree.rs `on_stale`).  Counting this would
+            // turn routine filesystem activity on a busy live array into
+            // false metadata-fatal results.
             |_logical| {},
-            |_logical| {}, // read (EIO) errors counted by the open-time sweep
+            // Mirror divergence (good copy recovered): counted once per
+            // distinct node, live-bumped the same way.
+            |logical| {
+                if reported_mirror.insert(logical) {
+                    *mirror_mismatches += 1;
+                    if let Some(c) = counters {
+                        c.metadata_mirror_mismatches.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            },
+            // READ (EIO) failure: counted once per distinct node,
+            // live-bumped the same way.
+            |logical| {
+                if reported_read.insert(logical) {
+                    *metadata_read_errors += 1;
+                    if let Some(c) = counters {
+                        c.metadata_read_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            },
         );
         // Propagate walk errors as zero yields for the affected leaves
         // (matching the eager map behaviour of simply having fewer entries
-        // on a partial-read CSUM tree).  The metadata-error counter was
-        // already populated by the open-time sweep.
+        // on a partial-read CSUM tree).  The metadata-error counters were
+        // already incremented by the callbacks above.
         let _ = res;
         // walk_leaves yields leaves in BFS tree order, which for a CSUM tree
         // keyed by logical offset is *not* strictly ascending — a leaf

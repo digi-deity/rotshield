@@ -595,6 +595,24 @@ recipe_19_csum_tree_partial_break() {
     log "WARN: recipe 19a could not corrupt a CSUM_TREE leaf"
     record_expectation "$va/${label}.img" unverified 0 "could not corrupt CSUM_TREE leaf"
   fi
+
+  # b) ONE DUP mirror of a CSUM_TREE leaf broken -> the good mirror still
+  # serves the csums, so the data scrub completes cleanly; the DUP
+  # cross-check must surface the divergence as a recoverable metadata
+  # mirror mismatch (metadata mirror : 1).  This exercises the per-range
+  # CSUM-walk counting + the mirror-mismatch fold into the final stats
+  # (the open-time header sweep is gone; this counter is now produced and
+  # surfaced entirely by the scrub loop).
+  local vb="$base/b_one_mirror_broken"; mkdir -p "$vb"
+  cp -a "$img" "$vb/${label}.img"
+  if corrupt_csum_tree_one_mirror "$vb/${label}.img"; then
+    verify_check_offline "$vb/${label}.img" "$vb/EXPECTED_check_status.txt" || true
+    echo "EXPECTED: one DUP mirror of a CSUM_TREE leaf has its header csum broken; the other mirror is intact. The data scrub must complete with zero data mismatches (sectors checked > 0), and the divergence must surface as metadata mirror : 1 (self-heal-recoverable), never as data corruption and never as a clean scrub." >> "$vb/EXPECTED_check_status.txt"
+    record_expectation "$vb/${label}.img" self_heal_recoverable 1 "one DUP mirror of a CSUM_TREE leaf broken -- recoverable mirror divergence must surface as metadata_mirror_mismatches"
+  else
+    log "WARN: recipe 19b could not corrupt a CSUM_TREE leaf mirror"
+    record_expectation "$vb/${label}.img" unverified 0 "could not corrupt CSUM_TREE leaf mirror"
+  fi
 }
 
 # ===========================================================================
