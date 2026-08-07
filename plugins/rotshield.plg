@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.07b">
-<!ENTITY bundleversion "2026.08.07b">
+<!ENTITY version       "2026.08.07c">
+<!ENTITY bundleversion "2026.08.07c">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -15,6 +15,23 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.07c
+- The status table now explains itself: every statistic row and every
+  group header carries a question-mark help popup with a plain-language
+  explanation of what the number means, whether a non-zero value is good
+  or bad, and what (if anything) to do about it. No filesystem expertise
+  is needed to read a scrub result.
+- The table now shows only the essentials: progress, scrub volume,
+  mismatch and read-error counts, and the recovery outcome. Diagnostic
+  rows that are normally zero (stale blocks, no-checksum blocks, skipped
+  recoveries) and the whole metadata group stay hidden until a disk
+  actually reports a non-zero value, so a healthy all-zero run reads
+  clean at a glance and issue rows appear exactly when there is
+  something to look at.
+- Target disk(s): disks without a btrfs filesystem are greyed out and
+  cannot be selected, instead of only being rejected when a scrub
+  reaches them.
 
 ###2026.08.07b
 - Fixed: the plugin's icons now actually render in the webGUI. The shipped

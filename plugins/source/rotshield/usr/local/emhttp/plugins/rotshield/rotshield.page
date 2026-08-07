@@ -11,9 +11,15 @@ Icon="rotshield.png"
  * scheduled runs behave identically. The Status section shows a per-disk
  * progress table fed by status.php: live counters (polled every 5 s) for
  * the disk currently being scrubbed, exact final counters from the run log
- * for finished disks. Raw logs are no longer shown in the UI (they are
- * still written to /boot/config/plugins/rotshield/runs for
- * debugging).
+ * for finished disks. Every group and statistic row carries a question-mark
+ * help popup (same style as the settings form) explaining in plain language
+ * what the number counts and whether a non-zero value is good or bad.  The
+ * table shows only essential rows (progress, volume, mismatch, read error,
+ * recovered, failed); diagnostic rows (stale, no csum, skipped) and the
+ * whole Metadata group stay hidden until some disk reports a non-zero
+ * value for them. Raw
+ * logs are no longer shown in the UI (they are still written to
+ * /boot/config/plugins/rotshield/runs for debugging).
  */
 $plugin      = "rotshield";
 $plugin_dir  = "/usr/local/emhttp/plugins/$plugin";
@@ -215,6 +221,10 @@ pre { max-width: 100%; overflow-x: auto; }
   color: #333;
   text-align: left;
   white-space: normal;
+  /* Inside the uppercase group-header rows the popup must not inherit the
+     row's all-caps / letter-spaced styling. */
+  text-transform: none;
+  letter-spacing: normal;
 }
 .help-block:hover .help-content,
 .help-block:focus-within .help-content { display: block; }
@@ -224,8 +234,14 @@ pre { max-width: 100%; overflow-x: auto; }
    stat labels are indented under their group.  Colored chips mark each
    disk's state, the active column gets a subtle tint, and the progress row
    shows a bar.  Semi-transparent colors keep both light and dark webGui
-   themes readable. */
+   themes readable.  Every group and stat row carries a question-mark help
+   popup (same pattern as the settings form). */
 #progress-wrap { margin-top: 8px; overflow-x: auto; max-width: 100%; }
+/* Rows near the bottom of the table (Metadata, Recovery) open their help
+   popups UPWARD: #progress-wrap's horizontal scroll also clips vertically,
+   so a downward popup on the last rows would be cut off at the container
+   edge. */
+.help-block .help-content.help-up { top: auto; bottom: 1.6em; }
 #progress-table {
   border-collapse: collapse;
   margin-top: 6px;
@@ -247,7 +263,10 @@ pre { max-width: 100%; overflow-x: auto; }
 #progress-table th { font-weight: bold; }
 #progress-table th:first-child, #progress-table td:first-child { width: 220px; }
 #progress-table th:not(:first-child), #progress-table td:not(:first-child) { width: 170px; }
-#progress-table td:first-child { color: #6c757d; }
+/* The label column must not clip the help popups, which are wider than the
+   220px column.  table-layout: fixed still keeps the label text itself at
+   220px; only the absolutely-positioned popup is allowed to overflow. */
+#progress-table td:first-child { color: #6c757d; overflow: visible; }
 .devname {
   display: inline-block;
   max-width: 96px;
@@ -269,7 +288,6 @@ pre { max-width: 100%; overflow-x: auto; }
   padding: 5px 4px;
   border-bottom: none;
   border-top: 1px solid rgba(0,0,0,.08);
-  cursor: help;
 }
 .chip {
   display: inline-block;
@@ -440,40 +458,55 @@ $configured_devices = array_values(array_filter(
   }
 
   // Row hierarchy: group rows order the statistics so related counters sit
-  // together, and the group tooltips explain the relationships (e.g. how
-  // the recovery outcomes relate to the mismatch count above them).
+  // together.  Every group row and every statistic row carries a
+  // question-mark help popup (same pattern as the settings form) with a
+  // plain-language explanation of what the number counts and whether a
+  // non-zero value is good or bad.  Groups near the bottom of the table
+  // set `up: true` so their popups open upward and cannot be clipped by
+  // the scrollable table container.
+  //
+  // Visibility: always-visible rows are the healthy-scrub signals where a
+  // visible 0 is meaningful (Progress, Scrub volume, Sectors mismatch,
+  // Sectors read error, Recovered, Failed).  Rows marked 'cond' (Sectors
+  // stale, Sectors no csum, Skipped) and the Metadata group (cond: true)
+  // are hidden for ALL disks until some disk reports a non-zero value for
+  // the stat — they are edge-case diagnostics, not part of the essential
+  // view, and a healthy all-zero run shows only the essential rows.
   var GROUPS = [
     { name: 'Progress',
-      tip: 'Coarse scrub completion: physical bytes of the data dev-extents already scrubbed, as a share of all data the scrub will cover.',
-      rows: [ ['Progress', 'progress'] ] },
+      tip: "How far along the scan of this disk is: 0% at the start, 100% when every data area has been checked. The bar updates in steps as whole regions of the disk finish, so it may pause for a while and then jump forward.",
+      rows: [ ['Progress', 'progress', "The share of this disk's data that has been checked so far, shown as a bar and a percentage. The value moves in steps as whole regions finish, so it can sit still for a while and then jump. 100% = the scan of this disk is complete."] ] },
     { name: 'Scrub volume',
-      tip: 'Total work done by the scrub pass. Sectors checked counts every sector the pass attempted, OK ones, and the raw bytes read.',
+      tip: "How much work the scan has done on this disk so far: how many data blocks were read and checked, how many came back exactly right, and the total amount of data covered. On a healthy disk, almost every checked block comes back OK.",
       rows: [
-        ['Sectors checked', 'sectors_checked'],
-        ['Sectors OK', 'sectors_ok'],
-        ['Bytes checked', 'bytes_checked']
+        ['Sectors checked', 'sectors_checked', "The number of data blocks the scan has read and verified on this disk so far (each block is a few kilobytes; the exact size depends on the filesystem settings). It grows while the disk is being scrubbed and stops at the total when the scan finishes. A growing number simply means the scan is working."],
+        ['Sectors OK', 'sectors_ok', "Blocks that were read back exactly as they should be: their checksum matched the one recorded when the data was written. On a healthy disk this is almost the same as Sectors checked. This is the result you want to see."],
+        ['Bytes checked', 'bytes_checked', "The total amount of data read and verified so far, in bytes \u2014 the same progress as Sectors checked, just shown as a data volume instead of a block count. A large number is normal on a large disk."]
       ] },
     { name: 'Issues found',
-      tip: 'Sector outcomes that are not plain OK. Mismatch = genuine corruption; stale = benign churn (block rewritten/freed, or nodatasum); no csum = file carries no checksum; read error = disk EIO (hardware).',
+      tip: "Anything the scan found that was not simply 'block is fine': real corruption, blocks that only looked suspicious but are actually fine, blocks with no checksum to compare against, and blocks the disk could not read back at all (a hardware problem).",
       rows: [
-        ['Sectors mismatch', 'sectors_mismatch'],
-        ['Sectors stale', 'sectors_stale'],
-        ['Sectors no csum', 'sectors_no_csum'],
-        ['Sectors read error', 'sectors_read_error']
+        ['Sectors mismatch', 'sectors_mismatch', "Real corruption: the block's content no longer matches the checksum recorded when it was written \u2014 something changed or damaged the data. Any number above zero means genuine problems were found; the Recovery group below shows what could be done about them."],
+        ['Sectors stale', 'sectors_stale', "Blocks that initially looked wrong but turned out to be fine: the filesystem had legitimately rewritten or deleted them while the scan was running, or the file was never checksummed in the first place. This is normal activity on a busy disk, not corruption \u2014 no action needed.", 'cond'],
+        ['Sectors no csum', 'sectors_no_csum', "Data blocks the filesystem stores without a checksum, so there is nothing to compare against. Nothing is wrong with them \u2014 they simply cannot be verified. In this scan mode the count is always 0, because such blocks are passed over silently rather than counted.", 'cond'],
+        ['Sectors read error', 'sectors_read_error', "The disk refused to return this block's data (an I/O error \u2014 the same kind of failure SMART tests report). This is a hardware problem, not corrupted data. The scan skips only these blocks and keeps checking the rest of the disk. Check the disk's health (SMART, cables, controller). These blocks could not be verified; if parity cannot rebuild them, they need attention."]
       ] },
     { name: 'Metadata',
-      tip: 'btrfs metadata node problems. Header errors = no good copy (run btrfs check --repair offline); mirror mismatches = a good copy still exists (self-heal); read errors = device EIO.',
+      cond: true,
+      up: true,
+      tip: "The filesystem's bookkeeping \u2014 the map that records which files exist and where their data is stored \u2014 is kept twice for safety. The three rows describe different kinds of trouble: the two copies disagree but a good one still exists (mirror mismatch), every copy is damaged so no good one is left (header error), or the disk would not return the bytes at all (read error \u2014 hardware).",
       rows: [
-        ['Metadata header errors', 'metadata_header_errors'],
-        ['Metadata mirror mismatches', 'metadata_mirror_mismatches'],
-        ['Metadata read errors', 'metadata_read_errors']
+        ['Metadata header errors', 'metadata_header_errors', "The filesystem's bookkeeping \u2014 the map of which files exist and where their data is stored \u2014 is damaged: the disk returns the bytes, but no copy passes the integrity check (or the only valid copy is stale, from an older moment in time). This is corruption of the stored map itself, e.g. silent bit rot \u2014 not a hardware read problem \u2014 and unlike data blocks it is never rebuilt from parity, so the scan cannot fix it. The affected part of the map cannot be trusted: the scan skips it (those data areas may never be checked) but continues with the rest of the disk, and because part of the map could not be trusted, the whole run is reported as failed. Action: unmount the disk and repair the filesystem offline (btrfs check --repair)."],
+        ['Metadata mirror mismatches', 'metadata_mirror_mismatches', "The two safety copies of the bookkeeping disagree \u2014 but at least one copy is intact, so the filesystem reads the good copy and can refresh the bad one itself. The scan continues normally and no data is lost; no action is needed \u2014 the count is reported for visibility, the same way a normal btrfs scrub reports it. It usually means a copy was damaged at some point (or is from an older moment in time) and btrfs already caught it."],
+        ['Metadata read errors', 'metadata_read_errors', "The disk refused to return the bookkeeping bytes at all (an I/O error \u2014 the kind a failing drive produces). This is a hardware problem, not corruption: the scan skips that part of the map, so some data areas may never have been checked, but it keeps scrubbing the rest of the disk. Action: check the disk's hardware health (SMART, cables, controller) \u2014 a filesystem repair will not help here."]
       ] },
     { name: 'Recovery',
-      tip: 'How confirmed corruption was handled by the parity-recovery pipeline (dry-run: what would be written). Recovered + Failed = Sectors mismatch. n/a = no array config, so recovery was not possible.',
+      up: true,
+      tip: "What was done about the genuine corruption found above, using the array's parity: blocks successfully rebuilt, blocks that could not be rebuilt, and blocks deliberately left alone because the scan could not safely confirm them. Recovered + Failed = Sectors mismatch. n/a means no array information was available, so rebuilding was not possible.",
       rows: [
-        ['Recovered', 'recovered'],
-        ['Failed', 'failed'],
-        ['Skipped', 'skipped']
+        ['Recovered', 'recovered', "Blocks that were confirmed corrupt and then successfully rebuilt from the array's parity \u2014 the original data was reconstructed. With Repair disk turned off (the default), this shows what would be written back; with it on, the rebuilt blocks are actually written to the disk. Green = the corruption was fixable."],
+        ['Failed', 'failed', "Blocks that were confirmed corrupt but could not be rebuilt: the disk's own bytes could not be read at repair time, the parity data could not be read, the reconstruction failed the checksum test, or writing the blocks back to the disk failed. These blocks could not be fixed. This needs attention: check the array and the other disks, and consider restoring from backup."],
+        ['Skipped', 'skipped', "Blocks the scan deliberately left alone: at repair time, the bookkeeping covering exactly that block could not be read, so the scan could not confirm whether it is still corrupt \u2014 and it never writes a guess. Only that one block is skipped; the rest of the run continues normally. A small number is a cautious, safe outcome; if it grows, it usually points to the disk having read trouble (see the read-error rows).", 'cond']
       ] }
   ];
 
@@ -511,7 +544,7 @@ $configured_devices = array_values(array_filter(
       // Plain scrub (no array): the counters are meaningless, show n/a
       // instead of zeros that would read like "nothing was recovered".
       if (d.data.recovery === '0') {
-        return '<span class="muted" title="No array config \u2014 parity recovery is not available for this disk">n/a</span>';
+        return '<span class="muted" title="No array information available \u2014 this disk cannot be rebuilt from parity, so recovery counts are not shown">n/a</span>';
       }
     }
     if (d.data[key] === undefined) return null;
@@ -527,6 +560,39 @@ $configured_devices = array_values(array_filter(
       txt += ' <span class="of" title="of the ' + m + ' confirmed mismatches (recovered + failed = mismatch)">of ' + m + '</span>';
     }
     return '<span' + cls + '>' + txt + '</span>';
+  }
+
+  // Help popup wrapper - the same question-mark pattern the settings form
+  // uses: label + icon, hover/focus shows the plain-language tip.  `up`
+  // opens the popup above the icon for rows near the bottom of the table,
+  // so it stays inside the scrollable #progress-wrap.
+  function helpWrap(label, tip, up) {
+    return '<span class="help-block" tabindex="0">' + label +
+           '<i class="fa fa-question-circle"></i>' +
+           '<span class="help-content' + (up ? ' help-up' : '') + '">' + tip +
+           '</span></span>';
+  }
+
+  // Row/group visibility: `anyDisk(key)` is true when at least one disk
+  // has reported a non-zero value for the stat.  Conditional rows and
+  // groups (see GROUPS) render only then — otherwise the whole row (or
+  // the whole group including its header) is omitted for every disk.
+  function anyDisk(key) {
+    var devs = Object.keys(disks);
+    for (var i = 0; i < devs.length; i++) {
+      var v = disks[devs[i]].data[key];
+      if (v !== undefined && Number(v) > 0) return true;
+    }
+    return false;
+  }
+  // A conditional group is visible iff any of its stats is non-zero on
+  // some disk (e.g. the Metadata group appears only when there is
+  // something to look at).
+  function groupVisible(grp) {
+    for (var r = 0; r < grp.rows.length; r++) {
+      if (anyDisk(grp.rows[r][1])) return true;
+    }
+    return false;
   }
 
   function renderTable() {
@@ -549,11 +615,18 @@ $configured_devices = array_values(array_filter(
       html += '<tbody>';
     for (var g = 0; g < GROUPS.length; g++) {
       var grp = GROUPS[g];
-      html += '<tr class="grp"><td colspan="' + span + '" title="' + esc(grp.tip) + '">' +
-              esc(grp.name) + '</td></tr>';
+      // Conditional group (Metadata): hide the header AND its rows for
+      // every disk until some disk actually reports an issue.
+      if (grp.cond && !groupVisible(grp)) continue;
+      html += '<tr class="grp"><td colspan="' + span + '">' +
+              helpWrap(esc(grp.name), grp.tip, grp.up) + '</td></tr>';
       for (var r = 0; r < grp.rows.length; r++) {
-        var label = grp.rows[r][0], key = grp.rows[r][1];
-        html += '<tr><td class="stat">' + esc(label) + '</td>';
+        var label = grp.rows[r][0], key = grp.rows[r][1], tip = grp.rows[r][2];
+        // Conditional row: hide it for ALL disks until some disk reports
+        // a non-zero value (stale / no-csum / skipped are diagnostics,
+        // not healthy-scrub signals).
+        if (grp.rows[r][3] === 'cond' && !anyDisk(key)) continue;
+        html += '<tr><td class="stat">' + helpWrap(esc(label), tip, grp.up) + '</td>';
         for (var i = 0; i < devs.length; i++) {
           var d = disks[devs[i]];
           var cell = cellFor(d, key);
