@@ -18,7 +18,8 @@ a `cron.d` entry managed by the `rc` script.
 ## Layout
 
 ```
-plugin/
+plugins/
+├── rotshield.xml                       # Community Apps wrapper
 ├── rotshield.plg                       # plugin manifest (installs the bundle)
 ├── README.md                           # this file
 ├── source/rotshield/                   # files packaged into the .txz bundle
@@ -58,15 +59,15 @@ cargo build --release
 cd ..
 
 # 2. Stage them into the plugin tree
-BIN=plugin/source/rotshield/usr/local/emhttp/plugins/rotshield/bin
+BIN=plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/bin
 cp scrub-rs/target/release/scrub-rs    "$BIN"/
 cp scrub-rs/target/release/craft-corrupt "$BIN"/
 chmod 755 "$BIN"/scrub-rs "$BIN"/craft-corrupt
 
 # 3. Package the bundle
-cd plugin/source/rotshield
+cd plugins/source/rotshield
 bash pkg_build.sh
-# -> ../../../archive/rotshield-<version>-x86_64-1.txz
+# -> ../../archive/rotshield-<version>-x86_64-1.txz
 #    (<version> is read from the .plg's <!ENTITY version>)
 ```
 
@@ -84,12 +85,16 @@ bash pkg_build.sh
 
 ## Install on unRAID
 
-1. Grab `rotshield-<version>-x86_64-1.txz` (the version
+1. **From Apps (once published):** search `Rotshield` in **Apps** and hit
+   Install. The Community Apps wrapper for this plugin is
+   [`rotshield.xml`](rotshield.xml) (same directory); the repository
+   profile is [`ca_profile.xml`](../ca_profile.xml).
+2. **Manually:** grab `rotshield-<version>-x86_64-1.txz` (the version
    matching your `.plg`) from the matching GitHub Release (or build it
    locally per above).
-2. Install the plugin via the unRAID webUI (Plugins → Install Plugin, paste the
+3. Install the plugin via the unRAID webUI (Plugins → Install Plugin, paste the
    raw `.plg` URL), or drop the `.plg` on the flash drive and install it.
-3. Open **Settings → Rotshield**, select the target raw data
+3. Open **Utilities → Rotshield**, select the target raw data
    disk(s) (auto-discovered from the array's `/proc/nmdstat`; the partition
    offset and freeze mount are applied automatically), choose recovery mode
    and write vs dry-run, optionally pick a schedule, and click **Run Scrub
@@ -195,7 +200,9 @@ recovery ran; 0 = plain scrub, the table shows n/a).
 ## Releasing
 
 Bump `version` / `bundleversion` in `rotshield.plg` (and add a
-CHANGES entry), then push a tag `v<version>` (e.g. `v2026.08.05b`). The
+CHANGES entry), update `plugins/rotshield.xml` / `ca_profile.xml` if
+needed (e.g. new icon or support link), then push a tag `v<version>`
+(e.g. `v2026.08.05b`). The
 `build-plugin.yml` workflow builds, packages and attaches
 `rotshield-<version>-x86_64-1.txz` to that release with
 auto-generated release notes — and verifies the tag matches the `.plg`

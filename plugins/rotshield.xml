@@ -1,0 +1,35 @@
+<Plugin>
+  <!-- Community Apps wrapper for the Rotshield plugin -->
+
+  <!-- Name of the plugin -->
+  <Name>Rotshield</Name>
+
+  <!-- Plain text description -->
+  <Overview>Btrfs scrubber for unRAID/NonRAID arrays: detects bitrot the same way btrfs scrub does, and rebuilds corrupted blocks from the array's P/Q parity instead of just reporting them. Settings-page UI with on-demand or scheduled scrubs, live per-disk progress, and repair that is always verified against the filesystem checksums before anything is written back.</Overview>
+
+  <!-- NOTE: PluginURL must match exactly the URL of the PluginURL in the .plg file -->
+  <PluginURL>https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg</PluginURL>
+
+  <!-- Author of the plugin -->
+  <PluginAuthor>digi-deity</PluginAuthor>
+
+  <!-- The .plg has no <Support> attribute, so <Support> here is REQUIRED -->
+  <Support>https://github.com/digi-deity/rotshield/issues</Support>
+
+  <!-- Project page -->
+  <Project>https://github.com/digi-deity/rotshield</Project>
+
+  <!-- Readme first file -->
+  <ReadMe>https://raw.githubusercontent.com/digi-deity/rotshield/main/README.md</ReadMe>
+
+  <!-- Valid category entries can be generated from the Application Categorizer plugin available in Apps -->
+  <Category>Tools:System</Category>
+
+  <!-- App icon hosted at the repo root (rotshield.svg). IconFA is intentionally omitted:
+       when IconFA is set, the Icon tag is ignored by Community Apps. -->
+  <Icon>https://raw.githubusercontent.com/digi-deity/rotshield/main/rotshield.svg</Icon>
+
+  <!-- License of the plugin -->
+  <License>Apache 2.0</License>
+
+</Plugin>

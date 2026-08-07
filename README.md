@@ -1,5 +1,7 @@
 # Rotshield
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 A btrfs scrubber for unRAID/NonRAID arrays. It checks your data disks for
 bitrot the same way `btrfs scrub` does, and on the rare occasion it finds
 actual corruption, it rebuilds the bad blocks from the array's P/Q parity
@@ -112,19 +114,22 @@ ECC memory, good cables, and verifying transfers from other machines.
 | Path | What it is |
 |------|-----------|
 | `scrub-rs/` | The Rust crate: `scrub-rs` (btrfs scrub + parity recovery CLI) and `craft-corrupt` (test-only corruption injector). See [`scrub-rs/README.md`](scrub-rs/README.md). |
-| `plugin/` | The Rotshield unRAID plugin that bundles the binaries behind a Settings-page UI. See [`plugin/README.md`](plugin/README.md). |
+| `plugins/` | The Rotshield unRAID plugin: CA wrapper (`plugins/rotshield.xml`), manifest (`plugins/rotshield.plg`), build tree (`plugins/source/`), and docs. See [`plugins/README.md`](plugins/README.md). |
+| `ca_profile.xml` / `plugins/rotshield.xml` | Community Applications repository profile + plugin wrapper — what Apps shows in the store. |
+| `rotshield.svg` / `LICENSE` | Repository icon referenced by the CA files; Apache-2.0 license. |
 | `mk_array.sh` / `teardown_disk.sh` / `nmdctl` | Local test-array helpers: assemble a loop-device-backed NonRAID array (and tear it down) for manual experiments. |
 | `.github/workflows/` | CI: Rust lint, btrfs matrix + array recovery tests, and the plugin build/release. |
 
 The Rust source and the plugin live in separate trees on purpose: the plugin
-bundles only the built binaries (staged into `plugin/…/bin/`), never the
+bundles only the built binaries (staged into `plugins/…/bin/`), never the
 source.
 
 ## Getting started
 
-**Plugin users** — install the Rotshield plugin on unRAID and drive a scrub
-from the Settings page. See [`plugin/README.md`](plugin/README.md) for the
-`.plg` / `.txz` bundle, install steps, and configuration keys.
+**Plugin users** — install the Rotshield plugin on unRAID, either from
+**Apps** (Community Applications, once published) or manually, and drive a
+scrub from the Settings page. See [`plugins/README.md`](plugins/README.md) for
+the `.plg` / `.txz` bundle, install steps, and configuration keys.
 
 **Developers** — build the tools, run the test matrix, and use
 `mk_array.sh` for a local scratch array:
@@ -173,15 +178,32 @@ Two layers of automated coverage run in CI (`.github/workflows/`):
 Run the shell harness locally from `scrub-rs/tests/integration/` (needs
 root + `btrfs-progs` + loop devices) — see `scrub-rs/README.md`.
 
+## Community Apps
+
+This repository follows the
+[unraid-community-apps-starter](https://github.com/unraid/unraid-community-apps-starter)
+layout so it can be submitted to the Apps store:
+
+- `ca_profile.xml` — repository profile (description, icon, support link).
+- `plugins/rotshield.xml` — the plugin entry Apps displays; its `<PluginURL>`
+  matches the `.plg`'s `pluginURL` exactly.
+- `rotshield.svg` — the app icon shown in Apps.
+- `LICENSE` — Apache-2.0 (OSI-approved, required for submission).
+
+To submit, push to `main`, then run **Validate** and **Scan** in the
+Community Apps submit flow (`/submit` in the unRAID webGUI).
+
 ## More documentation
 
 - [`scrub-rs/README.md`](scrub-rs/README.md) — tool layout, build, and test
   commands.
-- [`plugin/README.md`](plugin/README.md) — plugin layout, build, install,
+- [`plugins/README.md`](plugins/README.md) — plugin layout, build, install,
   configuration keys, and the live status endpoint.
 - [`scrub-rs/docs/EIO-robustness-design.md`](scrub-rs/docs/EIO-robustness-design.md)
   — the robustness design for read-error (EIO) handling.
 
 ## License
 
-(Add your license here.)
+Licensed under the [Apache License 2.0](LICENSE). `scrub-rs` and
+`craft-corrupt` are built from this repository's own source — no third-party
+binaries are bundled with the plugin.

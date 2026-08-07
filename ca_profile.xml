@@ -1,0 +1,28 @@
+<CommunityApplications>
+  <!-- Required profile -->
+  <Profile>
+    This repository provides the **Rotshield** plugin for unRAID.
+
+    Rotshield is a btrfs scrubber for unRAID/NonRAID arrays. It checks your
+    data disks for bitrot the same way `btrfs scrub` does, and on the rare
+    occasion it finds actual corruption, it rebuilds the bad blocks from the
+    array's P/Q parity instead of just reporting them.
+
+    It runs as a native plugin with a Settings-page UI: pick the target
+    data disk(s), run a scrub on demand or on a schedule, and watch live
+    per-disk progress and results. Recovery is always verified against the
+    filesystem checksums before anything is written back.
+
+    For support or questions, please open an issue on GitHub.
+  </Profile>
+
+  <!-- Repository icon (root-level rotshield.svg) -->
+  <Icon>https://raw.githubusercontent.com/digi-deity/rotshield/main/rotshield.svg</Icon>
+
+  <!-- Optional web page -->
+  <WebPage>https://github.com/digi-deity/rotshield</WebPage>
+
+  <!-- Support link (GitHub issues; swap for the unRAID forum topic once published) -->
+  <Forum>https://github.com/digi-deity/rotshield/issues</Forum>
+
+</CommunityApplications>

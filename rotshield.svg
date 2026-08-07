@@ -1,0 +1,45 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="shieldClip">
+      <path d="M50 6 L88 20 L88 48 C88 74 70 90 50 96 C30 90 12 74 12 48 L12 20 Z"/>
+    </clipPath>
+  </defs>
+
+  <path d="M50 6 L88 20 L88 48 C88 74 70 90 50 96 C30 90 12 74 12 48 L12 20 Z"
+        fill="#1e2a3a"/>
+
+  <g clip-path="url(#shieldClip)">
+
+  <!-- Static noise, as scattered bits, sitting behind the pulse -->
+  <g fill="#5b6c85" font-family="'SFMono-Regular', Consolas, monospace" font-weight="700" text-anchor="middle">
+    <text x="24" y="28" font-size="10" opacity="0.45">1</text>
+    <text x="32" y="21" font-size="9" opacity="0.3">0</text>
+    <text x="22" y="44" font-size="9" opacity="0.35">0</text>
+    <text x="30" y="64" font-size="10" opacity="0.4">1</text>
+    <text x="20" y="74" font-size="9" opacity="0.3">1</text>
+    <text x="38" y="76" font-size="9" opacity="0.35">0</text>
+    <text x="36" y="30" font-size="9" opacity="0.3">1</text>
+
+    <text x="76" y="28" font-size="10" opacity="0.45">0</text>
+    <text x="68" y="21" font-size="9" opacity="0.3">1</text>
+    <text x="79" y="44" font-size="9" opacity="0.35">1</text>
+    <text x="71" y="64" font-size="10" opacity="0.4">0</text>
+    <text x="81" y="74" font-size="9" opacity="0.3">0</text>
+    <text x="63" y="76" font-size="9" opacity="0.35">1</text>
+    <text x="65" y="30" font-size="9" opacity="0.3">0</text>
+
+    <text x="50" y="19" font-size="9" opacity="0.3">0</text>
+    <text x="50" y="87" font-size="10" opacity="0.35">1</text>
+  </g>
+
+  <!-- Heartbeat pulse: centered and point-symmetric, flat outer arms pulled in from the edges -->
+  <polyline points="24,48 38,48 44,32 56,64 62,48 76,48"
+            fill="none" stroke="#9aa8bd" stroke-width="4"
+            stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- The repaired segment, picked out in accent color -->
+  <line x1="44" y1="32" x2="56" y2="64"
+        stroke="#e8823c" stroke-width="4.5" stroke-linecap="round"/>
+
+  </g>
+</svg>

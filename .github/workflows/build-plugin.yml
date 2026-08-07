@@ -48,7 +48,7 @@ jobs:
 
       - name: Stage binaries into plugin tree
         run: |
-          BIN_DIR="plugin/source/rotshield/usr/local/emhttp/plugins/rotshield/bin"
+          BIN_DIR="plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/bin"
           mkdir -p "$BIN_DIR"
           cp scrub-rs/target/release/scrub-rs    "$BIN_DIR/"
           cp scrub-rs/target/release/craft-corrupt "$BIN_DIR/"
@@ -57,14 +57,14 @@ jobs:
 
       - name: Package bundle (.txz)
         run: |
-          cd plugin/source/rotshield
+          cd plugins/source/rotshield
           bash pkg_build.sh
           ls -l ../../archive/
 
       - name: Compute md5 and inject into .plg
         run: |
-          VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*"\([^"]*\)".*/\1/p' plugin/rotshield.plg | head -1)
-          TXZ="plugin/archive/rotshield-${VERSION}-x86_64-1.txz"
+          VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*"\([^"]*\)".*/\1/p' plugins/rotshield.plg | head -1)
+          TXZ="plugins/archive/rotshield-${VERSION}-x86_64-1.txz"
           MD5=$(md5sum "$TXZ" | awk '{print $1}')
           echo "bundle: $TXZ"
           echo "bundle md5: $MD5"
@@ -79,7 +79,7 @@ jobs:
       - name: Verify release tag matches plugin version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*"\([^"]*\)".*/\1/p' plugin/rotshield.plg | head -1)
+          VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*"\([^"]*\)".*/\1/p' plugins/rotshield.plg | head -1)
           echo "plugin version: $VERSION"
           echo "release tag:    ${GITHUB_REF_NAME}"
           if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
@@ -91,14 +91,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rotshield-bundle
-          path: plugin/archive/*.txz
+          path: plugins/archive/*.txz
           if-no-files-found: error
 
       - name: Publish to GitHub Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: plugin/archive/*.txz
+          files: plugins/archive/*.txz
           # Auto-generate release notes from the conventional commits since
           # the last release. The asset is named after the .plg version
           # (pkg_build.sh derives it from the plg) and the verification step

@@ -86,11 +86,11 @@ scrub-rs/tests/integration/btrfs_test_images/
 /root/btrfs_live_scrub_test_*/
 
 # unRAID plugin: built binaries + bundle (produced by CI / pkg_build.sh)
-plugin/source/rotshield/usr/local/emhttp/plugins/rotshield/bin/scrub-rs
-plugin/source/rotshield/usr/local/emhttp/plugins/rotshield/bin/craft-corrupt
-plugin/archive/
+plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/bin/scrub-rs
+plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/bin/craft-corrupt
+plugins/archive/
 # keep the .gitkeep so the bin/ dir is tracked
-!plugin/source/rotshield/usr/local/emhttp/plugins/rotshield/bin/.gitkeep
+!plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/bin/.gitkeep
 
 # JS tooling (pi / bun) — stray artifacts from running `pi install` or `bun` in the repo root
 node_modules/
