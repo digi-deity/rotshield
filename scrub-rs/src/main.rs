@@ -389,12 +389,18 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         }
     }
 
+    // NOTE: this line must NOT start with the word "scrubbing" — scrub.sh
+    // and status.php find the run's active device by scanning the log for
+    // "scrubbing <device>" markers, and a bare "scrubbing (...)" banner
+    // (no device path) used to be misread as a marker, producing a phantom
+    // "dry-run):cancelled" column and dropping the interrupted disk's
+    // counters on manual stop.
     println!(
-        "\nscrubbing{}:",
+        "\nscan mode     : recovery assessment + {}",
         if dry_run {
-            " (recovery assessment + dry-run)"
+            "dry-run (no writes)"
         } else {
-            " (recovery assessment + REPAIR)"
+            "REPAIR (writes enabled)"
         }
     );
 

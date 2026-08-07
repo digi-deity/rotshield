@@ -571,9 +571,17 @@ newest_run_log() {
 
 # Device of the run's most recently started scrub (last "scrubbing <dev>"
 # line in the log) — the disk that was in flight when a stop killed the run.
+# Only the runner's OWN marker line matches: scrub-rs also prints a
+# "scrubbing (recovery assessment + dry-run):" banner into the same log, and
+# its LAST token is "dry-run):" — matching it handed stop() a bogus device,
+# which then failed sanitize_status_payload and silently dropped the
+# cancelled block's counters (the UI showed a phantom "dry-run):cancelled"
+# column instead of the interrupted disk's numbers).  The runner's marker is
+# the only "scrubbing" line whose next token is an absolute device path
+# (starts with "/"), so the pattern requires that.
 last_scrubbed_device() {
   local log="$1"
-  awk '/scrubbing[[:space:]]+/{dev=$NF} END{print dev}' "${log}" 2>/dev/null
+  awk '/scrubbing[[:space:]]+\//{dev=$NF} END{print dev}' "${log}" 2>/dev/null
 }
 
 # Send a signal to a process and every descendant (recursively), so a stop

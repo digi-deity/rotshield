@@ -82,8 +82,13 @@ if ($run_log !== "" && is_file($run_log)) {
             if (preg_match('/finished:\s*(.+)$/', $line, $m)) {
                 $outcome = $m[1];
             }
-            // scrub.sh's per-device start marker: "[ts] (1/2) scrubbing /dev/sdb"
-            if (preg_match('/scrubbing\s+(\S+)/', $line, $m)) {
+            // scrub.sh's per-device start marker: "[ts] (1/2) scrubbing /dev/sdb".
+            // The next token must be an absolute device path (leading "/"):
+            // scrub-rs prints its own "scrubbing (recovery assessment +
+            // dry-run):" banner into the same log, and matching that would
+            // hand the page a bogus active device ("(recovery") whenever the
+            // live status server is unavailable (STATUS_PORT=0).
+            if (preg_match('/scrubbing\s+(\/\S+)/', $line, $m)) {
                 $active = $m[1];
             }
         }
