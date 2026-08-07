@@ -28,7 +28,8 @@ plugins/
 │   ├── etc/rc.d/rc.rotshield           # schedule manager (cron.d)
 │   └── usr/local/emhttp/plugins/rotshield/
 │       ├── rotshield.page              # menu entry + Settings UI
-│       ├── images/rotshield.png
+│       ├── images/rotshield.png        # panel / plugin-list icon
+│       ├── icons/rotshield.png         # title-bar / sidebar icon (same file)
 │       ├── scripts/
 │       │   ├── install.sh              # .plg install step
 │       │   ├── uninstall.sh            # .plg remove step

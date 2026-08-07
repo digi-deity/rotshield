@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.07a">
-<!ENTITY bundleversion "2026.08.07a">
+<!ENTITY version       "2026.08.07b">
+<!ENTITY bundleversion "2026.08.07b">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -15,6 +15,16 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.07b
+- Fixed: the plugin's icons now actually render in the webGUI. The shipped
+  `images/rotshield.png` was a corrupt 115-byte placeholder (a patched
+  transparent 1x1 PNG whose IDAT fails to decompress), so browsers showed
+  nothing even though the page referenced the right path. It is replaced
+  with a real 128x128 render of the Rotshield logo, and the icon is now
+  also shipped in `icons/` — the webGUI looks there for the settings-page
+  title bar (and sidebar) icons. The plugin list, the Utilities panel and
+  the settings-page title now all show the logo.
 
 ###2026.08.07a
 - Launch path fixed: the plugin manager's Launch button now points at
