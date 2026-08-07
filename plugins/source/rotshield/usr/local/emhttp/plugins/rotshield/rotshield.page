@@ -11,9 +11,18 @@ Icon="rotshield.png"
  * scheduled runs behave identically. The Status section shows a per-disk
  * progress table fed by status.php: live counters (polled every 5 s) for
  * the disk currently being scrubbed, exact final counters from the run log
- * for finished disks. Every group and statistic row carries a question-mark
- * help popup (same style as the settings form) explaining in plain language
- * what the number counts and whether a non-zero value is good or bad.  The
+ * for finished disks. The table renders one column per TARGETED disk (the
+ * checkboxes in the form above): ticking or unticking a disk shows or
+ * hides its column immediately, as a live preview — the selection itself
+ * still persists the usual way (form POST on Save), exactly like any
+ * other field. Columns never depend on which disks have data: status.php
+ * parses the run log for every device independent of the selection, and
+ * the page keeps that data for all disks, so re-checking a disk brings its
+ * column back with the last run's results (or live progress) — nothing is
+ * lost when a column is hidden. Every group and statistic row carries a
+ * question-mark help popup (same style as the settings form) explaining in
+ * plain language what the number counts and whether a non-zero value is
+ * good or bad.  The
  * table shows only essential rows (progress, volume, mismatch, read error,
  * recovered, failed); diagnostic rows (stale, no csum, skipped) and the
  * whole Metadata group stay hidden until some disk reports a non-zero
@@ -321,7 +330,7 @@ pre { max-width: 100%; overflow-x: auto; }
 .dev-unsupported { color: #adb5bd; font-style: italic; cursor: not-allowed; }
 </style>
 
-<form method="post">
+<form method="post" id="settings-form">
   <table class="settings">
     <tr><td>Schedule <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">How often an automatic scrub runs. <b>Disabled</b> = manual only; <b>Weekly</b> = Sundays 03:00; <b>Monthly</b> = 1st of month 03:00; <b>Custom</b> = your own 5-field cron. Daily is deliberately omitted because a full scrub can take days and would overlap its own previous run. The schedule is written to /etc/cron.d by the plugin's rc script; "Run Scrub Now" always works regardless of this setting.</span></span></td>
         <td><select name="schedule">
@@ -339,7 +348,7 @@ pre { max-width: 100%; overflow-x: auto; }
       document.getElementById('cron-row').style.display = (this.value === 'custom') ? '' : 'none';
   });
   </script>
-    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, in the order listed; the whole run is written to a single per-run log (…/runs/run-&lt;ts&gt;.log) with each disk's section and final status block, and the progress table below shows per-disk results. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/sdX). An empty selection is saved as-is: the table stays empty (headers only) and scrubbing is skipped until at least one disk is selected. Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job. Disks without a btrfs filesystem (e.g. XFS) are greyed out and can't be selected — Rotshield only supports btrfs data disks.</span></span></td>
+    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, in the order listed; the whole run is written to a single per-run log (…/runs/run-&lt;ts&gt;.log) with each disk's section and final status block, and the progress table below shows per-disk results. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/sdX). An empty selection is saved as-is: the table shows no columns and scrubbing is skipped until at least one disk is selected. Ticking or unticking a disk shows or hides its table column immediately (a live preview — the selection persists when you hit Save, like any other field). Columns never depend on whether a disk has data: results for every disk are read from the run log regardless of the selection, so a newly ticked disk shows the last run's results if any exist, and unticking never discards anything. A Scrub order row under the header numbers the disks in the order they are scrubbed. Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job. Disks without a btrfs filesystem (e.g. XFS) are greyed out and can't be selected — Rotshield only supports btrfs data disks.</span></span></td>
         <td><div class="devices-list">
             <?php
             // Current target selection (recomputed after a save refreshed
@@ -396,45 +405,73 @@ pre { max-width: 100%; overflow-x: auto; }
 <h2>Status</h2>
 <p><b>Scrub:</b> <span id="scrub-line"><?= $running ? '<span style="color:#c00">Running</span>' : 'Idle' ?></span></p>
 <?php
-// Configured scrub targets: these appear as table columns up front (pending)
-// and fill in as the sequential run reaches each disk.  Any device that
-// shows up in a status block is added as a column dynamically.  Column
-// order follows the config order (scrub.sh scrubs DEVICES verbatim), so
-// the table always matches the execution order.  Empty entries are
-// filtered: an empty (deliberately saved) DEVICES list means no columns.
-$configured_devices = array_values(array_filter(
-    explode(' ', $config['DEVICES'] ?? ($config['DEVICE'] ?? '')),
-    'strlen'
-));
+// Table columns are driven by the target-disk checkboxes in the form
+// above (see the script below): the checked-state rendered by the form IS
+// the saved selection, and ticking/unticking re-renders the table as a
+// live preview.  No separate configured-device list is embedded — the
+// checkbox DOM is the single source of truth for the column set.
 ?>
 <div id="progress-wrap">
   <table id="progress-table"></table>
-  <p style="margin-top:8px;color:#6c757d;font-size:12px">Live counters refresh every 5&nbsp;s for the disk being scrubbed; finished disks keep their exact final counters from the run log. <span id="progress-updated"></span></p>
+  <p style="margin-top:8px;color:#6c757d;font-size:12px">Live counters refresh every 5&nbsp;s for the disk being scrubbed; finished disks keep their exact final counters from the run log. Columns follow the target-disk checkboxes above — hidden disks keep their stored results and reappear when re-checked. <span id="progress-updated"></span></p>
 </div>
 <script>
-// Progress table: rows = statistics grouped by hierarchy, columns = disks.
-// Polls status.php every 5 s; the response is blank-line-separated
-// key=value blocks (final per-device blocks from the run log, then the live
-// block, then meta), all parsed with the same tiny kv parser.  Configured
-// disks start as pending columns; a new run (run_log change, or idle ->
-// running) resets the table.
+// Progress table: rows = statistics grouped by hierarchy, columns = the
+// TARGETED disks (the checkboxes in the settings form above).  Polls
+// status.php every 5 s; the response is blank-line-separated key=value
+// blocks (final per-device blocks from the run log, then the live block,
+// then meta), all parsed with the same tiny kv parser.
+//
+// The column set is STABLE: every array data disk (each checkbox) is a
+// potential column, and the table always renders exactly the checked
+// ones, in checkbox order (= discovery order = the order the saved
+// DEVICES list stores them in, which is the scrub order).  Ticking or
+// unticking a disk just re-renders with that column added or removed — a
+// live preview; the selection itself persists the usual way (form POST on
+// Save).  Data tracking is independent of the selection: `disks` holds
+// per-device state for every known device, so hiding a column never
+// discards its results and re-checking a disk shows whatever progress
+// exists for it (the last run's final counters, or live progress).  A new
+// run (run_log change, or idle -> running) resets the table's data.
 (function () {
   var url = '/plugins/<?=htmlspecialchars($plugin)?>/status.php';
   var POLL_MS = 5000;
 
-  var configured = <?=json_encode($configured_devices, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES)?>;
-
-  // Per-disk state: { st: 'pending'|'active'|'done'|'error', data: {kv} }
+  // Per-disk state for every KNOWN device (each checkbox): { st, data }.
+  // `data` is the latest status kv block (final counters from the run
+  // log, or live counters while running); `st` is pending|active|done|
+  // error|cancelled.
   var disks = {};
   var runLog = null;
   var running = false;
 
-  function mkDisk(st) { return { st: st, data: {} }; }
-  function resetDisks() {
-    disks = {};
-    for (var i = 0; i < configured.length; i++) disks[configured[i]] = mkDisk('pending');
+  // The known devices ARE the checkboxes — a single source of truth for
+  // the form and the table columns (checkbox order = discovery order =
+  // the alphabetical order the saved DEVICES list is stored in).
+  function allDevices() {
+    var boxes = document.querySelectorAll('input[name="devices[]"]');
+    var out = [];
+    for (var i = 0; i < boxes.length; i++) out.push(boxes[i].value);
+    return out;
   }
-  function ensureDisk(dev) { if (!disks[dev]) disks[dev] = mkDisk('pending'); }
+  // The current target selection = the checked boxes (the live DOM state;
+  // the same state the form POST persists on Save).
+  function targetedDevices() {
+    var boxes = document.querySelectorAll('input[name="devices[]"]');
+    var out = [];
+    for (var i = 0; i < boxes.length; i++) if (boxes[i].checked) out.push(boxes[i].value);
+    return out;
+  }
+
+  function mkDisk(st) { return { st: st, data: {} }; }
+  // New run: reset the DATA for every known device (columns are stable —
+  // only the data layer resets; status blocks re-populate it as the run
+  // progresses).
+  function resetDisks() {
+    var devs = allDevices();
+    disks = {};
+    for (var i = 0; i < devs.length; i++) disks[devs[i]] = mkDisk('pending');
+  }
   resetDisks();
 
   // --- formatting -------------------------------------------------------
@@ -577,10 +614,15 @@ $configured_devices = array_values(array_filter(
   // has reported a non-zero value for the stat.  Conditional rows and
   // groups (see GROUPS) render only then — otherwise the whole row (or
   // the whole group including its header) is omitted for every disk.
+  // Visibility of conditional rows/groups is judged on the RENDERED
+  // columns only: a hidden (untargeted) disk's non-zero diagnostics must
+  // not make a group appear whose visible cells would all be em-dashes.
   function anyDisk(key) {
-    var devs = Object.keys(disks);
+    var devs = targetedDevices();
     for (var i = 0; i < devs.length; i++) {
-      var v = disks[devs[i]].data[key];
+      var d = disks[devs[i]];
+      if (!d) continue;
+      var v = d.data[key];
       if (v !== undefined && Number(v) > 0) return true;
     }
     return false;
@@ -596,7 +638,12 @@ $configured_devices = array_values(array_filter(
   }
 
   function renderTable() {
-    var devs = Object.keys(disks);
+    // Columns = the checked (targeted) disks, in checkbox order — the same
+    // order the saved DEVICES list stores them in, which is the scrub
+    // order.  Rendering is a pure function of the current selection and
+    // data; untargeted disks simply get no column (their data stays in
+    // `disks` and reappears if re-targeted).
+    var devs = targetedDevices();
     var span = devs.length + 1;
     var html = '<thead><tr><th style="text-align:left">Statistic</th>';
     for (var i = 0; i < devs.length; i++) {
@@ -613,6 +660,16 @@ $configured_devices = array_values(array_filter(
     // body (groups + rows) appears once at least one disk is targeted.
     if (devs.length > 0) {
       html += '<tbody>';
+      // Scrub-order row: numbers the targeted disks in the order they are
+      // scrubbed (checkbox order == the saved DEVICES order, which is the
+      // order scrub.sh runs them in; a hand-edited config.cfg order is
+      // honored by the run but cannot be shown here because the page's
+      // columns derive from the checkbox list).
+      html += '<tr><td class="stat">' +
+              helpWrap('Scrub order', "The order this run scrubs the targeted disks in: disk 1 is scrubbed first, then disk 2, and so on \u2014 one disk at a time, sequentially. The order is the one the settings form lists the disks in: the saved DEVICES list stores the disks in that same order and scrub.sh runs it verbatim.", false) +
+              '</td>';
+      for (var oi = 0; oi < devs.length; oi++) html += '<td>' + (oi + 1) + '</td>';
+      html += '</tr>';
     for (var g = 0; g < GROUPS.length; g++) {
       var grp = GROUPS[g];
       // Conditional group (Metadata): hide the header AND its rows for
@@ -674,23 +731,24 @@ $configured_devices = array_values(array_filter(
     running = meta.running === '1';
 
     // Final blocks first, live block last (live wins for the active disk).
+    // Data is tracked for every KNOWN device (each checkbox), independent
+    // of the selection — hidden disks keep their results.  A device that
+    // is not one of the known disks (stray value in a log, device removed
+    // from the array) is ignored: it can never create a column.
     for (var i = 0; i < p.finals.length; i++) {
       var f = p.finals[i];
-      if (!f.device) continue;
-      ensureDisk(f.device);
+      if (!f.device || !disks[f.device]) continue;
       disks[f.device].st = f.state === 'error' ? 'error'
                          : f.state === 'cancelled' ? 'cancelled' : 'done';
       disks[f.device].data = f;
     }
-    if (p.live && p.live.device) {
-      ensureDisk(p.live.device);
+    if (p.live && p.live.device && disks[p.live.device]) {
       disks[p.live.device].st = 'active';
       disks[p.live.device].data = p.live;
     }
     // Status server down mid-run (e.g. STATUS_PORT=0): the log's most
     // recent "scrubbing <dev>" line still tells us which disk is active.
-    if (running && !p.live && meta.active_device) {
-      ensureDisk(meta.active_device);
+    if (running && !p.live && meta.active_device && disks[meta.active_device]) {
       if (disks[meta.active_device].st === 'pending') disks[meta.active_device].st = 'active';
     }
 
@@ -733,6 +791,15 @@ $configured_devices = array_values(array_filter(
   }
   poll();
   setInterval(poll, POLL_MS);
+
+  // Live column preview: ticking/unticking a target disk shows or hides
+  // its table column immediately.  Pure rendering — the selection itself
+  // still persists the usual way (form POST on Save), and no data is
+  // touched: hidden disks keep their tracked results and reappear with
+  // them when re-checked.
+  document.getElementById('settings-form').addEventListener('change', function (ev) {
+    if (ev.target && ev.target.name === 'devices[]') renderTable();
+  });
 })();
 </script>
 

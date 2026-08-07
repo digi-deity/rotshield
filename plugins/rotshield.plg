@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.07e">
-<!ENTITY bundleversion "2026.08.07e">
+<!ENTITY version       "2026.08.07f">
+<!ENTITY bundleversion "2026.08.07f">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -15,6 +15,21 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.07f
+- The progress table now follows the target-disk selection live: ticking
+  or unticking a disk in the settings form shows or hides its table column
+  immediately, as a preview (the selection itself still persists with
+  Save, as before). Columns no longer depend on which disks have data —
+  status.php parses the run log for every device regardless of the
+  selection, so re-checking a disk brings its column back with the last
+  run's results (or live progress), and hiding a disk never loses its
+  stored progress.
+- The table's column set is now stable and derived from the checkbox list
+  instead of being assembled dynamically from status blocks: a stray
+  device in a log can no longer create a phantom column, and a new
+  "Scrub order" row numbers the targeted disks in the order they are
+  scrubbed.
 
 ###2026.08.07e
 - Robust parity reconstruction on real arrays: device capacities for all
