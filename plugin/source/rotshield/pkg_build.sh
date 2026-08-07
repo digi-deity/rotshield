@@ -15,12 +15,12 @@
 #
 # Unlike rathole we do NOT download a binary at install time — the
 # scrub-rs / craft-corrupt binaries are copied into
-#   usr/local/emhttp/plugins/btrfs-integrity-recovery/bin/
+#   usr/local/emhttp/plugins/rotshield/bin/
 # by CI (build-plugin.yml) before this script runs, so they are bundled.
 
 DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 PLUGIN_DIR="$(dirname "$(dirname "${DIR}")")"          # .../plugin
-PLG="${PLUGIN_DIR}/btrfs-integrity-recovery.plg"
+PLG="${PLUGIN_DIR}/rotshield.plg"
 tmpdir=/tmp/tmp.$(( $RANDOM * 19318203981230 + 40 ))
 plugin=$(basename "${DIR}")
 archive="$(dirname "$(dirname "${DIR}")")/archive"
@@ -37,7 +37,7 @@ bundle="${plugin}-${VERSION}-x86_64-1.txz"
 # Guard: the .plg must reference exactly this bundle (its bundlefile
 # entity embeds &version;), otherwise the released asset would not match
 # the .plg's FILE Name / bundleURL and updates would 404 or go stale.
-grep -q "btrfs-integrity-recovery-&version;-x86_64-1.txz" "${PLG}" || {
+grep -q "rotshield-&version;-x86_64-1.txz" "${PLG}" || {
   echo "FATAL: ${PLG} does not define the versioned bundlefile entity" >&2
   exit 1
 }

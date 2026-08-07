@@ -8,7 +8,7 @@
 # applies the schedule. No binary download happens here.
 
 set -u
-PLUGIN="btrfs-integrity-recovery"
+PLUGIN="rotshield"
 PLUGIN_DIR="/usr/local/emhttp/plugins/${PLUGIN}"
 CONFIG_DIR="/boot/config/plugins/${PLUGIN}"
 CONFIG_FILE="${CONFIG_DIR}/config.cfg"
@@ -69,7 +69,7 @@ esac
 
 echo ""
 echo "-----------------------------------------------------------"
-echo " btrfs-integrity-recovery has been installed."
-echo " Open Settings -> btrfs-integrity-recovery to run a scrub."
+echo " rotshield has been installed."
+echo " Open Settings -> Rotshield to run a scrub."
 echo "-----------------------------------------------------------"
 echo ""

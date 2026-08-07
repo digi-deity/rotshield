@@ -1,9 +1,9 @@
 Menu="Utilities"
-Title="btrfs-integrity-recovery"
-Icon="btrfs-integrity-recovery.png"
+Title="Rotshield"
+Icon="rotshield.png"
 ---
 <?php
-/* btrfs-integrity-recovery settings page
+/* Rotshield settings page
  * Served by emhttp. Lets the user pick the device/array partition, set a
  * schedule, and trigger a scrub on demand. The actual work is done by
  * scripts/scrub.sh (backgrounded) so the UI never blocks. "Run Scrub Now"
@@ -12,10 +12,10 @@ Icon="btrfs-integrity-recovery.png"
  * progress table fed by status.php: live counters (polled every 5 s) for
  * the disk currently being scrubbed, exact final counters from the run log
  * for finished disks. Raw logs are no longer shown in the UI (they are
- * still written to /boot/config/plugins/btrfs-integrity-recovery/runs for
+ * still written to /boot/config/plugins/rotshield/runs for
  * debugging).
  */
-$plugin      = "btrfs-integrity-recovery";
+$plugin      = "rotshield";
 $plugin_dir  = "/usr/local/emhttp/plugins/$plugin";
 $config_dir  = "/boot/config/plugins/$plugin";
 $config_file = "$config_dir/config.cfg";
@@ -159,7 +159,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 // reflects BOTH manual and scheduled runs — no status-file bookkeeping.
 $running = trim(shell_exec("$plugin_dir/scripts/scrub.sh running 2>/dev/null")) === '1';
 ?>
-<h1 style="margin:0 0 12px">btrfs Integrity Recovery</h1>
+<h1 style="margin:0 0 12px">Rotshield</h1>
 <?php if ($message): ?><div class="notice"><?=htmlspecialchars($message)?></div><?php endif; ?>
 
 <style>

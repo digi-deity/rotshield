@@ -1,14 +1,14 @@
 <?xml version='1.0' standalone='yes'?>
 
 <!DOCTYPE PLUGIN [
-<!ENTITY name          "btrfs-integrity-recovery">
-<!ENTITY author        "iiLaurens">
+<!ENTITY name          "rotshield">
+<!ENTITY author        "digi-deity">
 <!ENTITY version       "2026.08.05c">
 <!ENTITY bundleversion "2026.08.05c">
-<!ENTITY launch        "Settings/btrfs-integrity-recovery">
-<!ENTITY pluginURL     "https://raw.githubusercontent.com/iiLaurens/unraid-btrfs-integrity-recovery/main/plugin/btrfs-integrity-recovery.plg">
-<!ENTITY bundlefile    "btrfs-integrity-recovery-&version;-x86_64-1.txz">
-<!ENTITY bundleURL     "https://github.com/iiLaurens/unraid-btrfs-integrity-recovery/releases/download/v&version;/&bundlefile;">
+<!ENTITY launch        "Settings/rotshield">
+<!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugin/rotshield.plg">
+<!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
+<!ENTITY bundleURL     "https://github.com/digi-deity/rotshield/releases/download/v&version;/&bundlefile;">
 ]>
 
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;">
@@ -36,7 +36,7 @@
 ###2026.08.05b
 - Plugin updates now actually replace the shipped files. The bundle
   filename and download URL are derived from the plugin version
-  (btrfs-integrity-recovery-&lt;version&gt;-x86_64-1.txz, fetched from the
+  (rotshield-&lt;version&gt;-x86_64-1.txz, fetched from the
   release tagged v&lt;version&gt;), so every release downloads a fresh bundle.
   unRAID's plugin manager never re-downloads a file that already exists
   on the flash drive ("skipping: ... already exists"), which is why the
@@ -46,7 +46,7 @@
   replaces the previous package and drops files that no longer ship.
 - Stale bundles are pruned from the flash drive on install/update, so
   repeated updates don't accumulate .txz files under
-  /boot/config/plugins/btrfs-integrity-recovery/install/.
+  /boot/config/plugins/rotshield/install/.
 - Releases must be tagged v&lt;version&gt; matching the .plg version; the
   build workflow verifies this and fails the release otherwise.
 
@@ -148,7 +148,7 @@ Install the bundle. It already contains the prebuilt binaries
 (scrub-rs, craft-corrupt) plus all plugin files, so there is NO
 binary download at install time (we build and ship it ourselves).
 
-The bundle filename is VERSIONED (btrfs-integrity-recovery-<version>-
+The bundle filename is VERSIONED (rotshield-<version>-
 x86_64-1.txz) on purpose. unRAID's plugin manager does not re-download
 a FILE whose target already exists on the flash drive ("skipping: ...
 already exists"), so a fixed bundle name meant updates only replaced
@@ -166,7 +166,7 @@ Plain install-new is correct here (no reinstall flag): the versioned
 package name is what makes upgradepkg perform the upgrade; reinstall
 would only re-extract an already-installed package on every boot.
 -->
-<FILE Name="/boot/config/plugins/btrfs-integrity-recovery/install/&bundlefile;" Run="upgradepkg --install-new">
+<FILE Name="/boot/config/plugins/rotshield/install/&bundlefile;" Run="upgradepkg --install-new">
 <URL>&bundleURL;</URL>
 </FILE>
 
@@ -174,7 +174,7 @@ would only re-extract an already-installed package on every boot.
      $1 = current plugin version (from &version;), used by install.sh to
      prune stale bundles from the flash drive. -->
 <FILE Run="/bin/bash" Method="install">
-<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh &version;</INLINE>
+<INLINE>/usr/local/emhttp/plugins/rotshield/scripts/install.sh &version;</INLINE>
 </FILE>
 
 <!-- Re-run the same logic on upgrade. NOTE: unRAID's stock plugin script
@@ -184,12 +184,12 @@ would only re-extract an already-installed package on every boot.
      safety net for plugin scripts/forks that do call it; install.sh is
      idempotent. -->
 <FILE Run="/bin/bash" Method="upgrade">
-<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/install.sh &version;</INLINE>
+<INLINE>/usr/local/emhttp/plugins/rotshield/scripts/install.sh &version;</INLINE>
 </FILE>
 
 <!-- Uninstall logic. -->
 <FILE Run="/bin/bash" Method="remove">
-<INLINE>/usr/local/emhttp/plugins/btrfs-integrity-recovery/scripts/uninstall.sh</INLINE>
+<INLINE>/usr/local/emhttp/plugins/rotshield/scripts/uninstall.sh</INLINE>
 </FILE>
 
 </PLUGIN>

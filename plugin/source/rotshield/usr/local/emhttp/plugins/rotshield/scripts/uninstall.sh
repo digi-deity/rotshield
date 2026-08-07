@@ -1,7 +1,7 @@
 #!/bin/bash
 # scripts/uninstall.sh — run by the .plg remove step.
 set -u
-PLUGIN="btrfs-integrity-recovery"
+PLUGIN="rotshield"
 PLUGIN_DIR="/usr/local/emhttp/plugins/${PLUGIN}"
 CONFIG_DIR="/boot/config/plugins/${PLUGIN}"
 RC="/etc/rc.d/rc.${PLUGIN}"
@@ -11,7 +11,7 @@ RC="/etc/rc.d/rc.${PLUGIN}"
 rm -f /etc/cron.d/${PLUGIN} 2>/dev/null
 
 # 2. Remove the Slackware package(s). The bundle name is versioned
-#    (btrfs-integrity-recovery-<version>-x86_64-1.txz), so iterate the
+#    (rotshield-<version>-x86_64-1.txz), so iterate the
 #    package DB and remove every installed version of the plugin package.
 for pkg in /var/log/packages/${PLUGIN}-*; do
   [ -f "$pkg" ] && removepkg "$(basename "$pkg")" &>/dev/null
@@ -29,5 +29,5 @@ rm -rf "${CONFIG_DIR}"
 rm -f /var/log/${PLUGIN}.log
 
 echo ""
-echo " btrfs-integrity-recovery has been uninstalled."
+echo " rotshield has been uninstalled."
 echo ""

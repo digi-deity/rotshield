@@ -1,5 +1,5 @@
 <?php
-/* status.php — aggregated status endpoint for the btrfs-integrity-recovery page.
+/* status.php — aggregated status endpoint for the Rotshield page.
  *
  * Polled by the Settings page (every 5 s) to feed the per-disk progress
  * table.  Returns blank-line-separated `key=value` blocks, one per source:
@@ -22,7 +22,7 @@
  * final blocks, then the live block, then meta — the live block wins for
  * the active disk.  Read-only; no user input reaches this script.
  */
-$plugin     = "btrfs-integrity-recovery";
+$plugin     = "rotshield";
 $plugin_dir = "/usr/local/emhttp/plugins/$plugin";
 $config_dir = "/boot/config/plugins/$plugin";
 $runs_dir   = "$config_dir/runs";

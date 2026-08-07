@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 /// Exit-code contract (kept small and stable so callers — e.g. the
-/// btrfs-integrity-recovery unRAID plugin — can branch on meaning, not on
+/// Rotshield unRAID plugin — can branch on meaning, not on
 /// guessing whether a non-zero code means "found problems" or "crashed").
 /// The code reflects the *state of the data*, NOT which flags were passed:
 /// the recovery-possibility assessment runs in every mode (plain scrub,

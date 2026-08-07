@@ -1,0 +1,12 @@
+rotshield: rotshield (btrfs scrub + parity recovery)
+rotshield:
+rotshield: A read-only btrfs scrubber and NonRAID/Unraid parity-aware
+rotshield: recovery utility. It scans btrfs on-disk metadata, verifies the
+rotshield: checksum of every data sector, and uses the array P/Q parity to
+rotshield: recover single-disk corruption that btrfs cannot self-heal.
+rotshield:
+rotshield: Homepage: https://github.com/digi-deity/rotshield
+rotshield:
+rotshield:
+rotshield:
+rotshield:

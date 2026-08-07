@@ -1,4 +1,4 @@
-# btrfs-integrity-recovery — unRAID plugin
+# Rotshield — unRAID plugin
 
 > This document covers the unRAID plugin half of the project. For the
 > project overview, the `scrub-rs` tool, and the integration-test harness,
@@ -10,7 +10,7 @@ you can run a scrub on demand or on a schedule. The binaries are always
 bundled inside this plugin — there is no separate distribution.
 
 Unlike a typical daemon plugin, this is an **on-demand tool**: there is no
-long-running service. The Settings page (Utilities → btrfs-integrity-recovery)
+long-running service. The Settings page (Utilities → Rotshield)
 triggers `scripts/scrub.sh`, which runs `scrub-rs` against the configured device
 and writes a per-run log the page can show. An optional schedule is applied via
 a `cron.d` entry managed by the `rc` script.
@@ -19,20 +19,20 @@ a `cron.d` entry managed by the `rc` script.
 
 ```
 plugin/
-├── btrfs-integrity-recovery.plg          # plugin manifest (installs the bundle)
-├── README.md                             # this file
-├── source/btrfs-integrity-recovery/      # files packaged into the .txz bundle
-│   ├── pkg_build.sh                      # tars the tree -> archive/*.txz
+├── rotshield.plg                       # plugin manifest (installs the bundle)
+├── README.md                           # this file
+├── source/rotshield/                   # files packaged into the .txz bundle
+│   ├── pkg_build.sh                    # tars the tree -> archive/*.txz
 │   ├── install/slack-desc
-│   ├── etc/rc.d/rc.btrfs-integrity-recovery   # schedule manager (cron.d)
-│   └── usr/local/emhttp/plugins/btrfs-integrity-recovery/
-│       ├── btrfs-integrity-recovery.page # menu entry + Settings UI
-│       ├── images/btrfs-integrity-recovery.png
+│   ├── etc/rc.d/rc.rotshield           # schedule manager (cron.d)
+│   └── usr/local/emhttp/plugins/rotshield/
+│       ├── rotshield.page              # menu entry + Settings UI
+│       ├── images/rotshield.png
 │       ├── scripts/
-│       │   ├── install.sh                # .plg install step
-│       │   ├── uninstall.sh              # .plg remove step
-│       │   └── scrub.sh                  # backend runner (run / status)
-│       └── bin/                          # shipped binaries (git-ignored; CI fills)
+│       │   ├── install.sh              # .plg install step
+│       │   ├── uninstall.sh            # .plg remove step
+│       │   └── scrub.sh                # backend runner (run / status)
+│       └── bin/                        # shipped binaries (git-ignored; CI fills)
 │           ├── scrub-rs
 │           └── craft-corrupt
 └── archive/                              # built .txz (git-ignored; produced by CI)
@@ -58,15 +58,15 @@ cargo build --release
 cd ..
 
 # 2. Stage them into the plugin tree
-BIN=plugin/source/btrfs-integrity-recovery/usr/local/emhttp/plugins/btrfs-integrity-recovery/bin
+BIN=plugin/source/rotshield/usr/local/emhttp/plugins/rotshield/bin
 cp scrub-rs/target/release/scrub-rs    "$BIN"/
 cp scrub-rs/target/release/craft-corrupt "$BIN"/
 chmod 755 "$BIN"/scrub-rs "$BIN"/craft-corrupt
 
 # 3. Package the bundle
-cd plugin/source/btrfs-integrity-recovery
+cd plugin/source/rotshield
 bash pkg_build.sh
-# -> ../../../archive/btrfs-integrity-recovery-<version>-x86_64-1.txz
+# -> ../../../archive/rotshield-<version>-x86_64-1.txz
 #    (<version> is read from the .plg's <!ENTITY version>)
 ```
 
@@ -84,18 +84,18 @@ bash pkg_build.sh
 
 ## Install on unRAID
 
-1. Grab `btrfs-integrity-recovery-<version>-x86_64-1.txz` (the version
+1. Grab `rotshield-<version>-x86_64-1.txz` (the version
    matching your `.plg`) from the matching GitHub Release (or build it
    locally per above).
 2. Install the plugin via the unRAID webUI (Plugins → Install Plugin, paste the
    raw `.plg` URL), or drop the `.plg` on the flash drive and install it.
-3. Open **Settings → btrfs-integrity-recovery**, select the target raw data
+3. Open **Settings → Rotshield**, select the target raw data
    disk(s) (auto-discovered from the array's `/proc/nmdstat`; the partition
    offset and freeze mount are applied automatically), choose recovery mode
    and write vs dry-run, optionally pick a schedule, and click **Run Scrub
    Now**.
 
-## Configuration keys (`/boot/config/plugins/btrfs-integrity-recovery/config.cfg`)
+## Configuration keys (`/boot/config/plugins/rotshield/config.cfg`)
 
 The Settings page writes these INI-style keys; `scripts/scrub.sh` turns them
 into `scrub-rs` arguments (see `scrub-rs/src/main.rs` for the full flag list):
@@ -194,10 +194,10 @@ recovery ran; 0 = plain scrub, the table shows n/a).
 
 ## Releasing
 
-Bump `version` / `bundleversion` in `btrfs-integrity-recovery.plg` (and add a
+Bump `version` / `bundleversion` in `rotshield.plg` (and add a
 CHANGES entry), then push a tag `v<version>` (e.g. `v2026.08.05b`). The
 `build-plugin.yml` workflow builds, packages and attaches
-`btrfs-integrity-recovery-<version>-x86_64-1.txz` to that release with
+`rotshield-<version>-x86_64-1.txz` to that release with
 auto-generated release notes — and verifies the tag matches the `.plg`
 version, so the `.plg`'s `bundleURL` (`…/releases/download/v<version>/…`)
 always resolves.

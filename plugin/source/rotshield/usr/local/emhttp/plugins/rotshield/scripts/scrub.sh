@@ -1,5 +1,5 @@
 #!/bin/bash
-# scripts/scrub.sh — backend runner for the btrfs-integrity-recovery plugin.
+# scripts/scrub.sh — backend runner for the Rotshield plugin.
 #
 #   scrub.sh run      run scrub-rs against the configured device(s). Multiple
 #                     disks (DEVICES, space-separated) are scrubbed SEQUENTIALLY
@@ -24,7 +24,7 @@
 # in the UI.
 
 set -u
-PLUGIN="btrfs-integrity-recovery"
+PLUGIN="rotshield"
 PLUGIN_DIR="/usr/local/emhttp/plugins/${PLUGIN}"
 CONFIG_DIR="/boot/config/plugins/${PLUGIN}"
 CONFIG_FILE="${CONFIG_DIR}/config.cfg"

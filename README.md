@@ -1,4 +1,4 @@
-# unraid-btrfs-integrity-recovery
+# Rotshield
 
 Heal corrupted files on unRAID / NonRAID arrays that btrfs can detect but
 cannot fix — by reading the raw block devices underneath the filesystem and
@@ -9,7 +9,7 @@ This repository is the home of the whole project. It contains:
 - **`scrub-rs`** — a standalone Rust tool that scrubs a btrfs filesystem's
   checksums and uses the NonRAID array's P/Q parity to recover single-disk
   corruption that btrfs itself can't self-heal.
-- **The unRAID plugin** — a thin wrapper that ships the tool to unRAID as a
+- **The Rotshield unRAID plugin** — a thin wrapper that ships the tool to unRAID as a
   Settings-page utility (run a scrub on demand or on a schedule). The
   binaries are always bundled inside the plugin; there is no separate
   distribution.
@@ -162,7 +162,7 @@ ECC memory, good cables, and verifying transfers from other machines.
 | Path | What it is |
 |------|-----------|
 | `scrub-rs/` | The Rust crate: `scrub-rs` (btrfs scrub + parity recovery CLI) and `craft-corrupt` (test-only corruption injector). See [`scrub-rs/README.md`](scrub-rs/README.md). |
-| `plugin/` | The unRAID plugin that bundles the binaries behind a Settings-page UI. See [`plugin/README.md`](plugin/README.md). |
+| `plugin/` | The Rotshield unRAID plugin that bundles the binaries behind a Settings-page UI. See [`plugin/README.md`](plugin/README.md). |
 | `mk_array.sh` / `teardown_disk.sh` / `nmdctl` | Local test-array helpers: assemble a loop-device-backed NonRAID array (and tear it down) for manual experiments. |
 | `.github/workflows/` | CI: Rust lint, btrfs matrix + array recovery tests, and the plugin build/release. |
 
@@ -172,7 +172,7 @@ source.
 
 ## Getting started
 
-**Plugin users** — install the prebuilt plugin on unRAID and drive a scrub
+**Plugin users** — install the Rotshield plugin on unRAID and drive a scrub
 from the Settings page. See [`plugin/README.md`](plugin/README.md) for the
 `.plg` / `.txz` bundle, install steps, and configuration keys.
 

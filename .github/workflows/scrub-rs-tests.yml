@@ -1,6 +1,6 @@
 name: scrub-rs Integration Tests With Asymmetric Disks
 
-# Rust port of unraid-btrfs-integrity-recovery/.github/workflows/integration-tests.yml.
+# Rust port of rotshield/.github/workflows/integration-tests.yml.
 # Same diverse 6-disk asymmetric array (P, Q + 4 data disks with ascending
 # partition offsets and shrinking sizes) as the original Python workflow, but
 # exercises scrub-rs / craft-corrupt instead of recover.py / btrfs_manipulate.py.

@@ -1,12 +1,12 @@
 #!/bin/bash
-# /etc/rc.d/rc.btrfs-integrity-recovery
+# /etc/rc.d/rc.rotshield
 #
 # This plugin is an on-demand tool (not a long-running daemon), so this
 # rc script only manages the optional schedule: it installs/removes a
 # cron.d entry based on SCHEDULE in the config file. `start` applies the
 # schedule, `stop` clears it, `restart` re-applies.
 
-PLUGIN="btrfs-integrity-recovery"
+PLUGIN="rotshield"
 PLUGIN_DIR="/usr/local/emhttp/plugins/${PLUGIN}"
 CONFIG_DIR="/boot/config/plugins/${PLUGIN}"
 CONFIG_FILE="${CONFIG_DIR}/config.cfg"
