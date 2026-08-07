@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.05c">
-<!ENTITY bundleversion "2026.08.05c">
+<!ENTITY version       "2026.08.07">
+<!ENTITY bundleversion "2026.08.07">
 <!ENTITY launch        "Settings/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugin/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -15,6 +15,14 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.07
+- Rebrand: the plugin is now **Rotshield** (plugin id `rotshield`) under
+  digi-deity/rotshield. The .plg manifest, page + icon, scripts, config dir
+  (/boot/config/plugins/rotshield), rc script and slack-desc were renamed;
+  pluginURL/bundleURL point at the new repo, and the versioned bundle keeps
+  its rotshield-&lt;version&gt;-x86_64-1.txz name. The Rust tools keep their
+  scrub-rs / craft-corrupt names and ship bundled with the plugin only.
 
 ###2026.08.05c
 - Fixed: final per-disk status blocks were served without their key names
