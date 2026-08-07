@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.07">
-<!ENTITY bundleversion "2026.08.07">
+<!ENTITY version       "2026.08.07a">
+<!ENTITY bundleversion "2026.08.07a">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -16,22 +16,28 @@
 <CHANGES>
 ##&name;
 
+###2026.08.07a
+- Launch path fixed: the plugin manager's Launch button now points at
+  `Utilities/rotshield`, matching where the page actually lives (the .page
+  file's Menu attribute); the previous `Settings/rotshield` launch 404'd.
+- Community Apps submission prep: added the repository profile
+  (`ca_profile.xml`), the CA wrapper (`plugins/rotshield.xml`, whose
+  PluginURL matches the .plg's pluginURL exactly), an Apache-2.0 LICENSE,
+  and the `rotshield.svg` repository icon wired into both CA files. The
+  wrapper has no MinVer/MaxVer caps, so new unRAID releases don't require
+  maintenance.
+- Repo layout: the plugin tree moved from `plugin/` to `plugins/` (the
+  Community Apps starter convention — `plugins/` now holds the CA wrapper,
+  the manifest, the build tree and the archive); pluginURL and the build
+  workflow were updated to match.
+
 ###2026.08.07
-- Fixed: the plugin's launch path now points at `Utilities/rotshield`,
-  matching where the page actually lives (the .page file's Menu attribute);
-  the previous `Settings/rotshield` launch made the plugin manager's
-  Launch button 404.
 - Rebrand: the plugin is now **Rotshield** (plugin id `rotshield`) under
   digi-deity/rotshield. The .plg manifest, page + icon, scripts, config dir
   (/boot/config/plugins/rotshield), rc script and slack-desc were renamed;
   pluginURL/bundleURL point at the new repo, and the versioned bundle keeps
   its rotshield-&lt;version&gt;-x86_64-1.txz name. The Rust tools keep their
   scrub-rs / craft-corrupt names and ship bundled with the plugin only.
-- Repo layout: the plugin tree moved from `plugin/` to `plugins/` (the
-  Community Apps starter convention — `plugins/` now holds the CA wrapper
-  `plugins/rotshield.xml`, the manifest `plugins/rotshield.plg`, the build
-  tree and the archive); pluginURL and the build workflow were updated to
-  match.
 
 ###2026.08.05c
 - Fixed: final per-disk status blocks were served without their key names
