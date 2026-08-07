@@ -1,113 +1,86 @@
 # Rotshield
 
-Heal corrupted files on unRAID / NonRAID arrays that btrfs can detect but
-cannot fix — by reading the raw block devices underneath the filesystem and
-rebuilding the bad blocks from the array's P/Q parity.
-
-This repository is the home of the whole project. It contains:
-
-- **`scrub-rs`** — a standalone Rust tool that scrubs a btrfs filesystem's
-  checksums and uses the NonRAID array's P/Q parity to recover single-disk
-  corruption that btrfs itself can't self-heal.
-- **The Rotshield unRAID plugin** — a thin wrapper that ships the tool to unRAID as a
-  Settings-page utility (run a scrub on demand or on a schedule). The
-  binaries are always bundled inside the plugin; there is no separate
-  distribution.
-- **A shell integration-test harness** that validates the tool against a
-  diverse set of loop-device-backed btrfs images and live NonRAID arrays.
+A btrfs scrubber for unRAID/NonRAID arrays. It checks your data disks for
+bitrot the same way `btrfs scrub` does, and on the rare occasion it finds
+actual corruption, it rebuilds the bad blocks from the array's P/Q parity
+instead of just reporting them.
 
 ## Why this exists
 
-Non-parity (single-disk) btrfs disks in an unRAID/NonRAID array are each
-their own filesystem. btrfs gives them checksums and error *detection*, but
-**not** self-healing — there is no second copy of the data to rebuild from.
-The array's P/Q parity disks *do* hold the information needed to rebuild any
-single corrupted block, but the unRAID parity layer operates on whole disks:
-it can rebuild a *missing* disk, not a *corrupted file* on a present one.
+unRAID already supports scrubbing a btrfs disk, and that scrub will happily
+tell you a block is corrupt. It just won't do anything about it. A
+single-disk btrfs filesystem gets checksums and corruption *detection* from
+btrfs, but not self-healing: there's no second copy on the same disk to
+recover from. So a failed scrub leaves you with a report and two bad
+options: resilver the entire disk from parity to fix one bad block, or go
+digging through logs to figure out which file it was and pull it from a
+backup, if you have one.
 
-This project bridges that gap. It reads the raw block device underneath the
-filesystem, finds every sector whose btrfs checksum fails, and reconstructs
-those exact sectors from the surviving data disks plus P/Q parity — healing
-the file in place while the disk stays in the array.
+Meanwhile the fix is sitting one layer up, and neither side is set up to
+reach it. btrfs sees a single disk: checksums, block layout, enough
+information to know exactly which bytes are wrong. It has no idea an array
+exists above it. unRAID sees the array: which disks make it up and
+how to rebuild any one of them from the others. It has no idea what's
+inside those disks, on purpose, since that ignorance is exactly what lets
+one array hold btrfs, XFS, and anything else side by side. So you end up
+with one side that knows what's broken and another that knows how to fix
+it, and nothing connecting the two.
 
-## How it works
+Rotshield exists because that mismatch was annoying enough to fix: most of
+what it does is a plain scrub, walking the disk and checking every
+checksum, the same as `btrfs scrub`. The difference only shows up on the
+rare block that actually fails: instead of stopping at a report, it pulls
+the correct data from the surviving disks and parity, verifies it, and
+writes it back in place. Think of it as a first line of defense: if it
+can't fix something, you're in exactly the same position you'd have been in
+anyway, resilver or backup restore still on the table.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ btrfs filesystem (mounted, e.g. /mnt/disk1)                 │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ data disk partition (/dev/loop2p1, /dev/nmd1p1, …)
-┌──────────────────────────▼──────────────────────────────────┐
-│ NonRAID array layer — P (XOR) + Q (Reed–Solomon) parity      │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ raw block device
-┌──────────────────────────▼──────────────────────────────────┐
-│ scrub-rs: read on-disk btrfs metadata directly (no kernel)   │
-│ 1. verify every data-sector checksum                          │
-│ 2. map failing extents to physical offsets (chunk tree)      │
-│ 3. reconstruct exact bad blocks from other disks + P/Q       │
-│ 4. optionally write them back (--repair, under a freeze)     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-Recovery assessment is **always on**: every checksum mismatch is rebuilt
-from parity (read-only, free) so you learn whether the corruption is
-repairable. Writing the reconstruction back to the disk is opt-in via
-`--repair`.
-
-## Built on checks and balances
+## Why you can trust this plugin
 
 This tool repairs your data, so it is built the way a repair tool should
 be: it never touches anything until it is sure, and it is designed so it
 can never make a bad situation worse. Everything below is open for
 inspection in the source code — but here it is in plain language.
 
-**It only looks, until you tell it to fix.** Every scrub first checks
-the disk and reports what it finds. Nothing is ever written without your
-explicit choice (`--repair`, or the plugin's write setting); the default
-is a dry run that shows what *could* be fixed and changes nothing.
+**The checksum is leading.** A bad data block is rebuilt from the other disks,
+and the filesystem checksums proves the rebuilt data is correct before it is
+written. If the recovered block's checksum doesn't match, then we won't write.
 
-**It checks its own understanding before it starts.** Before repairing
-anything, the tool proves that its view of the array is correct by
-reconstructing a known block from the other disks and checking it. If
-something is wrong — wrong disk, wrong offset, misinterpreted setup — it
-refuses to run and tells you, rather than risk repairing on a broken
-foundation.
-
-**It never mistakes normal activity for corruption.** Files being moved,
-rewritten or deleted can briefly look like corruption. Before anything
-is written back, the tool re-checks that the problem is still really
-there — this false-positive guard means a repair can never overwrite a
-healthy, recently-changed file.
-
-**Parity repairs, the checksum decides.** A bad block is rebuilt from
-the other disks (P and Q parity), and the filesystem checksums proves
-the rebuilt data is correct before it is written. Arrays with two
-parity disks can even be repaired when two disks are affected at the
-same time.
+**Rigourous testing.** Automated tests scrub dozens of disk images
+ covering different array configurations, filesystem layouts and corruption
+scenarios, compare the results against btrfs's own tools, run scrubs
+while files are being actively written and deleted, and verify repairs
+on a full test array in a controlled environment with parity disk(s).
 
 **Every fix is verified after it's written.** After a repaired block is
 written back, the tool reads it again and confirms the fix actually
-landed on the disk. A repair that doesn't verify is reported — never
-silently assumed to be done.
+landed on the disk.
 
-**It repairs data, never the filesystem's own bookkeeping.** To find
-corruption, the tool has to read the disk's internal bookkeeping
-(metadata) — and it does, thoroughly. But it deliberately never
-*writes* to it: metadata is so sensitive that a single wrong change
-can be catastrophic for the whole disk, far worse than the corruption
+**A repair only touches the targeted disk.** The other disks and the
+parity disk(s) are never modified because it bypasses the array. If a disk
+turns out to be beyond saving, the normal unRAID path still works perfectly:
+pull the disk and rebuild it from parity, exactly as if this tool had never
+run.
+
+**It repairs data, never the filesystem's metadata.** To find
+corruption, the tool has to read the disk's internal metadata. 
+But it deliberately never *writes* to it: metadata is so sensitive that a
+single wrong change can be catastrophic for the whole disk, far worse than the corruption
 being fixed. If the bookkeeping itself turns out to be damaged, the
 tool refuses to guess and tells you to run the official `btrfs check`
 tool, which is designed to repair it safely.
 
-**A repair only touches the one targeted disk.** The other disks and the
-parity disks are never modified. So if a disk turns out to be beyond
-saving, the normal unRAID path still works perfectly: pull the disk and
-rebuild it from parity, exactly as if this tool had never run.
+**It checks its own understanding before it starts.** Before starting, 
+the tool proves that its view of the array is correct by reconstructing 
+a known block from parity and checking it. If something is wrong (wrong 
+disk, wrong offset, misinterpreted array setup) it refuses to run and
+tells you.
 
-**Built for real-world unRAID arrays.** Real arrays mix disk sizes and
-disk types. The tool is built for that and is tested against an array
-with mixed disk sizes and layouts — not just identical toy disks.
+**It never mistakes normal activity for corruption.** Files being moved,
+rewritten or deleted can briefly look like corruption. Before anything
+is written back, the tool re-checks that the problem is still really
+there and not just regular filesystem churn. This prevents accidental
+and unwarranted recoveries.
 
 **Repairs are race-free.** While a block is written back, the filesystem
 is briefly paused so nothing else can write to that spot at the same
@@ -124,29 +97,6 @@ disk sector.
 **Memory stays modest on huge disks.** Scrubbing a 20 TB disk shouldn't
 eat your NAS's RAM. Memory use stays bounded no matter how large the
 disk, so a big array never turns a scrub into an out-of-memory risk.
-
-**You always get an honest verdict.** The result is one of: clean ·
-problems found but fixable · problems found and fixed · problems found
-but not fixable · or damaged metadata, in which case the tool will not
-touch it and points you to the official `btrfs check`. Problems caused
-by failing hardware are reported as hardware problems — never hidden
-as "clean", never blamed on the filesystem.
-
-**The plugin keeps you safe by default.** Manual and scheduled scrubs
-can never overlap, a scrub can be stopped safely, your disks' settings
-are detected automatically, live progress stays on your machine, and
-you get a notification with severity when a scrub finishes — so a
-problem never quietly slips by.
-
-**It's tested against real damage.** Automated tests scrub dozens of
-disk images covering different filesystem layouts and corruption
-scenarios, compare the results against btrfs's own tools, run scrubs
-while files are being actively written and deleted, and verify repairs
-on a full test array in a controlled environment with parity disk(s).
-
-**Honest limits.** This is not a backup: it repairs what your parity can
-reconstruct. It does not repair a parity disk itself, and each scrub
-only heals the disk it is pointed at.
 
 **It cannot repair corruption baked in before it reaches the disk.** If
 data is corrupted in memory or while travelling to your NAS — faulty
