@@ -11,18 +11,43 @@ itself cannot self-heal.
 ```
 scrub-rs/
 ├── Cargo.toml            # crate manifest (lib + scrub-rs + craft-corrupt bins)
+├── Cargo.lock            # committed (binary crate)
 ├── src/                  # Rust source
 │   ├── lib.rs            # library crate root (scrub_rs)
 │   ├── main.rs           # `scrub-rs` binary (CLI entry point)
 │   ├── bin/
 │   │   └── craft_corrupt.rs   # `craft-corrupt` binary (injects test corruptions)
-│   ├── array/            # parity-array layer (P/Q, stripes, config) — btrfs-agnostic
-│   ├── btrfs/            # raw btrfs parser (superblock, trees, csum, scrub) — array-agnostic
-│   ├── recovery/         # GF(2^8) Reed-Solomon / parity recovery engine
-│   ├── batch_recover.rs  # batch recovery driver
-│   ├── freeze.rs         # snapshot-freeze helpers
-│   └── fs.rs             # filesystem helpers
+│   ├── array/            # parity-array layer — btrfs-agnostic
+│   │   ├── config.rs     # /proc/nmdstat parsing; slot/rdev lookups
+│   │   ├── parity.rs     # P/Q syndrome computation
+│   │   └── stripe.rs     # aligned stripe-chunk reads/writes in raw-rdev space
+│   ├── btrfs/            # raw btrfs on-disk parser — array-agnostic
+│   │   ├── chunk.rs      # chunk-tree mapping (logical → physical stripes)
+│   │   ├── csum.rs       # lazy CSUM_TREE walker (bounded memory)
+│   │   ├── csum_strategy.rs  # csum_type → concrete hash (crc32c/xxhash/sha256/blake2)
+│   │   ├── dev_extent.rs # dev-tree extent enumeration
+│   │   ├── extent.rs     # EXTENT_DATA file extents
+│   │   ├── key.rs        # well-known tree objectids + key helpers
+│   │   ├── node.rs       # node/leaf parsing
+│   │   ├── open.rs       # filesystem open (superblock + backup fallback)
+│   │   ├── reader.rs     # pread-based block reader with prefetch hints
+│   │   ├── root.rs       # ROOT_ITEM parsing (tree-root resolution)
+│   │   ├── scrub.rs      # physical-order data scrub pass
+│   │   ├── scrub_driver.rs   # scrub orchestration behind the fs contract
+│   │   ├── superblock.rs # superblock parsing
+│   │   ├── tree.rs       # iterative tree walks (leaves, key-range pruned)
+│   │   └── util.rs       # positioned reads + little-endian helpers
+│   ├── recovery/         # parity recovery — GF(2^8) math, cascade, result model
+│   │   ├── engine.rs     # I/O-free, checksum-agnostic recovery engine
+│   │   ├── gf.rs         # GF(2^8) arithmetic
+│   │   └── model.rs      # recovery input / outcome model
+│   ├── batch_recover.rs  # batched recovery: dedup → freeze → re-confirm → recover → write-back
+│   ├── canary.rs         # startup array probe (parity canary)
+│   ├── freeze.rs         # FIFREEZE / FITHAW snapshot-freeze helpers
+│   ├── fs.rs             # filesystem seam (open/scrub contract)
+│   └── status.rs         # localhost-only HTTP live-status server
 ├── tests/
+│   ├── csum_dedup.rs     # Rust integration tests (CSUM_TREE dedup accounting)
 │   └── integration/      # shell-based integration harness (sourced by CI)
 │       ├── btrfs_test_lib.sh        # shared mkfs/mount/corruption primitives
 │       ├── btrfs_test_matrix.sh     # generate the single-device image matrix
@@ -30,10 +55,6 @@ scrub-rs/
 │       ├── cmp_utilities.sh         # 3-way compare: scrub-rs vs btrfs check vs btrfs scrub
 │       ├── btrfs_live_scrub_test.sh # concurrent-churn + live scrub scenarios
 │       └── btrfs_live_workload.sh   # standalone write/delete/snapshot churn generator
-├── docs/                 # design & handoff notes
-│   ├── OPTIMIZE_PLAN.md
-│   ├── POST_IMPLEMENTATION.md
-│   └── PROGRESS.md
 └── target/               # cargo build output (git-ignored)
 ```
 

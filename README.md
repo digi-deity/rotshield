@@ -214,8 +214,6 @@ Community Apps submit flow (`/submit` in the unRAID webGUI).
   commands.
 - [`plugins/README.md`](plugins/README.md) — plugin layout, build, install,
   configuration keys, and the live status endpoint.
-- [`scrub-rs/docs/EIO-robustness-design.md`](scrub-rs/docs/EIO-robustness-design.md)
-  — the robustness design for read-error (EIO) handling.
 
 ## License
 
