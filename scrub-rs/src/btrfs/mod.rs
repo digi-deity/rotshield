@@ -1,3 +1,5 @@
+//! Raw btrfs on-disk parser: superblock, chunk/dev/extent/csum trees, node
+//! and leaf parsing, and the scrub driver. Array-agnostic.
 pub mod chunk;
 pub mod csum;
 pub mod csum_strategy;

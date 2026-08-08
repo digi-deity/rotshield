@@ -1,46 +1,31 @@
-//! btrfs B-tree node/leaf header and item-slot parsing.
-//!
-//! On-disk layout of a node/leaf (`struct btrfs_header` + items):
-//!   btrfs_header  (101 bytes, *including* the 32-byte csum prefix)
-//!   if level == 0: nritems * LeafItem slots   (each 17 + 4 + 4 = 25 bytes)
-//!   else:          nritems * KeyPtr           (each 17 + 8 + 8 = 33 bytes)
-//!   ... followed by item data (for leaves).
-//!
-//! Field offsets within the 101-byte header:
-//!   +0   csum[32]
-//!   +32  fsid[16]
-//!   +48  bytenr u64
-//!   +56  flags u64
-//!   +64  chunk_tree_uuid[16]
-//!   +80  generation u64
-//!   +88  owner u64
-//!   +96  nritems u32
-//!   +100 level u8
+//! Node/leaf parsing: the 101-byte on-disk header, leaf item slots, and
+//! internal-node child pointers.
 
 use super::key::{Key, KeyPtr};
-
-/// Fixed size of the btrfs node/leaf header (`struct btrfs_header`),
-/// *including* the 32-byte csum prefix.
+// On-disk node/leaf header: 32-byte checksum, then fsid, bytenr, flags,
+// chunk_tree_uuid, generation, owner, nritems, level.
 pub const HEADER_SIZE: usize = 101;
 
-/// Per-item leaf slot: (key, data_offset, data_size).
-///   key         17 bytes
-///   data_offset  4 bytes (relative to the *end* of the header+slots block)
-///   data_size    4 bytes
+// Leaf item slot: 17-byte key + 4-byte data_offset + 4-byte data_size.
 pub const LEAF_ITEM_SIZE: usize = 25;
 
-/// Internal-node key pointer size (key + blockptr + generation).
+// Internal-node child pointer: 17-byte key + 8-byte blockptr + 8-byte
+// generation.
 pub const KEYPTR_SIZE: usize = 33;
 
+/// On-disk node/leaf header (101 bytes). The 32-byte checksum at offset 0 is
+/// verified separately by the csum strategy, so parsing starts at byte 32.
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
     pub fsid: [u8; 16],
+    /// The node's own logical address; checked against the read position.
     pub bytenr: u64,
     pub flags: u64,
     pub chunk_tree_uuid: [u8; 16],
     pub generation: u64,
     pub owner: u64,
     pub nritems: u32,
+    /// 0 = leaf; higher values are internal-node levels.
     pub level: u8,
 }
 
@@ -69,11 +54,13 @@ impl Header {
     }
 }
 
-/// One leaf item slot (key + data offset/size).  The data itself is stored
-/// later in the leaf, at `header_end + slots_total_size + data_offset`.
+/// One slot in a leaf's item array: the item's key and where its data lives
+/// in the leaf.
 #[derive(Debug, Clone, Copy)]
 pub struct LeafItemSlot {
     pub key: Key,
+    /// Offset of the item data relative to the end of the header (the data
+    /// area starts at HEADER_SIZE).
     pub data_offset: u32,
     pub data_size: u32,
 }
@@ -91,29 +78,24 @@ impl LeafItemSlot {
     }
 }
 
-/// A parsed leaf node: header + slots, plus the raw node buffer (so callers
-/// can slice item data out by absolute offset).
+/// A parsed leaf: its header, item slots, and the raw node bytes so items
+/// can be sliced out of the buffer.
 pub struct Leaf {
     pub header: Header,
     pub slots: Vec<LeafItemSlot>,
-    /// The full node buffer (length == node_size), used for slicing item data.
+    /// Raw leaf bytes (header + slots + item data).
     pub buf: Vec<u8>,
 }
 
 impl Leaf {
-    /// Byte offset within `buf` where item data begins (end of header + slots).
+    // First byte after the item-slot array; the leaf's item data lives at or
+    // after this point.
     pub fn data_start(&self) -> usize {
         HEADER_SIZE + self.slots.len() * LEAF_ITEM_SIZE
     }
 
-    /// Slice the payload bytes for slot `i`.
-    ///
-    /// In btrfs, a leaf item's `data_offset` is measured from the end of
-    /// the 101-byte header to the item's data — data grows backward from
-    /// the end of the node.  This matches the Python reference parser, which
-    /// computes the data position as `header.phys_end + data_offset` where
-    /// `phys_end` is the stream position just past the header (= node_start
-    /// + 101), so the node-relative position is `101 + data_offset`.
+    // slot.data_offset is relative to the end of the header, so the item
+    // starts at HEADER_SIZE + data_offset.
     pub fn item_data(&self, i: usize) -> &[u8] {
         let slot = &self.slots[i];
         let start = HEADER_SIZE + slot.data_offset as usize;
@@ -122,13 +104,12 @@ impl Leaf {
     }
 }
 
-/// A parsed internal node: header + key pointers.
 pub struct InternalNode {
     pub header: Header,
     pub ptrs: Vec<KeyPtr>,
 }
 
-/// Either a leaf or an internal node, discriminated by `header.level`.
+/// A parsed node: a leaf at level 0, an internal node at higher levels.
 pub enum Node {
     Leaf(Leaf),
     Internal(InternalNode),
@@ -142,7 +123,8 @@ impl Node {
         }
     }
 
-    /// Parse a full node buffer of `node_size` bytes.
+    // Level 0 nodes are leaves with item slots; higher levels are internal
+    // nodes whose slots are child key pointers.
     pub fn parse(buf: Vec<u8>) -> Self {
         let header = Header::parse(&buf);
         let n = header.nritems as usize;

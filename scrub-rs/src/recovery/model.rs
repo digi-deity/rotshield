@@ -1,68 +1,26 @@
-//! Recovery result and failure-reason models.
-//!
-//! View layer for [`crate::recovery::engine`] — enums describing *what*
-//! happened during a recovery attempt, without any I/O locations or
-//! filesystem coupling.  These are produced by [`recover_block`] and
-//! inspected by the caller (the integration glue in `main.rs`, which
-//! knows about array device paths, the failing slot, and how to format a
-//! diagnostic line).  Recovery stays out of the "verdict book-keeping"
-//! business — the caller inspects [`RecoveryResult`] directly and keeps
-//! its own counters; there is no `ScrubVerdict` enum here.
-//!
-//! [`recover_block`]: crate::recovery::engine::recover_block
+//! Recovery input and outcome model.
 
-/// All the chunks of one aligned stripe, plus the corrupt block itself.
-///
-/// Slots are 1-based NonRAID data-disk slot numbers (`1..=n`); the failing
-/// disk is identified by `failing_slot` and its on-disk (corrupt) bytes
-/// are `corrupt_block`.  `p_block` / `q_block` are the parity **on disk at
-/// the same offset** — they may or may not still reflect original data
-/// (the recovery engine detects when they have been recomputed from the
-/// corrupt bytes — the "baked in" case — via
-/// [`FailureReason::ParityBakedIn`]).  `None` for either parity indicates
-/// the array has no such parity disk (e.g. single-parity arrays omit Q).
-///
-/// `other_blocks` is the `(slot, block)` pair for every *other* data disk
-/// — the ones the corrupt disk's reconstructed block XORs/multiplies
-/// against.  For asymmetric arrays a block past a smaller disk's end is
-/// represented by an all-zero slice (the array-level parity convention;
-/// the array layer that assembles this struct is responsible for the
-/// substitution — see `array/`).
 #[derive(Clone)]
 pub struct RecoveryInput<'a> {
-    /// 1-based NonRAID slot of the disk we are trying to recover.
+    /// 1-based NonRAID data-disk slot of the corrupt disk.
     pub failing_slot: u64,
-    /// The on-disk bytes of the corrupt block at this offset (size ==
-    /// `block_size`, every block in this struct shares that length).  Used
-    /// both to confirm corruption (the verifier should reject it) and to
-    /// detect the "parity baked from the corrupt byte" case.
+    /// On-disk bytes of the corrupt block; a zero placeholder when
+    /// `unreadable_source` is set.
     pub corrupt_block: &'a [u8],
-    /// The source bytes were **unreadable** (the device returned `EIO`) —
-    /// `corrupt_block` is a caller-supplied zero placeholder, NOT the
-    /// on-disk data.  When set, the engine must skip the two checks that
-    /// compare reconstruction against the corrupt block (the
-    /// "already matches" early return and the "parity baked in"
-    /// detections), because the placeholder is not the real bytes: a
-    /// legitimately all-zero recovered block would otherwise be
-    /// misclassified as `NotCorrupt` / `ParityBakedIn`.
+    /// The source read failed with EIO, so `corrupt_block` is not the
+    /// real data — the engine skips the checks that compare against it.
     pub unreadable_source: bool,
-    /// `block_size`-byte chunk for each other data disk (`failing_slot`
-    /// excluded), in arbitrary order.  All entries must be `block_size`
-    /// bytes long.
+    /// `(slot, block)` for every other data disk (failing slot excluded).
     pub other_blocks: &'a [(u64, Vec<u8>)],
-    /// Primary parity (`P = XOR of all data disks`) at this offset, or
-    /// `None` if the array has no P disk.
+    /// P parity (XOR of all data disks) at this offset; `None` if the
+    /// array has no P disk.
     pub p_block: Option<&'a [u8]>,
-    /// Secondary parity (`Q = XOR g^(slot-1) · D_slot`) at this offset,
-    /// or `None` if the array has no Q disk (single-parity array).
+    /// Q parity (GF(2^8) row syndrome) at this offset; `None` if the
+    /// array has no Q disk.
     pub q_block: Option<&'a [u8]>,
-    /// Verifier: returns `true` iff `block` is the correct original data
-    /// for this offset (e.g. `crc32c::crc32c(block) == expected_csum` for
-    /// btrfs, or `block == &golden[..]` in unit tests).  Recovery has no
-    /// other way to confirm success — parity math only produces
-    /// candidates; the verifier is what rules the bad ones out.  The
-    /// caller owns the checksum algorithm so ZFS edonr/sha just replaces
-    /// this closure.
+    /// Returns `true` iff `block` is the correct original data for this
+    /// offset (e.g. a checksum match). The only way recovery confirms a
+    /// reconstructed candidate.
     pub verifier: &'a dyn Fn(&[u8]) -> bool,
 }
 
@@ -80,76 +38,49 @@ impl<'a> std::fmt::Debug for RecoveryInput<'a> {
     }
 }
 
-/// Which parity disk(s) a successful recovery attempt used.
+/// Which parity path reconstructed the block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParityPath {
-    /// Single-parity: XOR of all other data disks plus P.
+    /// P-only XOR path.
     P,
-    /// Single-parity: GF(2^8) reconstruction from Q.
+    /// Q-only GF(2^8) path.
     Q,
-    /// Dual-parity: P and Q used simultaneously to solve a 2-disk
-    /// corruption.  `partner_slot` is the *other* slot we assumed was
-    /// also corrupt at this offset (we brute-force every candidate partner
-    /// and the verifier confirms which one was right).
+    /// Two-disk solve; `partner_slot` is the other disk reconstructed
+    /// simultaneously from the same P/Q equations.
     PQ { partner_slot: u64 },
 }
 
-/// Outcome of a single block recovery attempt.
+/// Outcome of one recovery attempt.
 #[derive(Debug)]
 pub enum RecoveryResult {
-    /// Reconstructed a block the verifier accepted.  `block` is the
-    /// recovered bytes (already `block_size` long); the caller writes it
-    /// back to the failing disk if it wants to.
+    /// A candidate passed the verifier; `block` is the reconstructed bytes.
     Recovered { via: ParityPath, block: Vec<u8> },
-    /// The failing disk already matches the verifier — it was not
-    /// actually corrupt when we got to it (the scrub may have raced with
-    /// a kernel rewrite).  No write is needed.
+    /// The failing block already passes the verifier — no recovery needed.
     NotCorrupt,
-    /// Recovery failed; `reason` says which paths were tried and why each
-    /// declined.  Strictly diagnostic — the caller logs it.
+    /// No parity path produced a verifiable block.
     Failed { reason: FailureReason },
 }
 
-/// Why a recovery attempt failed.
+/// Why recovery failed (aggregated from every path that was tried).
 #[derive(Debug, Clone)]
 pub enum FailureReason {
-    /// Attempted to recover via the single-parity path `via`, but the
-    /// reconstructed block's verifier returned `false`.  Pure engine stays
-    /// checksum-agnostic — no recovered value is stored here.
+    /// Reconstruction via `via` did not pass the verifier.
     CsumMismatch { via: ParityPath },
-    /// Parity has been recomputed from the corrupt byte (the "baked in"
-    /// case) — this path yields a block byte-identical to the corrupt one
-    /// and carries no new information.  Distinct from `CsumMismatch`
-    /// because the caller may want to log it differently ("Q is burned,
-    /// try the PQ path" vs "we got something different but wrong").
+    /// Parity was recomputed from the corrupt bytes after the fact, so
+    /// reconstructing via `via` just reproduces the corruption.
     ParityBakedIn { via: ParityPath },
-    /// The array has no parity disk of the requested path (e.g. a
-    /// single-parity array with no Q disk, asked to attempt Q-only
-    /// recovery).  The pure engine itself performs no I/O, so it cannot
-    /// report I/O failures — but it *can* detect the input had no parity
-    /// chunk of a given sort, which is what this variant flags.  Distinct
-    /// from `CsumMismatch` / `ParityBakedIn` because "no parity to use"
-    /// is a *structural* reason, not a *reconstruction* failure.
+    /// The array has no such parity disk (`P` or `Q`).
     ParityAbsent { via: ParityPath },
-    /// An internal contract assertion failed — e.g. a single-path branch
-    /// should always populate a `reason` but didn't.  This is the engine
-    /// being explicit that something invariant went wrong (a bug it wants
-    /// the caller to surface), rather than papers it with a phantom `Io`
-    /// reason.  Never produced for ordinary user-facing paths.
+    /// Internal invariant violation in the recovery engine.
     InternalInconsistency(String),
-    /// Both single-parity paths (P and Q) failed *and* the PQ 2-disk
-    /// solve with every candidate partner failed to verify.  `p_reason` /
-    /// `q_reason` carry the single-path diagnostics; `pq_partners_tried`
-    /// lists the partner slots actually attempted (empty if the PQ solve
-    /// was impossible, e.g. P or Q absent).
+    /// Both single paths failed; the two-disk solve (when both P and Q are
+    /// present) tried each other disk as the partner (`pq_partners_tried`)
+    /// without a verifiable result.
     AllPathsFailed {
         p_reason: Box<FailureReason>,
         q_reason: Box<FailureReason>,
         pq_partners_tried: Vec<u64>,
     },
-    /// The array has no Q disk and the P path failed — no PQ fallback was
-    /// even attemptable.  Reported instead of [`AllPathsFailed`] when Q is
-    /// absent, so callers can distinguish "exhausted all paths" from
-    /// "Q unavailable, would have tried PQ".
+    /// Single-parity array (no Q) and the P path failed.
     NoQPathAndPFailed { p_reason: Box<FailureReason> },
 }

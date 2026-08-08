@@ -1,73 +1,49 @@
-//! Pure parity-recovery engine — I/O-free, checksum-agnostic.
+//! Pure parity-recovery engine: I/O-free and checksum-agnostic.
 //!
-//! The single entry point [`recover_block`] takes a [`RecoveryInput`] (the
-//! aligned chunks of one stripe plus a verifier closure) and runs the
-//! full cascade — P-only → Q-only → PQ 2-disk brute-force — returning the
-//! first candidate the verifier accepts.  It performs **no I/O whatsoever**:
-//! every byte, including the corrupt block and the parity blocks, was
-//! already gathered by the caller (the array layer).  This is what makes
-//! the recovery math trivial to unit-test (see `tests/` below).
-//!
-//! The low-level functions [`recover_via_p`], [`recover_via_q`], and
-//! [`solve_two_disk`] are also `pub` because tests exercise them in
-//! isolation against fabricated syndromes — they're not part of the
-//! stable public API though; the integration glue normally calls only
-//! [`recover_block`].
+//! Recover a corrupt block from one stripe's aligned chunks via P-only,
+//! Q-only, then a P/Q two-disk solve; a verifier closure picks the first
+//! candidate that checks out.
 
 use crate::recovery::gf;
 use crate::recovery::model::{FailureReason, ParityPath, RecoveryInput, RecoveryResult};
 
-/// Outcome of the Q-path reconstruction attempt (internal helper).
+/// Result of the Q-only reconstruction attempt (internal).
 enum QOutcome {
-    /// Reconstructed block the verifier accepted.
+    /// Reconstruction passed the verifier.
     Recovered { block: Vec<u8> },
-    /// Q recomputed from the corrupt byte: the reconstruction equals the
-    /// corrupt block and carries no new information.
+    /// Reconstruction equals the corrupt block: Q was recomputed from it.
     BakedIn,
-    /// Reconstructed block did not pass the verifier.
+    /// Reconstruction did not pass the verifier.
     CsumMismatch,
 }
 
-/// Attempt to recover one corrupt block via parity, trying every path.
+/// Recover one corrupt block, trying every parity path in order:
+/// P-only, Q-only, then a P/Q two-disk solve against each other disk.
 ///
-/// Order: P-only → Q-only → PQ 2-disk solve with each candidate partner.
-/// Returns [`RecoveryResult::Recovered`] for the first candidate the
-/// verifier accepts, [`RecoveryResult::NotCorrupt`] if the failing disk
-/// already passes the verifier (raced with a kernel rewrite), or
-/// [`RecoveryResult::Failed`] with the aggregated reasons otherwise.
-///
-/// `block_size` is the length of every block — passed explicitly so tests
-/// can fabricate mini-stripes (the kernel uses 4096; tests might use 4 or
-/// 16).  Every slice in `input` must be exactly `block_size` bytes or
-/// the function panics (cheap guard at the seam).
+/// Returns `Recovered` for the first candidate the verifier accepts,
+/// `NotCorrupt` if the failing block already verifies, or `Failed` with
+/// the aggregated reasons. All slices in `input` must be exactly
+/// `block_size` bytes; lengths are asserted where the math reads them.
 pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryResult {
-    // 1. Cheap sanity: the failing block already passes the verifier?  Then
-    //    the scrub raced with a kernel rewrite — nothing to recover.  This
-    //    also establishes a baseline against the "baked in" check, which
-    //    wants to see a corrupt block to compare against.
+    // Failing block already passes the verifier — the scrub raced a
+    // rewrite; nothing to recover.
     let corrupt = input.corrupt_block;
     assert_eq!(corrupt.len(), block_size, "corrupt_block length mismatch");
-    // When the source bytes were unreadable (EIO), `corrupt` is a zero
-    // placeholder, NOT the on-disk data — the "already matches" early
-    // return and the "parity baked in" detections are meaningless and must
-    // be skipped (a legitimately all-zero block would otherwise be
-    // misclassified as NotCorrupt / ParityBakedIn).
+    // With an unreadable source, `corrupt` is a zero placeholder, not the
+    // on-disk bytes, so this early return and the baked-in detections are
+    // meaningless and must be skipped.
     let unreadable = input.unreadable_source;
     if !unreadable && (input.verifier)(corrupt) {
         return RecoveryResult::NotCorrupt;
     }
 
-    // 2. P-only path (if P is present).  `recover_via_p` returns either a
-    //    candidate or a BakedIn indicator; only check the verifier if P
-    //    actually produced something new.
+    // P-only path.
     let p_reason: Option<FailureReason> = match input.p_block {
         None => Some(FailureReason::ParityAbsent { via: ParityPath::P }),
         Some(p_block) => {
             assert_eq!(p_block.len(), block_size, "p_block length mismatch");
-            // Reject the all-zero XOR-pre-image as baked-in early: when P
-            // matches the (already-corrupted) data stripe, the (corrupt +
-            // others + P) XOR collapse proves P was recomputed from the
-            // corrupt byte.
+            // If P XOR (corrupt XOR all other blocks) is all-zero, P was
+            // recomputed from the corrupt bytes — it carries no new info.
             let mut zero_acc = corrupt.to_vec();
             for (_, b) in input.other_blocks {
                 xor_inplace(&mut zero_acc, b);
@@ -88,17 +64,14 @@ pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryRe
         }
     };
 
-    // 3. Q-only path (if Q is present).  Same structure as P, but using
-    //    GF(2^8) reconstruction.
+    // Q-only path.
     let q_reason: Option<FailureReason> = match input.q_block {
         None => Some(FailureReason::ParityAbsent { via: ParityPath::Q }),
         Some(q_block) => {
             assert_eq!(q_block.len(), block_size, "q_block length mismatch");
-            // For an unreadable source, pass an empty `corrupt` slice so
-            // `recover_via_q`'s internal BakedIn comparison (recovered ==
-            // corrupt) can never fire — the zero placeholder is not the
-            // real data, and a legitimately all-zero recovered block must
-            // not be misclassified.
+            // Empty corrupt slice for unreadable sources so the baked-in
+            // comparison inside recover_via_q can never fire on the
+            // placeholder.
             let q_corrupt: &[u8] = if unreadable { &[] } else { corrupt };
             match recover_via_q(
                 input.other_blocks,
@@ -120,9 +93,8 @@ pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryRe
         }
     };
 
-    // 4. PQ 2-disk solve: only possible if both P and Q chunks are present.
-    //    We don't know which other disk is the partner, so brute-force every
-    //    candidate; the verifier tells us which guess was right.
+    // Two-disk solve: both blocks unknown, so brute-force each other disk
+    // as the partner; the verifier identifies the right one.
     let p_singleton = p_reason.clone().unwrap_or_else(|| {
         FailureReason::InternalInconsistency("internal: P path returned no reason".into())
     });
@@ -150,7 +122,7 @@ pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryRe
                     block: candidate,
                 };
             }
-            // Wrong partner — keep trying.
+            // Wrong partner — try the next one.
         }
         return RecoveryResult::Failed {
             reason: FailureReason::AllPathsFailed {
@@ -161,17 +133,16 @@ pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryRe
         };
     }
 
-    // 5. No Q disk at all (single-parity array).  Report P failure as the
-    //    single reason rather than packaging a phantom Q result.
+    // No Q disk (single-parity array): report the P failure directly
+    // instead of a phantom Q result.
     RecoveryResult::Failed {
         reason: if input.q_block.is_none() {
             FailureReason::NoQPathAndPFailed {
                 p_reason: Box::new(p_singleton),
             }
         } else {
-            // P chunk was None but Q present — Q path already ran above and
-            // produced q_singleton.  Surface as exhausted-all-paths with an
-            // empty PQ list (the PQ solve needs both P and Q).
+            // P absent but Q present: PQ was never possible, so surface
+            // both single-path reasons with an empty partner list.
             FailureReason::AllPathsFailed {
                 p_reason: Box::new(p_singleton),
                 q_reason: Box::new(q_singleton),
@@ -181,11 +152,8 @@ pub fn recover_block(input: &RecoveryInput<'_>, block_size: usize) -> RecoveryRe
     }
 }
 
-/// Reconstruct one missing block via P-only XOR.
-///
-/// `D_k = P XOR XOR_{j≠k} D_j`.  The corrupt block itself doesn't enter
-/// (its contribution is folded into P). Lengths are asserted; pass
-/// `block_size`-byte slices only.
+/// Reconstruct one block via P-only XOR: D_k = P XOR XOR_{j != k} D_j.
+/// All slices must be `block_size` bytes (asserted).
 pub fn recover_via_p(
     _corrupt: &[u8],
     other_blocks: &[(u64, Vec<u8>)],
@@ -203,12 +171,11 @@ pub fn recover_via_p(
     recovered
 }
 
-/// Reconstruct one missing block via Q-only GF(2^8) math.
-///
-/// `D_k = g^(-(k-1)) · (Q XOR XOR_{j≠k} g^(j-1) · D_j)`.  When the result
-/// equals the corrupt block the caller passed, we report `BakedIn`: Q was
-/// recomputed from the corrupt byte and carries no new information.
-#[allow(private_interfaces)] // QOutcome is intentionally private
+// QOutcome is intentionally private; the allow silences the lint for this
+// pub fn's signature.
+/// Reconstruct one block via Q-only GF(2^8) math:
+/// D_k = g^-(k-1) * (Q XOR XOR_{j != k} g^(j-1) * D_j).
+#[allow(private_interfaces)]
 pub fn recover_via_q(
     other_blocks: &[(u64, Vec<u8>)],
     q_block: &[u8],
@@ -217,10 +184,6 @@ pub fn recover_via_q(
     verifier: &dyn Fn(&[u8]) -> bool,
     corrupt: &[u8],
 ) -> QOutcome {
-    // Note: visibility of `QOutcome` is `pub(self)` but this fn is `pub`;
-    // the wrapper `#[allow(private_interfaces)]` silences the lint since
-    // callers can't name `QOutcome` anyway (it's an internal helper).  The
-    // public callers go through `recover_block`.
     assert_eq!(q_block.len(), block_size);
     let m = gf::gf_exp(-((failing_slot as i32) - 1));
 
@@ -232,10 +195,8 @@ pub fn recover_via_q(
     let mut recovered = vec![0u8; block_size];
     gf_mul_into(&mut recovered, &acc, m);
 
-    // "Baked in" detection: a recomputed Q gives back exactly the corrupt
-    // bytes, so failure would look like a CsumMismatch — but the
-    // distinction matters to the caller (Test B/C/F distinguish a
-    // "burned Q" from a "Q returned garbage").
+    // Recovered == corrupt means Q was recomputed from the corrupt byte —
+    // the reconstruction carries no new information.
     if recovered.as_slice() == corrupt {
         return QOutcome::BakedIn;
     }
@@ -246,16 +207,9 @@ pub fn recover_via_q(
     }
 }
 
-/// Solve a 2-disk corruption system using P and Q simultaneously.
-///
-/// Direct port of `raid6_2data_recov_intx1` from `nonraid/raid6/recov.c`,
-/// specialised to NonRAID's slot-based addressing.  We assume the failing
-/// disk (`failing_slot`) and one `partner_slot` are both corrupt at this
-/// offset; P and Q give two equations in two unknowns.
-///
-/// Returns the reconstructed block for the **failing** disk (never the
-/// partner — the caller verifies only the failing block's csum and writes
-/// only the failing disk; the partner's bytes never enter the math).
+/// Solve a two-disk corruption from P and Q: two equations in the two
+/// unknown blocks (failing disk + one partner). Returns the failing
+/// disk's block only.
 pub fn solve_two_disk(
     p_block: &[u8],
     q_block: &[u8],
@@ -264,6 +218,7 @@ pub fn solve_two_disk(
     failing_slot: u64,
     block_size: usize,
 ) -> Option<Vec<u8>> {
+    // The two failed slots as 0-based column exponents, ascending.
     let (a, b) = if failing_slot < partner_slot {
         (failing_slot as i32 - 1, partner_slot as i32 - 1)
     } else {
@@ -279,9 +234,8 @@ pub fn solve_two_disk(
     let pbmul = &gf::GFMUL[pbmul_coef as usize];
     let qmul = &gf::GFMUL[qmul_coef as usize];
 
-    // P_zero = XOR of all good disks (everyone except failing & partner).
-    // Q_zero = XOR_{j good} g^(j-1) · D_j.
-    // ΔP = P ⊕ P_zero, ΔQ = Q ⊕ Q_zero.
+    // Syndromes of the good disks only; XORing them out of P and Q
+    // isolates the two unknowns.
     let mut p_zero = vec![0u8; block_size];
     let mut q_zero = vec![0u8; block_size];
     for (slot, block) in other_blocks {
@@ -298,6 +252,7 @@ pub fn solve_two_disk(
     let mut delta_q = q_block.to_vec();
     xor_inplace(&mut delta_q, &q_zero);
 
+    // Solve for d_b (column b); d_a follows since delta_p = d_a XOR d_b.
     let mut d_b = vec![0u8; block_size];
     for i in 0..block_size {
         d_b[i] = pbmul[delta_p[i] as usize] ^ qmul[delta_q[i] as usize];
@@ -312,7 +267,6 @@ pub fn solve_two_disk(
     })
 }
 
-/// XOR `b` into `a` in place.  Panics if lengths differ.
 fn xor_inplace(a: &mut [u8], b: &[u8]) {
     debug_assert_eq!(a.len(), b.len(), "xor_inplace: length mismatch");
     for (x, y) in a.iter_mut().zip(b.iter()) {
@@ -320,7 +274,7 @@ fn xor_inplace(a: &mut [u8], b: &[u8]) {
     }
 }
 
-/// `a ^= coef * b` byte-wise in GF(2^8).  Panics if lengths differ.
+// `a ^= coef * b` byte-wise in GF(2^8).
 fn gf_mul_xor_inplace(a: &mut [u8], b: &[u8], coef: u8) {
     debug_assert_eq!(a.len(), b.len(), "gf_mul_xor_inplace: length mismatch");
     let table = &gf::GFMUL[coef as usize];
@@ -329,7 +283,7 @@ fn gf_mul_xor_inplace(a: &mut [u8], b: &[u8], coef: u8) {
     }
 }
 
-/// `dest = coef * src` byte-wise in GF(2^8).  Panics if lengths differ.
+// `dest = coef * src` byte-wise in GF(2^8).
 fn gf_mul_into(dest: &mut [u8], src: &[u8], coef: u8) {
     debug_assert_eq!(dest.len(), src.len(), "gf_mul_into: length mismatch");
     let table = &gf::GFMUL[coef as usize];
@@ -408,14 +362,14 @@ mod tests {
         q
     }
 
-    /// Corrupt one byte of `chunk` (flip byte idx 1 by 0x5a).
+    // Flip byte 1 of `chunk` by 0x5a to corrupt it.
     fn corrupt(chunk: &[u8]) -> Vec<u8> {
         let mut c = chunk.to_vec();
         c[1] ^= 0x5a;
         c
     }
 
-    /// Reconpute P with the failing slot's chunk replaced by `corrupt`.
+    // Recompute P with the failing slot's chunk replaced by `corrupt`.
     fn bake_p(stripe: &Stripe, failing: u64, corrupt: &[u8]) -> Vec<u8> {
         let data: Vec<(u64, Vec<u8>)> = stripe
             .data
@@ -434,7 +388,7 @@ mod tests {
         compute_p(&data, BLOCK)
     }
 
-    /// Reompute Q with the failing slot's chunk replaced by `corrupt`.
+    // Recompute Q with the failing slot's chunk replaced by `corrupt`.
     fn bake_q(stripe: &Stripe, failing: u64, corrupt: &[u8]) -> Vec<u8> {
         let data: Vec<(u64, Vec<u8>)> = stripe
             .data
@@ -453,7 +407,7 @@ mod tests {
         compute_q(&data, BLOCK)
     }
 
-    /// Assert we recovered via the given path and the block equals golden.
+    // Assert the recovery used the expected path and returned `golden`.
     fn expect_recovered(r: RecoveryResult, expect_via: ParityPath, golden: &[u8]) {
         match r {
             RecoveryResult::Recovered { via, block } => {
@@ -466,7 +420,7 @@ mod tests {
 
     #[test]
     fn p_path_recovers_when_q_unavailable() {
-        // 3 data disks, no Q. P intact. P path must reconstruct D_2.
+        // 3 data disks, no Q, P intact: the P path must reconstruct D2.
         let stripe = Stripe::new(BLOCK, 3, 0xA1);
         let failing = 2;
         let golden = stripe.chunk(failing).to_vec();
@@ -487,8 +441,8 @@ mod tests {
 
     #[test]
     fn q_path_recovers_when_p_baked_in() {
-        // 4 data disks. Bake P from corrupt → P path fails (baked-in),
-        // Q intact → Q path succeeds.
+        // P recomputed from the corrupt bytes; Q still reflects the
+        // original data, so the Q path must succeed.
         let stripe = Stripe::new(BLOCK, 4, 0xB2);
         let failing = 2;
         let golden = stripe.chunk(failing).to_vec();
@@ -511,8 +465,8 @@ mod tests {
 
     #[test]
     fn p_path_recovers_when_q_baked_in() {
-        // 4 data disks. Bake Q from corrupt → Q path fails (baked-in),
-        // P intact → P path succeeds.
+        // Q baked in from the corrupt bytes; P intact: the P path must
+        // succeed.
         let stripe = Stripe::new(BLOCK, 4, 0xC3);
         let failing = 3;
         let golden = stripe.chunk(failing).to_vec();
@@ -535,12 +489,9 @@ mod tests {
 
     #[test]
     fn pq_two_disk_solve_when_both_corrupt() {
-        // 4 data disks. Two disks silently corrupted at this offset
-        // (failing=1, partner=3); P and Q are LEFT INTACT (still reflect
-        // the original data — the "silent corruption, no parity sync"
-        // case).  Single-parity P and Q each inherit the *partner's* bad
-        // bytes and fail; the PQ 2-disk solve uses P and Q simultaneously
-        // to isolate both unknowns and reconstruct D_1.
+        // Two disks silently corrupt; P and Q still reflect the original
+        // stripe (no parity resync). Single paths inherit the partner's
+        // bad bytes and fail; the PQ solve must isolate both unknowns.
         let stripe = Stripe::new(BLOCK, 4, 0xD4);
         let failing = 1;
         let partner = 3;
@@ -552,13 +503,11 @@ mod tests {
             c[2] ^= 0xa5;
             c
         };
-        // Original P and Q (computed from the golden, uncorrupted stripe)
-        // — parity was NOT resynced after the silent corruption.
+        // Original P and Q, computed from the uncorrupted stripe.
         let p = stripe.p.clone();
         let q = stripe.q.clone();
-        // `other_blocks` for the failing disk includes the partner's
-        // *corrupt* chunk (the recovery code doesn't know it's bad) and
-        // the other slots' originals.
+        // Other data includes the partner's corrupt chunk — the engine
+        // does not know it is bad.
         let others: Vec<(u64, Vec<u8>)> = stripe
             .data
             .iter()
@@ -593,10 +542,8 @@ mod tests {
 
     #[test]
     fn all_paths_fail_when_both_parity_baked() {
-        // 4 data disks. Bake both P and Q from corrupt → no path can
-        // reconstruct; PQ brute-force finds no verifiable partner (only the
-        // failing disk is corrupt, so every candidate is wrong).
-        // Expect AllPathsFailed.
+        // Both P and Q recomputed from the corrupt bytes: every path
+        // reproduces the corruption, so recovery must fail.
         let stripe = Stripe::new(BLOCK, 4, 0xE5);
         let failing = 2;
         let golden = stripe.chunk(failing).to_vec();
@@ -629,7 +576,7 @@ mod tests {
 
     #[test]
     fn not_corrupt_when_verifier_accepts_on_disk() {
-        // Scrub said mismatch but on-disk now matches the verifier —
+        // The on-disk block already passes the verifier (raced rewrite):
         // return NotCorrupt without consulting parity.
         let stripe = Stripe::new(BLOCK, 3, 0xF6);
         let failing = 1;
@@ -654,14 +601,13 @@ mod tests {
 
     #[test]
     fn no_q_and_p_fails_reports_no_q_path_and_p_failed() {
-        // Single-parity array (no Q). P corrupted independently of the
-        // failing disk's data → P path fails with CsumMismatch → expect
-        // NoQPathAndPFailed (not AllPathsFailed).
+        // Single-parity array; P corrupted independently of the data:
+        // expect NoQPathAndPFailed, not AllPathsFailed.
         let stripe = Stripe::new(BLOCK, 3, 0xA1);
         let failing = 2;
         let golden = stripe.chunk(failing).to_vec();
         let corrupt = corrupt(&golden);
-        // Independent P corruption: flip a byte of the real P.
+        // Independent P corruption: flip one byte of the real P.
         let mut p_bad = stripe.p.clone();
         p_bad[3] ^= 0x11;
         let others = stripe.others(failing);
@@ -685,15 +631,12 @@ mod tests {
 
     #[test]
     fn unreadable_source_recovers_all_zero_block_via_p() {
-        // The failing disk's bytes were unreadable (EIO), so the caller
-        // passes a ZERO placeholder as corrupt_block with unreadable_source
-        // set.  The underlying data is legitimately all-zero: without the
-        // flag the engine would misclassify the reconstruction as
-        // NotCorrupt / ParityBakedIn.  With it, P-only recovery must
-        // reconstruct the all-zero block and return Recovered.
+        // Unreadable source whose real data is all-zero: without the flag
+        // the engine would misclassify it as NotCorrupt/ParityBakedIn;
+        // with it, P-only recovery must return Recovered.
         let block_size = BLOCK;
         let n = 3u8;
-        // Build a stripe where the failing slot's data is all zeros.
+        // Slot 2's data is all zeros.
         let mut data: Vec<(u64, Vec<u8>)> = (1..=n as u64)
             .map(|slot| {
                 let bytes = if slot == 2 {
@@ -734,11 +677,8 @@ mod tests {
 
     #[test]
     fn unreadable_source_skips_not_corrupt_when_verifier_accepts_placeholder() {
-        // Even with unreadable_source, a candidate whose verifier happens to
-        // accept the zero placeholder (e.g. a genuinely all-zero expected
-        // block) must NOT take the NotCorrupt early-return — the placeholder
-        // is not the real data, so "matches" proves nothing.  The engine
-        // must still reconstruct from parity and return Recovered.
+        // The verifier accepts zeros here, but the placeholder proves
+        // nothing — the engine must still reconstruct from parity.
         let block_size = BLOCK;
         let n = 3u8;
         let mut data: Vec<(u64, Vec<u8>)> = (1..=n as u64)
@@ -749,7 +689,7 @@ mod tests {
                 (slot, bytes)
             })
             .collect();
-        // Failing slot 2, all-zero on disk.
+        // Failing slot 2 is all-zero on disk.
         data = data
             .iter()
             .map(|(s, b)| {

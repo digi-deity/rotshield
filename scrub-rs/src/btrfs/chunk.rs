@@ -1,22 +1,16 @@
-//! btrfs CHUNK_ITEM parsing and the logical→physical chunk cache.
-//!
-//! Mirrors `btrfs_recon/util/chunk_cache.py` at the level needed for scrub:
-//! given a logical byte address, return the (devid, physical) of the first
-//! stripe that holds it.  Striping (RAID0/RAID10/RAID5/RAID6) is not yet
-//! implemented — only single-stripe and mirrored (DUP/RAID1/RAID1C3/RAID1C4)
-//! profiles, which is all the simple btrfs layouts this tool targets.
+//! Chunk mapping: parse chunk items and translate logical addresses to physical stripes.
 
 use super::key::bg_flag;
 use super::util::le_u64;
 
-/// One stripe of a chunk: (devid, physical offset on that dev).
+/// One stripe of a chunk: device id and physical offset within it.
 #[derive(Debug, Clone, Copy)]
 pub struct Stripe {
     pub devid: u64,
     pub offset: u64,
 }
 
-/// Parsed CHUNK_ITEM payload (subset of fields).
+/// Parsed btrfs chunk item: the logical span it covers and the stripes backing it.
 #[derive(Debug, Clone)]
 pub struct ChunkItem {
     pub length: u64,
@@ -27,22 +21,24 @@ pub struct ChunkItem {
 }
 
 impl ChunkItem {
-    /// Parse a CHUNK_ITEM payload (the bytes after a leaf slot's key).
+    /// Parse an on-disk chunk item: a 48-byte header followed by one 32-byte
+    /// stripe entry per `num_stripes`.
     pub fn parse(buf: &[u8]) -> Self {
         let length = le_u64(buf, 0);
         let _owner = le_u64(buf, 8);
         let stripe_len = le_u64(buf, 16);
         let ty = le_u64(buf, 24);
-        // io_align u32 @32, io_width u32 @36, sector_size u32 @40
+
         let num_stripes = u16::from_le_bytes([buf[44], buf[45]]);
         let _sub_stripes = u16::from_le_bytes([buf[46], buf[47]]);
-        // stripes follow at offset 48, each 32 bytes (devid u64, offset u64, uuid[16]).
+
+        // Stripe entries start at byte 48; only devid and offset are used.
         let mut stripes = Vec::with_capacity(num_stripes as usize);
         for i in 0..num_stripes as usize {
             let base = 48 + i * 32;
             let devid = le_u64(buf, base);
             let offset = le_u64(buf, base + 8);
-            // skip the 16-byte dev_uuid
+
             stripes.push(Stripe { devid, offset });
         }
         Self {
@@ -55,16 +51,13 @@ impl ChunkItem {
     }
 }
 
-/// A parsed (Key, ChunkItem) pair, as it appears in the chunk tree or in the
-/// superblock's system-chunk bootstrap array.
+/// A chunk item together with the logical address it starts at.
 #[derive(Debug, Clone)]
 pub struct ChunkRecord {
     pub logical: u64,
     pub chunk: ChunkItem,
 }
 
-/// All profile bits in `btrfs_chunk.type` (the SINGLE profile is the
-/// absence of any profile bit).
 const PROFILE_MASK: u64 = bg_flag::RAID0
     | bg_flag::RAID1
     | bg_flag::DUP
@@ -74,7 +67,7 @@ const PROFILE_MASK: u64 = bg_flag::RAID0
     | bg_flag::RAID1C3
     | bg_flag::RAID1C4;
 
-/// Human-readable name of a chunk's profile bits (for diagnostics).
+/// Human-readable name of a chunk's RAID profile (SINGLE when unset).
 pub fn profile_name(ty: u64) -> &'static str {
     match ty & PROFILE_MASK {
         0 => "SINGLE",
@@ -90,8 +83,8 @@ pub fn profile_name(ty: u64) -> &'static str {
     }
 }
 
-/// Parse a sequence of (Key, CHUNK_ITEM) records out of a raw byte buffer —
-/// used for the superblock's system-chunk array.
+/// Parse the superblock's system chunk array: alternating 17-byte keys and
+/// chunk items, ending at the first non-CHUNK_ITEM key or the buffer end.
 pub fn parse_sys_chunks(buf: &[u8]) -> Vec<ChunkRecord> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -99,10 +92,9 @@ pub fn parse_sys_chunks(buf: &[u8]) -> Vec<ChunkRecord> {
         let key = super::key::Key::parse(buf, pos);
         pos += 17;
         if key.ty != super::key::key_type::CHUNK_ITEM {
-            // The sys chunk array should only contain CHUNK_ITEMs; bail if not.
             break;
         }
-        // We need to compute the chunk item size to advance past it.
+
         let num_stripes = u16::from_le_bytes([buf[pos + 44], buf[pos + 45]]) as usize;
         let chunk_len = 48 + num_stripes * 32;
         if pos + chunk_len > buf.len() {
@@ -118,12 +110,7 @@ pub fn parse_sys_chunks(buf: &[u8]) -> Vec<ChunkRecord> {
     out
 }
 
-/// A logical→physical mapping cache.  Stores chunks as a sorted vec for
-/// binary-search lookup by logical address.
-///
-/// Immutable after the chunk-tree walk.  Held by reference (`&ChunkMap`) and
-/// shared between the reader, the scrub loop, and the recovery callback —
-/// no cloning needed.
+/// Sorted chunk ranges for logical-to-physical address translation.
 #[derive(Debug, Default, Clone)]
 pub struct ChunkMap {
     entries: Vec<MapEntry>,
@@ -134,23 +121,14 @@ struct MapEntry {
     begin: u64,
     end: u64,
     stripe_len: u64,
+    /// True when the chunk has mirror copies (RAID1/DUP/RAID1C3/RAID1C4).
     mirrored: bool,
-    /// The chunk's `btrfs_chunk.type` field — packs both the block-group
-    /// class (DATA/METADATA/SYSTEM) and the profile bits
-    /// (SINGLE/DUP/RAID*).  Exposed via [`ChunkMap::info`] so callers can
-    /// filter by class (skip non-DATA chunks) and guard against striped
-    /// profiles (which the physical-order scrub cannot map linearly).
+
     ty: u64,
     stripes: Vec<Stripe>,
 }
 
-/// Resolved chunk information for a dev extent, keyed by the chunk's logical
-/// start (`chunk_offset`).
-///
-/// Mirrors the `ChunkInfo` in `btrfs2/devtree.rs` so the physical-order
-/// scrub can answer "what type/profile is the chunk starting at this logical
-/// offset?" without re-walking the chunk tree.  `flags` is the raw
-/// `btrfs_chunk.type` field; test it against [`super::key::bg_flag`].
+/// Length and profile flags of the chunk containing a given offset.
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkInfo {
     pub length: u64,
@@ -158,6 +136,7 @@ pub struct ChunkInfo {
 }
 
 impl ChunkMap {
+    /// Add a chunk, keeping entries sorted by logical start for binary search.
     pub fn insert(&mut self, rec: &ChunkRecord) {
         let end = rec.logical + rec.chunk.length;
         let mirrored = (rec.chunk.ty & bg_flag::MIRROR_MASK) != 0;
@@ -169,14 +148,11 @@ impl ChunkMap {
             ty: rec.chunk.ty,
             stripes: rec.chunk.stripes.clone(),
         });
-        // Keep sorted by begin for binary search.
+
         self.entries.sort_by_key(|e| e.begin);
     }
 
-    /// Resolve the chunk starting at logical address `chunk_offset`, if one
-    /// is recorded.  Returns its `length` and raw `flags` (the
-    /// `btrfs_chunk.type` field) so callers can filter by block-group class
-    /// and guard against striped profiles.
+    /// Flags and length of the chunk containing `chunk_offset`.
     pub fn info(&self, chunk_offset: u64) -> Option<ChunkInfo> {
         let idx = self
             .entries
@@ -197,13 +173,8 @@ impl ChunkMap {
         })
     }
 
-    /// Resolve `logical` to a (devid, physical) on the first available stripe.
-    ///
-    /// For mirrored profiles every stripe is a full copy; we return the first.
-    /// For single-stripe chunks the math is the same.  Striped profiles
-    /// (RAID0/RAID10/RAID5/RAID6) are not supported and will return the first
-    /// stripe as a fallback (which is wrong for them — but we don't target
-    /// those here).
+    /// Map a logical address to (devid, physical offset) on its first stripe.
+    /// Valid for SINGLE/DUP chunks, where every copy sits at the same offset.
     pub fn lookup(&self, logical: u64) -> Option<(u64, u64)> {
         let idx = self
             .entries
@@ -223,14 +194,7 @@ impl ChunkMap {
         Some((s.devid, s.offset + log_offset))
     }
 
-    /// Resolve `logical` to *all* stripes of the chunk it falls in, as a
-    /// vector of `(devid, physical)` pairs.  For mirrored profiles (DUP /
-    /// RAID1 / RAID1C3 / RAID1C4) every entry is a full copy of the same
-    /// logical range — this is what lets the scrub cross-check the copies
-    /// (e.g. prefer the good DUP metadata copy when one header is corrupt).
-    /// For single-stripe chunks the vector has exactly one entry (identical
-    /// to [`ChunkMap::lookup`]'s result).  Returns `None` if `logical` is
-    /// not covered by any chunk.
+    /// (devid, physical offset) for every stripe copy of `logical`.
     pub fn lookup_stripes(&self, logical: u64) -> Option<Vec<(u64, u64)>> {
         let idx = self
             .entries
@@ -261,27 +225,15 @@ impl ChunkMap {
         self.entries.is_empty()
     }
 
-    /// H9: reject any DATA chunk whose profile is not SINGLE or DUP.  A
-    /// striped data chunk (RAID0/RAID10/RAID5/RAID6) cannot be mapped
-    /// linearly by the physical-order scrub — a dev-extent is not a
-    /// contiguous sub-range of the chunk's logical space, so
-    /// `phys - dev_extent.phys_start` would silently point at the wrong
-    /// sectors.  The caller ([`crate::btrfs::open`]) refuses the device
-    /// on the first such chunk.
-    ///
-    /// Metadata/system chunks are deliberately NOT checked: a
-    /// single-device filesystem can legally hold RAID1/RAID1C3 metadata
-    /// (e.g. after a dup→raid1 convert), and those trees are verified at
-    /// walk time rather than linearly mapped.
+    /// Reject data chunks with striped RAID profiles — the scrub maps
+    /// logical-to-physical linearly and cannot handle interleaved stripes.
     pub fn validate_data_profiles(&self) -> std::io::Result<()> {
         for e in &self.entries {
             if e.ty & bg_flag::DATA == 0 {
                 continue;
             }
             let profile = e.ty & PROFILE_MASK;
-            // SINGLE is the zero profile; DUP is the only non-SINGLE
-            // profile the linear physical-order scrub supports (both
-            // copies live on the same device, each as a contiguous range).
+
             if profile != 0 && profile != bg_flag::DUP {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -298,7 +250,7 @@ impl ChunkMap {
         Ok(())
     }
 
-    /// Debug helper: list every chunk, mirroring the Python output.
+    /// Print every entry (debugging aid).
     pub fn dump(&self) {
         for e in &self.entries {
             let stripes: Vec<String> = e
@@ -341,8 +293,8 @@ mod tests {
     #[test]
     fn data_single_and_dup_are_accepted() {
         let mut m = ChunkMap::default();
-        m.insert(&rec(0x1000_0000, bg_flag::DATA)); // SINGLE data
-        m.insert(&rec(0x2000_0000, bg_flag::DATA | bg_flag::DUP)); // DUP data
+        m.insert(&rec(0x1000_0000, bg_flag::DATA));
+        m.insert(&rec(0x2000_0000, bg_flag::DATA | bg_flag::DUP));
         assert!(m.validate_data_profiles().is_ok());
     }
 
@@ -368,12 +320,9 @@ mod tests {
 
     #[test]
     fn metadata_raid1_is_not_rejected() {
-        // A single-device FS can legally hold RAID1 metadata (dup→raid1
-        // convert); the tree-walk verification handles it — only DATA
-        // chunk profiles are gated.
         let mut m = ChunkMap::default();
         m.insert(&rec(0x1000_0000, bg_flag::METADATA | bg_flag::RAID1));
-        m.insert(&rec(0x2000_0000, bg_flag::DATA)); // healthy data chunk
+        m.insert(&rec(0x2000_0000, bg_flag::DATA));
         assert!(m.validate_data_profiles().is_ok());
     }
 }

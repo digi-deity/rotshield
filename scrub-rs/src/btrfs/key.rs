@@ -1,8 +1,5 @@
-//! btrfs on-disk key types and constants.
-//!
-//! See btrfs_recon/structure/key.py for the source-of-truth enum values.
-
-/// Special objectids that name the well-known btrfs trees.
+// Well-known btrfs tree objectids; also the objectid of each tree's
+// ROOT_ITEM key in the root tree.
 pub mod objectid {
     pub const ROOT_TREE: u64 = 1;
     pub const EXTENT_TREE: u64 = 2;
@@ -12,13 +9,12 @@ pub mod objectid {
     pub const CSUM_TREE: u64 = 7;
     pub const UUID_TREE: u64 = 9;
     pub const FREE_SPACE_TREE: u64 = 10;
-    /// EXTENT_CSUM_OBJECTID (-10) — the objectid of every CSUM_TREE item.
-    /// Stored as the u64 two's-complement of -10.
+    // -10 as u64: the objectid under which EXTENT_CSUM items live in the
+    // csum tree.
     pub const EXTENT_CSUM_OBJECTID: u64 = 0xFFFF_FFFF_FFFF_FFF6;
 }
 
-/// btrfs key type byte — discriminates the payload of a leaf item / the
-/// meaning of a key in an internal node.
+// btrfs on-disk key type numbers.
 pub mod key_type {
     pub const INODE_ITEM: u8 = 1;
     pub const INODE_REF: u8 = 12;
@@ -34,7 +30,7 @@ pub mod key_type {
     pub const CHUNK_ITEM: u8 = 228;
 }
 
-/// Block-group / chunk type flags (selected).
+// Block-group type / chunk profile flag bits (the chunk item's type field).
 pub mod bg_flag {
     pub const DATA: u64 = 1 << 0;
     pub const SYSTEM: u64 = 1 << 1;
@@ -48,25 +44,16 @@ pub mod bg_flag {
     pub const RAID1C3: u64 = 1 << 9;
     pub const RAID1C4: u64 = 1 << 10;
 
-    /// Any flag that means each stripe is a full mirror copy.
+    // Profiles that keep more than one copy of each block (mirrors / DUP);
+    // used to detect mirrored chunks.
     pub const MIRROR_MASK: u64 = RAID1 | DUP | RAID1C3 | RAID1C4;
 
-    /// Profiles the physical-order scrub explicitly rejects: striped layouts
-    /// whose mapping math the simple linear resolver cannot handle.  A
-    /// dev-extent in any of these chunks is not a contiguous sub-range of the
-    /// chunk's logical space, so `phys - dev_extent.phys_start` does not map
-    /// linearly to a logical offset.
+    // Profiles that stripe blocks across multiple devices.
     pub const STRIPED_MASK: u64 = RAID0 | RAID10 | RAID5 | RAID6;
 }
 
-/// A btrfs disk key: (objectid, type, offset).
-///
-/// `Ord`/`PartialOrd` compare lexicographically on `(objectid, ty, offset)`
-/// — the same ordering btrfs itself uses to sort items within a node and
-/// key pointers within an internal node. This lets tree walkers prune
-/// subtrees whose key range cannot overlap a requested `[key_lo, key_hi)`
-/// window (see [`super::tree::walk_leaves_range`]) without needing to know
-/// anything about a specific tree's item layout.
+/// A btrfs key: (objectid, type, offset), 17 bytes on disk.
+/// Items in a node are ordered lexicographically by key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Key {
     pub objectid: u64,
@@ -75,7 +62,6 @@ pub struct Key {
 }
 
 impl Key {
-    /// Construct a key directly.
     pub fn new(objectid: u64, ty: u8, offset: u64) -> Self {
         Self {
             objectid,
@@ -84,7 +70,8 @@ impl Key {
         }
     }
 
-    /// Parse a 17-byte key from `buf` at `pos`.
+    // 17-byte on-disk layout: objectid (8) | type (1) | offset (8),
+    // all little-endian.
     pub fn parse(buf: &[u8], pos: usize) -> Self {
         let objectid = u64::from_le_bytes([
             buf[pos],
@@ -115,17 +102,18 @@ impl Key {
     }
 }
 
-/// An internal-node key pointer: (key, blockptr, generation).
+/// A child pointer in an internal node: 17-byte key, the child node's
+/// logical address, and the child's expected generation (33 bytes on disk).
 #[derive(Debug, Clone, Copy)]
 pub struct KeyPtr {
     pub key: Key,
-    /// Logical bytenr of the child node.
+    /// Logical address of the child node; mapped through the chunk tree.
     pub blockptr: u64,
     pub generation: u64,
 }
 
 impl KeyPtr {
-    /// Parse a 25-byte keyptr (17-byte key + 8-byte blockptr + 8-byte gen).
+    // 33-byte on-disk layout: key (17) | blockptr (8) | generation (8).
     pub fn parse(buf: &[u8], pos: usize) -> Self {
         let key = Key::parse(buf, pos);
         let blockptr = u64::from_le_bytes([

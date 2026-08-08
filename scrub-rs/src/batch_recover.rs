@@ -1,87 +1,4 @@
-//! Batched, two-stage recovery pipeline.
-//!
-//! When scrub-rs runs with `--repair`, recovery is split into two
-//! cooperating threads connected by single-depth channels, so the two
-//! stages overlap and each provides backpressure to the one before it:
-//!
-//! ```text
-//!   scrub thread ──(A, depth 1)──▶ accumulator ──(B, depth 1)──▶ writer
-//!        reads disk          batches candidates        re-confirms +
-//!        emits Candidate     (max N / idle X s)        recovers + writes
-//! ```
-//!
-//! * **Accumulator** — receives raw csum-mismatch `Candidate`s from the
-//!   scrub, buffers them into a batch, and forwards the whole batch to the
-//!   writer.  It immediately starts filling the *next* batch.  Channel A is
-//!   depth 1, so the scrub blocks (pauses) once one batch is buffered.
-//! * **Writer** — receives a full batch, then re-confirms + recovers +
-//!   writes every candidate in it under **one** filesystem freeze.  Channel
-//!   B is depth 1, so the accumulator blocks (pauses) while the writer is
-//!   busy — but the accumulator can be filling batch N+1 while the writer
-//!   writes batch N.  That overlap is the whole point: the scrub and the
-//!   write proceed concurrently instead of strictly alternating.
-//!
-//! ## Why batch + thread
-//!
-//! * **Fewer freeze cycles.** `FIFREEZE`/`FITHAW` flushes dirty pages and
-//!   quiesces the mount — not free.  Batching does one freeze/thaw per
-//!   burst instead of one per corruption.
-//! * **Stricter reconfirmation.** Re-confirmation is *deferred* to write
-//!   time, so it answers "is this *still* corrupt right before I write?"
-//!   rather than "was it corrupt when I first scanned it?".  A block the
-//!   live FS legitimately rewrote in the meantime is classified `Stale`
-//!   and skipped.
-//! * **Per-sector metadata trust.** Re-confirmation returns
-//!   [`Reconfirm::Unverifiable`] only when the metadata node covering
-//!   *that specific sector* could not be read.  We skip the write for just
-//!   that candidate — we do NOT block unrelated writes because some other
-//!   part of the tree was unreadable.  (An earlier design gated globally on
-//!   `metadata_header_errors`; that was the wrong kind of gate and is gone.)
-//!
-//! ## Safety
-//!
-//! * The freeze wraps the *entire* batch's reconfirm + write + read-back
-//!   verify + cache-invalidate window, so the live FS cannot mutate a block
-//!   between our reconfirm and our write.  It is released by the
-//!   `FreezeGuard` RAII drop at the end of the batch — or EARLIER, when the
-//!   wall-clock guard fires (H4): once the freeze has been held longer than
-//!   `freeze_timeout`, the batch finishes only its current candidate and
-//!   defers the remainder to the next batch, so a slow/dying disk inside a
-//!   stripe gather can never stall the live filesystem indefinitely.
-//! * A failed thaw after a batch (H2) is a hard abort: the filesystem may
-//!   still be frozen, so no further batches may start.
-//! * A disk that degrades DURING the run (a sector that read fine at scan
-//!   time but EIOs at the writer's fresh read) is degraded to the
-//!   unreadable recovery path (H10) instead of being declared failed: the
-//!   sector is still reconstructed from parity and verified against its
-//!   stored checksum before any write.
-//! * The writer owns an **independent** [`Reconfirmer`] (a filesystem
-//!   handle with its own file handles + chunk map, built via
-//!   [`crate::fs::FilesystemScrub::reconfirmer`]), so it never borrows
-//!   the main scrub's reader — the two threads touch disjoint file
-//!   handles.  The main thread only *reads* the raw rdev; only the writer
-//!   *writes*.
-//! * Read-back verification: after writing each recovered block the writer
-//!   first invalidates the raw rdev's buffer cache (`BLKFLSBUF`) and then
-//!   re-reads the block from the device and asserts the verifier accepts it
-//!   — so the verify reads the platter, not the page cache the write just
-//!   dirtied.  A read-back that disagrees (or errors) is counted
-//!   `readback_failed` (never `recovered`) and blocks exit code 4: it is
-//!   the clearest "this disk is lying/failing" signal.  A second
-//!   `BLKFLSBUF` after the read-back drops the rdev's cached (possibly
-//!   stale) view of the disk so the next read through the live mount sees
-//!   the fresh bytes (note: this does NOT clear the mounted filesystem's
-//!   *file* page cache — see C5 in SERIOUS_ISSUES.md; repairs under a live
-//!   mount print a reboot/remount advisory).
-//!
-//! * A **required freeze that fails** (`FIFREEZE` ioctl error) never
-//!   degrades to unfrozen writes: that batch runs assess-only (every
-//!   candidate is still re-confirmed and reconstruction-tested so the
-//!   operator learns whether the corruption is repairable), but nothing is
-//!   written and would-be writes are counted `not_frozen`.  Only
-//!   `Ok(None)` from [`crate::freeze::FreezeController::guard`] (no live
-//!   mount declared: offline image, dry-run, explicit `--no-freeze`)
-//!   permits unfrozen writes.
+//! Batched parity recovery: dedup → freeze → re-confirm → recover → write-back.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -97,144 +14,82 @@ use crate::fs::{Reconfirm, ReconfirmRequest, Reconfirmer, SectorVerifier};
 use crate::recovery::{RecoveryInput, RecoveryResult, recover_block};
 use crate::status::StatusCounters;
 
-/// A single corruption candidate handed from the scrub thread to the
-/// writer thread.  Carries everything the writer needs to re-confirm and
-/// recover it without touching the scrub's reader.
+/// One mismatched sector queued for recovery.
 #[derive(Clone)]
 pub struct Candidate {
-    /// Byte offset on the failing disk's array partition (`/dev/nmd1p1`
-    /// space).  The array layer adds `rdevOffset` to reach raw-rdev space.
     pub array_phys: u64,
-    /// Sector size in bytes.
+
     pub block_size: usize,
-    /// Verifier closure: `true` iff a candidate block is the correct
-    /// original data.  Used both for recovery verification and read-back.
+
+    /// Verifies a candidate block against the sector's stored checksum.
     pub verify: SectorVerifier,
-    /// Raw-rdev byte offset, for log lines only.
+
     pub raw_phys: u64,
-    /// Raw-rdev path of the failing disk, for the write-back.
+
     pub failing_dev: PathBuf,
-    /// Filesystem-opaque deferred re-confirmation request, handed back to
-    /// the writer's [`Reconfirmer`] at write time to decide stale-vs-
-    /// corrupt right before the write.
+
+    /// Opaque request to re-check the sector against live metadata at write time.
     pub reconfirm: Option<ReconfirmRequest>,
-    /// The candidate's source bytes were **unreadable** (device `EIO`) —
-    /// the scrub could not read the failing disk at all, so the self-heal
-    /// fresh-read pre-check must be skipped (it would just `EIO` again)
-    /// and recovery must use a zero placeholder for the corrupt block.
+
+    /// The source read returned EIO; `verify` still carries the stored checksum.
     pub unreadable: bool,
 }
 
-/// Producer→accumulator protocol (channel A, depth 1).
+/// Messages from the scrub thread to the accumulator.
 pub enum Msg {
-    /// One corruption candidate.
+    /// One mismatched sector.
     Candidate(Candidate),
-    /// Producer is done; accumulator should flush any pending batch and exit.
+
+    /// The scrub finished; flush everything queued.
+    /// No more batches will arrive; drain the pending remainder.
     Done,
 }
 
-/// Accumulator→writer protocol (channel B, depth 1).
+/// Messages from the accumulator to the writer thread.
 enum BatchMsg {
-    /// One fully-buffered batch, ready to re-confirm + write.
+    /// A full batch of candidates.
     Batch(Vec<Candidate>),
-    /// Accumulator is done; writer should exit after the current batch.
+
     Done,
 }
 
-/// Aggregate counters produced by the writer thread, merged into the
-/// scrub's printed summary by `main`.
-///
-/// Per candidate the writer re-confirms against the live trees and then
-/// lands in exactly one bucket.  **Accounting invariant** (enforced by the
-/// verdict reconciliation in `main.rs`): every candidate handed to
-/// [`flush_batch`] is counted exactly once, with
-///
-/// ```text
-/// sent == stale + skipped + mismatch + deduped
-/// mismatch == recovered + failed + not_corrupt + not_frozen + readback_failed
-/// ```
-///
-/// (`sent` is tracked by `main` at the channel; `deduped` covers
-/// candidates collapsed by the per-batch `array_phys` dedup.)  A candidate
-/// that self-heals at the fresh read counts `stale` only; everything that
-/// reaches the recovery stage counts `mismatch` plus exactly one
-/// sub-bucket.
-///
-/// * `mismatch` → re-confirmed as genuine corruption (the live csum still
-///   disagrees with the stored one).  This is the count of *real* problems
-///   found; everything below is a sub-outcome of a mismatch.
-/// * `stale` → re-confirmation proved it was **never** genuine corruption:
-///   the extent is a hole / unallocated / `nodatasum`, or the live csum no
-///   longer matches the stored one (the live FS legitimately rewrote the
-///   block since our scan).  Benign churn — nothing to fix, no write.
-/// * `skipped` → the metadata node covering **this specific sector**
-///   (EXTENT_TREE or CSUM_TREE, or the live tree roots) could not be read,
-///   so we cannot safely re-confirm it.  We decline to write *just this
-///   candidate* (`Reconfirm::Unverifiable`) rather than risk a wrong
-///   reconstruction.  This is per-sector, NOT a global gate — other
-///   candidates in the same batch are unaffected.
-/// * `recovered` → confirmed corruption that was successfully rebuilt from
-///   parity and written (or would-be-written in dry-run), with a read-back
-///   verify that the verifier accepted.
-/// * `failed` → confirmed corruption where the fix did not land: the
-///   failing disk's stripe could not be read, the parity stripe could not
-///   be gathered, the write-back errored, or parity reconstruction produced
-///   a block the verifier rejects (`RecoveryResult::Failed`).
-/// * `not_corrupt` → re-confirm said corruption, but parity reconstruction
-///   produced a block the verifier rejects as the original — the block
-///   already matches / is not what the stored csum describes.  Nothing to
-///   write.  (Counted so the verdict sums reconcile.)
-/// * `not_frozen` → reconstruction succeeded but the batch's REQUIRED
-///   freeze failed, so the write was deferred (assess-only batch).  Never
-///   counted `recovered`; blocks exit code 4.
-/// * `readback_failed` → the write landed but the post-write read-back
-///   disagreed with the verifier or errored.  A lying/failing disk signal;
-///   never counted `recovered`; blocks exit code 4.
-/// * `deduped` → candidates collapsed by the per-batch `array_phys` dedup
-///   (accidental duplicates of the same physical location).
+/// Recovery accounting; stage counters (dedup/stale/skipped/mismatch) and
+/// outcome buckets are separate partitions of the same candidates.
 #[derive(Debug, Default)]
 pub struct BatchStats {
-    /// Candidates confirmed (post re-confirm) as genuine corruption.
+    /// Candidates that entered recovery (after dedup and re-confirm).
     pub mismatch: u64,
-    /// Candidates re-confirmed as benign churn (freed/rewritten/nodatasum).
+
+    /// Sectors no longer corrupt (rewritten or freed) — nothing to do.
     pub stale: u64,
-    /// Blocks successfully recovered and written (or would-be-written in
-    /// dry-run), with a passing read-back verify.
+
+    /// Reconstructed, written, and read-back verified (or dry-run).
     pub recovered: u64,
-    /// Recovery attempts that failed (read/gather/write error or parity
-    /// reconstruction the verifier rejected).
+
+    /// Recovery attempted but not achieved.
     pub failed: u64,
-    /// Candidates whose re-confirmation could not read the metadata for
-    /// *that specific sector* (`Reconfirm::Unverifiable`) — the write was
-    /// skipped for just this candidate, not globally.
+
+    /// Skipped without recovery (e.g. re-confirm metadata unreadable).
     pub skipped: u64,
-    /// Reconstruction succeeded but the batch's required freeze failed —
-    /// the write was deferred (assess-only).  Blocks exit code 4.
+
+    /// Would have been written, but the freeze failed (assess-only batch).
     pub not_frozen: u64,
-    /// Write landed but the post-write read-back disagreed or errored.
-    /// Blocks exit code 4.
+
+    /// Written but the read-back could not be verified.
     pub readback_failed: u64,
-    /// Reconstructed block rejected by the verifier as "not the original"
-    /// (`RecoveryResult::NotCorrupt`) — nothing to write.
+
+    /// Failed-disk read matched the stored checksum.
     pub not_corrupt: u64,
-    /// Candidates collapsed by the per-batch `array_phys` dedup.
+
+    /// Duplicate reports of the same sector collapsed in a batch.
     pub deduped: u64,
 }
 
-/// Writer-thread join result: `Ok(BatchStats)` on a clean finish, `Err` on
-/// a HARD abort (H2: a thaw failed and the filesystem may still be frozen).
-/// `main` turns the `Err` into a hard runtime error (exit 1, state=error).
 pub type WriterResult = io::Result<BatchStats>;
 
-/// Spawn the two-stage pipeline: an accumulator and a writer thread,
-/// connected by single-depth channels.
-///
-/// Returns the sending half of channel A (for the scrub to push
-/// candidates into) plus the two join handles.  The writer handle's `join`
-/// yields the [`BatchStats`].  The writer takes ownership of `freeze` (so
-/// the freeze lives entirely on its thread), a filesystem-owned
-/// [`Reconfirmer`] (independent of the scrub's reader) for write-time
-/// re-confirmation, and the array config.
+/// Start the accumulator and writer threads; returns the send handle for
+/// candidates and join handles for both threads. Channels are synchronous
+/// (capacity 1) so a slow writer back-pressures the scrub.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_pipeline(
     cfg: ArrayConfig,
@@ -251,10 +106,6 @@ pub fn spawn_pipeline(
     std::thread::JoinHandle<()>,
     std::thread::JoinHandle<WriterResult>,
 )> {
-    // Channel A: scrub -> accumulator (depth 1 => scrub pauses when one
-    // batch is buffered).  Channel B: accumulator -> writer (depth 1 =>
-    // accumulator pauses while the writer is busy, but can fill the next
-    // batch concurrently with the writer draining the current one).
     let (tx_a, rx_a) = mpsc::sync_channel(1);
     let (tx_b, rx_b) = mpsc::sync_channel(1);
 
@@ -282,9 +133,9 @@ pub fn spawn_pipeline(
     Ok((tx_a, acc_handle, writer_handle))
 }
 
-/// Accumulator: buffer candidates into batches and forward each batch to
-/// the writer.  Starts filling the next batch immediately after forwarding,
-/// so batch N+1 accumulates while batch N is being written.
+/// Collect candidates from the scrub and forward them to the writer in
+/// batches of up to `batch_max`, flushing early when `batch_idle` elapses.
+/// On Done/disconnect, flush whatever remains.
 fn run_accumulator(
     rx: mpsc::Receiver<Msg>,
     tx_b: SyncSender<BatchMsg>,
@@ -294,7 +145,8 @@ fn run_accumulator(
     let mut batch: Vec<Candidate> = Vec::with_capacity(batch_max);
 
     loop {
-        // First candidate of a batch: block until one arrives (or Done).
+        // Wait for the first candidate; when the scrub finishes, send a
+        // final batch plus Done.
         match rx.recv() {
             Ok(Msg::Candidate(c)) => batch.push(c),
             Ok(Msg::Done) => {
@@ -303,13 +155,12 @@ fn run_accumulator(
                         .send(BatchMsg::Batch(std::mem::take(&mut batch)))
                         .is_err()
                 {
-                    return; // writer is gone — stop buffering, don't drain into a dead channel
+                    return;
                 }
                 let _ = tx_b.send(BatchMsg::Done);
                 return;
             }
             Err(_) => {
-                // Producer gone.  Flush + exit.
                 if !batch.is_empty()
                     && tx_b
                         .send(BatchMsg::Batch(std::mem::take(&mut batch)))
@@ -322,8 +173,6 @@ fn run_accumulator(
             }
         }
 
-        // Fill the batch up to batch_max, or until batch_idle elapses with
-        // no new candidate (idle => forward the burst now).
         while batch.len() < batch_max {
             match rx.recv_timeout(batch_idle) {
                 Ok(Msg::Candidate(c)) => batch.push(c),
@@ -338,7 +187,8 @@ fn run_accumulator(
                     let _ = tx_b.send(BatchMsg::Done);
                     return;
                 }
-                Err(RecvTimeoutError::Timeout) => break, // idle => forward burst
+                // Batch filled the idle window — send what we have.
+                Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
                     if !batch.is_empty()
                         && tx_b
@@ -353,13 +203,7 @@ fn run_accumulator(
             }
         }
 
-        // Forward the filled batch.  Blocks if the writer is still busy with
-        // the previous one (backpressure) — but we then immediately start
-        // filling the next batch, so the two stages overlap.  If the writer
-        // is dead the send fails: stop immediately rather than draining the
-        // whole scrub into a dead channel (the writer's panic is surfaced
-        // by `main`'s join check, which turns the whole run into a hard
-        // error).
+        // Hand the batch to the writer and start the next one (full or idle timeout).
         if tx_b
             .send(BatchMsg::Batch(std::mem::take(&mut batch)))
             .is_err()
@@ -369,12 +213,8 @@ fn run_accumulator(
     }
 }
 
-/// Writer: receive one batch at a time, re-confirm + recover + write it
-/// under a single freeze, then wait for the next batch.
-///
-/// Returns an `Err` on a hard abort: a thaw failed after a batch (H2).
-/// `main` treats that as a hard runtime error — the verdict is incomplete
-/// and must never be reported as a clean/partial run.
+/// Receive batches and flush each one; on Done, keep flushing the deferred
+/// remainder until nothing is left.
 #[allow(clippy::too_many_arguments)]
 fn run_writer(
     rx: mpsc::Receiver<BatchMsg>,
@@ -387,15 +227,13 @@ fn run_writer(
     counters: Option<&StatusCounters>,
 ) -> io::Result<BatchStats> {
     let mut stats = BatchStats::default();
-    // Candidates deferred by a freeze-timeout in the previous flush (H4).
-    // They were already counted `sent` by `main` and must still be
-    // classified exactly once, so they head the next batch.  Flushing is
-    // drained on `Done` too, so a deferral can never lose candidates.
+
     let mut pending: Vec<Candidate> = Vec::new();
 
     loop {
         match rx.recv() {
             Ok(BatchMsg::Batch(batch)) => {
+                // Deferred candidates from freeze-timeouts are prepended to the next flush.
                 pending.extend(batch);
                 if let Err(e) = flush_pending(
                     &mut pending,
@@ -413,10 +251,6 @@ fn run_writer(
                 }
             }
             Ok(BatchMsg::Done) | Err(_) => {
-                // Producer done/gone: drain any freeze-deferred remainder.
-                // Each flush classifies at least one candidate (the
-                // freeze-timeout only defers from the second candidate
-                // on), so this always terminates.
                 while !pending.is_empty() {
                     if let Err(e) = flush_pending(
                         &mut pending,
@@ -439,8 +273,7 @@ fn run_writer(
     }
 }
 
-/// Flush the writer's pending queue through [`flush_batch`], replacing it
-/// with whatever the freeze-timeout deferred to the next flush.
+/// Flush the pending candidates, keeping the deferred remainder as pending.
 #[allow(clippy::too_many_arguments)]
 fn flush_pending(
     pending: &mut Vec<Candidate>,
@@ -468,12 +301,10 @@ fn flush_pending(
     Ok(())
 }
 
-/// Re-confirm + recover + write one batch under a single freeze.
-///
-/// Returns `Ok(deferred)` with the candidates a freeze-timeout deferred to
-/// the next batch (empty on a normal flush), or `Err` on a hard abort: a
-/// thaw failed after the batch (H2) — the run must stop and never start
-/// further batches while the filesystem may still be frozen.
+/// Process one batch: sort and dedup by array offset, freeze the filesystem,
+/// then per candidate re-confirm → read the failing disk → gather the stripe →
+/// recover → write back → read-back verify. Returns the candidates deferred
+/// by the freeze-timeout; aborts on a failed thaw.
 #[allow(clippy::too_many_arguments)]
 fn flush_batch(
     batch: &[Candidate],
@@ -486,14 +317,8 @@ fn flush_batch(
     counters: Option<&StatusCounters>,
     stats: &mut BatchStats,
 ) -> io::Result<Vec<Candidate>> {
-    // Dedupe by array_phys: a DUP chunk yields two dev-extents with
-    // *different* array_phys (two physical copies), which must BOTH be
-    // recovered — so we keep distinct array_phys and only collapse a true
-    // accidental duplicate of the same physical location.  Deduped
-    // candidates are counted so the sent-vs-classified verdict
-    // reconciliation in `main` still sums exactly (see the invariant on
-    // [`BatchStats`]).
     let mut batch = batch.to_vec();
+    // Dedup: the scrub can report the same sector more than once.
     batch.sort_by_key(|a| a.array_phys);
     let pre_dedup = batch.len();
     batch.dedup_by(|a, b| a.array_phys == b.array_phys);
@@ -503,31 +328,13 @@ fn flush_batch(
         c.deduped.fetch_add(deduped, Ordering::Relaxed);
     }
 
-    // One freeze for the whole batch's reconfirm + write + read-back.
-    // Deliberately NOT per-candidate: toggling FIFREEZE/FITHAW on and off
-    // for every sector in the batch would flicker the live filesystem
-    // frozen/thawed dozens of times per batch, which is its own source of
-    // stalls/latency spikes for anything doing I/O against the mount
-    // during recovery. A single freeze held for the whole batch is a
-    // bounded, predictable window (at most `batch_max` candidates' worth
-    // of reconfirm + write), preferred over frequent on/off flapping.
-    //
-    // A REQUIRED freeze that FAILS must never degrade to unfrozen writes.
-    // `guard()` distinguishes three outcomes:
-    //   Ok(Some(_)) — frozen; normal repair-write path.
-    //   Ok(None)    — no live mount declared (offline image, dry-run,
-    //                 explicit --no-freeze): unfrozen writes are the
-    //                 caller's explicit choice.
-    //   Err(e)      — a live mount WAS declared but FIFREEZE failed: run
-    //                 this batch assess-only (classify every candidate,
-    //                 write NOTHING, count would-be writes `not_frozen`).
-    //                 Subsequent batches keep retrying the freeze.
-    // Whether a live mount is declared — captured BEFORE the guard borrows
-    // `freeze` mutably (a `FreezeGuard` holds `&mut FreezeController`, so
-    // `freeze.has_live_mount()` cannot be called while it is alive).
+    // One freeze covers the whole batch. A failed freeze makes the batch
+    // assess-only: candidates are classified but never written.
     let has_live_mount = freeze.has_live_mount();
     let freeze_guard = match freeze.guard() {
         Ok(g) => g,
+        // Freeze failed: the filesystem is not frozen, so this batch runs
+        // assess-only — candidates are classified but never written.
         Err(e) => {
             eprintln!(
                 "ERROR: could not freeze the live filesystem for this batch ({e}). \
@@ -539,20 +346,13 @@ fn flush_batch(
             None
         }
     };
-    // Writes are allowed only when the freeze succeeded (guard present) or
-    // was never required (no declared live mount).  A failed freeze means
-    // `has_live_mount()` is true and the guard is None → writes blocked.
+
+    // Writes proceed only under an active freeze (or when there is no live
+    // mount at all, e.g. an offline image).
     let writes_allowed = freeze_guard.is_some() || !has_live_mount;
 
-    // H4: wall-clock guard on the batch.  The freeze window spans every
-    // candidate's reconfirm + fresh read + stripe gather across ALL other
-    // disks + write + read-back; a slow/dying disk inside the gather must
-    // not stall the live filesystem indefinitely.  Once the window exceeds
-    // `freeze_timeout` we finish only the CURRENT candidate and defer the
-    // rest to the next batch (the filesystem thaws here; `run_writer`
-    // re-queues the deferred tail).  The first candidate is always
-    // attempted so every flush makes progress — a batch can never be
-    // deferred in a loop.
+    // Bound the freeze window: once exceeded, defer the rest of the batch
+    // (still classified exactly once) to the next flush.
     let freeze_started = std::time::Instant::now();
     let mut deferred: Vec<Candidate> = Vec::new();
 
@@ -572,14 +372,12 @@ fn flush_batch(
             );
             break;
         }
-        // Re-confirm against the LIVE trees (deferred from scan time).
-        // Per-sector metadata trust: if the metadata covering *this*
-        // sector could not be read, we skip just this candidate — we do
-        // NOT block the other candidates in the batch.
+
+        // Re-confirm against live metadata: the sector may have been
+        // rewritten or freed since the scan.
         let verdict = match &cand.reconfirm {
             Some(req) => reconfirmer.reconfirm(req),
-            // No re-confirm request (no stored csum) — be conservative and
-            // treat as real corruption (never hide a possible mismatch).
+
             None => Reconfirm::Corruption,
         };
 
@@ -591,8 +389,8 @@ fn flush_batch(
                 }
                 continue;
             }
+            // Metadata unreadable — cannot safely write; skip this sector.
             Reconfirm::Unverifiable => {
-                // Metadata for THIS sector unreadable — skip only this one.
                 stats.skipped += 1;
                 if let Some(c) = counters {
                     c.skipped.fetch_add(1, Ordering::Relaxed);
@@ -606,15 +404,8 @@ fn flush_batch(
             Reconfirm::Corruption => {}
         }
 
-        // Obtain the "current bytes on the failing disk" for the recovery
-        // engine.  For a NORMAL candidate this is a fresh read, used both
-        // to close the transient-rewrite gap (if the live bytes now pass
-        // the verifier, the sector self-healed — treat as stale, no write)
-        // and as the `corrupt_block` input.  For an UNREADABLE candidate
-        // (EIO) the disk cannot return bytes — skip the fresh read entirely
-        // (it would just EIO again, see `docs/EIO-robustness-design.md`
-        // §5.2) and use a zero placeholder, exactly as the canary does for
-        // its P-only reconstruction.
+        // Re-read the failing disk. If it now verifies, the sector was
+        // rewritten since the scan — stale, nothing to recover.
         let mut unreadable = cand.unreadable;
         let corrupt_block: Vec<u8> = if unreadable {
             vec![0u8; cand.block_size]
@@ -627,8 +418,6 @@ fn flush_batch(
             ) {
                 Ok(block) => {
                     if (cand.verify)(&block) {
-                        // Self-healed since the scan/reconfirm read: the live bytes
-                        // now match the stored csum. Benign churn, not corruption.
                         stats.stale += 1;
                         if let Some(c) = counters {
                             c.stale.fetch_add(1, Ordering::Relaxed);
@@ -638,14 +427,6 @@ fn flush_batch(
                     block
                 }
                 Err(e) => {
-                    // H10: the disk degraded DURING the run — this sector read
-                    // fine at scan time but the writer's fresh read now EIOs.
-                    // Do NOT give up on the sector: degrade it to the
-                    // unreadable path (zero placeholder + skip-self-heal +
-                    // parity reconstruction verified against the stored csum),
-                    // exactly what a scan-time-EIO candidate gets.  The engine
-                    // knows `unreadable_source` and skips the checks that
-                    // would compare against a bogus corrupt block.
                     eprintln!(
                         "  [0x{:x}] read failing disk: {e} — disk degraded mid-run; \
                          degrading to the unreadable recovery path",
@@ -661,6 +442,7 @@ fn flush_batch(
             c.mismatch.fetch_add(1, Ordering::Relaxed);
         }
 
+        // Gather the other data disks plus P/Q at this offset.
         let stripe_chunks =
             match stripe::gather_stripe(cfg, scrub_slot, cand.array_phys, cand.block_size) {
                 Ok(s) => s,
@@ -682,6 +464,8 @@ fn flush_batch(
             q_block: stripe_chunks.q_block.as_deref(),
             verifier: &*cand.verify,
         };
+        // Try P, then Q, then the PQ 2-disk solve; the verifier picks the
+        // first candidate that matches the stored checksum.
         let result = recover_block(&input, cand.block_size);
         match &result {
             RecoveryResult::Recovered { via, block } => {
@@ -692,11 +476,8 @@ fn flush_batch(
                         format!("PQ(partner=slot {partner_slot})")
                     }
                 };
-                // Dry-run: the reconstruction is assessed but never
-                // written — classified `recovered` (would-be-written).
-                // Freeze-failed batch: the reconstruction is assessed but
-                // the write is DEFERRED — classified `not_frozen`, never
-                // `recovered` (exit 4 stays unreachable).
+
+                // Dry-run or assess-only: report the would-be write, never issue it.
                 if dry_run || !writes_allowed {
                     if writes_allowed {
                         eprintln!(
@@ -722,14 +503,10 @@ fn flush_batch(
                     }
                     continue;
                 }
-                // Real write path (freeze held, or no live mount declared).
+
+                // Write the recovered block straight to the raw rdev.
                 match stripe::write_block(cfg, &cand.failing_dev, cand.array_phys, block) {
                     Ok(()) => {
-                        // C5: remember that a repair landed under a declared
-                        // live mount, so `main` can print the page-cache
-                        // staleness advisory (BLKFLSBUF on the raw rdev does
-                        // NOT clear the mounted filesystem's FILE page
-                        // cache).
                         if let Some(c) = counters
                             && has_live_mount
                         {
@@ -745,22 +522,12 @@ fn flush_batch(
                         continue;
                     }
                 }
-                // C4: invalidate the raw rdev's buffer cache BEFORE the
-                // read-back, so the verify reads the device — not the page
-                // cache the write just dirtied.  A read-back served from
-                // cache proves nothing about the platter.
+
+                // Drop the device page cache so the read-back reads the platter,
+                // not stale cache.
                 match drop_cache(&cand.failing_dev) {
                     Ok(()) => {}
                     Err(e) => {
-                        // If the invalidation failed on a real BLOCK
-                        // device, the upcoming read-back could be served
-                        // from the page cache the write just dirtied — the
-                        // verify would prove nothing about the platter, so
-                        // it must NOT be trusted as "recovered" (C4 review:
-                        // a verify we cannot trust is a failed verify).
-                        // On a regular-FILE image ENOTTY is expected and
-                        // harmless: the file's page cache is the ground
-                        // truth there (the write was fsynced), so proceed.
                         use std::os::unix::fs::FileTypeExt;
                         let is_block = std::fs::metadata(&cand.failing_dev)
                             .map(|m| m.file_type().is_block_device())
@@ -777,8 +544,7 @@ fn flush_batch(
                             if let Some(c) = counters {
                                 c.readback_failed.fetch_add(1, Ordering::Relaxed);
                             }
-                            // Best-effort post-write invalidation for the
-                            // live mount (C5), then move on.
+
                             let _ = drop_cache(&cand.failing_dev);
                             continue;
                         }
@@ -790,6 +556,8 @@ fn flush_batch(
                         );
                     }
                 }
+                // Read-back verification: only count the write as recovered when
+                // the device returns bytes that verify.
                 let reread = stripe::read_block_or_zeros(
                     cfg,
                     &cand.failing_dev,
@@ -809,10 +577,6 @@ fn flush_batch(
                         }
                     }
                     Ok(_) => {
-                        // The write landed but the device returns bytes that
-                        // fail the verifier — the clearest "this disk is
-                        // lying / failing" signal.  Counted readback_failed
-                        // (never recovered), blocks exit code 4.
                         eprintln!(
                             "  [0x{:x}] READ-BACK MISMATCH: device returned bytes that fail \
                              the verifier after a successful write (lying/failing disk?) — \
@@ -836,18 +600,11 @@ fn flush_batch(
                         }
                     }
                 }
-                // C4/C5: invalidate again after the read-back so a
-                // subsequent read through the live mount sees the fresh
-                // bytes (this only clears the raw-rdev buffer cache — the
-                // mounted filesystem's FILE page cache is C5's problem).
-                // Best-effort: a failure here cannot invalidate the verify
-                // (already done) and only affects cache freshness.
+
                 let _ = drop_cache(&cand.failing_dev);
             }
+            // The on-disk block already matches its checksum (raced rewrite).
             RecoveryResult::NotCorrupt => {
-                // Re-confirm said corruption, but parity reconstruction
-                // produced a block the verifier rejects as the original —
-                // or the block already matches.  Nothing to write.
                 eprintln!(
                     "  [0x{:x}] not corrupt (matches stored csum)",
                     cand.raw_phys
@@ -857,6 +614,7 @@ fn flush_batch(
                     c.not_corrupt.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            // All parity paths failed or the verifier rejected everything.
             RecoveryResult::Failed { reason } => {
                 eprintln!(
                     "  [0x{:x}] FAILED: {reason:?} dev={}",
@@ -871,12 +629,8 @@ fn flush_batch(
         }
     }
 
-    // Explicitly drop the freeze guard here so the thaw completes before
-    // we check whether it FAILED (H2): a failed thaw means the filesystem
-    // may STILL be frozen.  That is strictly worse than the corruption
-    // being repaired — every writer on the mount stalls — so the run must
-    // not start further batches: abort, and surface the manual recovery
-    // command (`fsfreeze -u <mountpoint>`).
+    // A failed thaw means the filesystem may still be frozen — abort the run
+    // rather than risk unfrozen writes in later batches.
     drop(freeze_guard);
     if let Some(e) = freeze.take_thaw_error() {
         let mnt = freeze
@@ -892,21 +646,12 @@ fn flush_batch(
     Ok(deferred)
 }
 
-/// Invalidate the kernel's cached view of a block device via `BLKFLSBUF`.
-/// Called TWICE around a repair write: once BEFORE the read-back so the
-/// verify reads the device rather than the page cache the write just
-/// dirtied (C4), and once AFTER so a subsequent read through the live
-/// mount sees the fresh bytes rather than a stale page-cache entry.
-///
-/// Returns `Err` when the device cannot be opened or the ioctl fails
-/// (e.g. `ENOTTY` on a regular-file image).  The caller decides whether a
-/// failure is acceptable: for a block device the pre-read-back
-/// invalidation is REQUIRED for the verify to mean anything; for a file
-/// image `ENOTTY` is expected and harmless.
+/// Invalidate the kernel's page cache for the device (BLKFLSBUF ioctl) so
+/// subsequent reads come from the platter.
 fn drop_cache(dev: &Path) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(dev)?;
-    // BLKFLSBUF = _IO(0x12, 97) = 0x0000_1261.
+
     const BLKFLSBUF: std::os::raw::c_ulong = 0x0000_1261;
     let rc = unsafe { crate::freeze::libc_ioctl(f.as_raw_fd(), BLKFLSBUF, 0) };
     if rc < 0 {
@@ -927,9 +672,6 @@ mod tests {
 
     const BLOCK: usize = 16;
 
-    /// Reconfirmer stub: returns `Reconfirm::Corruption` for every token
-    /// except the ones mapped to `Stale` / `Unverifiable` (so one batch can
-    /// exercise every verdict in a single run).
     struct VerdictStub {
         stale_tokens: Vec<u64>,
         unverifiable_tokens: Vec<u64>,
@@ -954,10 +696,6 @@ mod tests {
         path
     }
 
-    /// Three-file "array": the failing disk d1 (slot 1) carries 0x11 on
-    /// disk, but the ORIGINAL data — what the verifier accepts — is 0x44.
-    /// d2 (slot 2) is 0x22; P is 0x44 ^ 0x22 = 0x66, so P-recovery
-    /// reconstructs 0x44 and the verifier accepts it.
     fn cfg(dir: &tempfile::TempDir) -> (ArrayConfig, PathBuf) {
         let d1 = make_disk(dir, "d1", 0x11);
         let d2 = make_disk(dir, "d2", 0x22);
@@ -1018,9 +756,6 @@ mod tests {
 
     #[test]
     fn freeze_failure_defers_writes_into_not_frozen() {
-        // C2: a REQUIRED freeze that fails must never degrade to unfrozen
-        // writes — the batch runs assess-only; would-be writes land in
-        // `not_frozen` (never `recovered`) and the disk stays untouched.
         let dir = tempfile::tempdir().unwrap();
         let (cfg, d1) = cfg(&dir);
         let before = fs::read(&d1).unwrap();
@@ -1048,8 +783,6 @@ mod tests {
 
     #[test]
     fn no_declared_mount_writes_normally() {
-        // C2 Ok(None): no live mount declared (offline image / --no-freeze)
-        // — unfrozen writes are the caller's explicit choice, unchanged.
         let dir = tempfile::tempdir().unwrap();
         let (cfg, d1) = cfg(&dir);
         let freeze = FreezeController::new(None);
@@ -1099,8 +832,6 @@ mod tests {
 
     #[test]
     fn unreadable_candidate_recovers_from_parity() {
-        // An EIO-unreadable candidate (zero placeholder) is still recovered
-        // from parity and written when the freeze is fine.
         let dir = tempfile::tempdir().unwrap();
         let (cfg, d1) = cfg(&dir);
         let freeze = FreezeController::new(None);
@@ -1124,10 +855,6 @@ mod tests {
 
     #[test]
     fn verdicts_stale_and_unverifiable_are_counted_and_never_written() {
-        // Mixed batch: two recoverable, one stale (self-healed/freed), one
-        // unverifiable (metadata unreadable for that sector) — the C7
-        // accounting invariant must hold and neither stale nor skipped may
-        // produce a write.
         let dir = tempfile::tempdir().unwrap();
         let (cfg, d1) = cfg(&dir);
         let freeze = FreezeController::new(None);
@@ -1138,8 +865,8 @@ mod tests {
             vec![
                 cand(d1.clone(), 0, 0, false),
                 cand(d1.clone(), 16, 1, false),
-                cand(d1.clone(), 32, 2, false), // token 2 -> Stale
-                cand(d1.clone(), 48, 3, false), // token 3 -> Unverifiable
+                cand(d1.clone(), 32, 2, false),
+                cand(d1.clone(), 48, 3, false),
             ],
             VerdictStub {
                 stale_tokens: vec![2],
@@ -1149,9 +876,7 @@ mod tests {
         assert_eq!(stats.recovered, 2);
         assert_eq!(stats.stale, 1);
         assert_eq!(stats.skipped, 1);
-        // Invariant: sent(4) == stale + skipped + mismatch + deduped,
-        // and mismatch == recovered + failed + not_corrupt + not_frozen +
-        // readback_failed.
+
         assert_eq!(stats.mismatch, 2);
         assert_eq!(
             stats.mismatch,
@@ -1165,8 +890,7 @@ mod tests {
             stats.stale + stats.skipped + stats.mismatch + stats.deduped,
             4
         );
-        // Only the two corruption candidates were written; the stale one
-        // (offset 32) must still hold its original corrupt bytes.
+
         let after = fs::read(&d1).unwrap();
         assert_eq!(&after[..16], &vec![0x44u8; 16]);
         assert_eq!(&after[16..32], &vec![0x44u8; 16]);
@@ -1176,9 +900,6 @@ mod tests {
 
     #[test]
     fn array_phys_dedup_is_counted() {
-        // Two candidates at the same physical offset collapse to one; the
-        // collapsed candidate is counted `deduped` so the sent-vs-classified
-        // reconciliation still sums exactly.
         let dir = tempfile::tempdir().unwrap();
         let (cfg, d1) = cfg(&dir);
         let freeze = FreezeController::new(None);
@@ -1186,10 +907,7 @@ mod tests {
             &cfg,
             freeze,
             false,
-            vec![
-                cand(d1.clone(), 0, 0, false),
-                cand(d1.clone(), 0, 1, false), // accidental duplicate
-            ],
+            vec![cand(d1.clone(), 0, 0, false), cand(d1.clone(), 0, 1, false)],
             VerdictStub {
                 stale_tokens: vec![],
                 unverifiable_tokens: vec![],
@@ -1203,13 +921,6 @@ mod tests {
 
     #[test]
     fn fresh_read_failure_degrades_to_unreadable_recovery_path() {
-        // H10: a sector that read fine at scan time but EIOs at the
-        // writer's fresh read must NOT be auto-failed — it degrades to
-        // the unreadable path (zero placeholder + skip-self-heal + parity
-        // reconstruction verified against the stored csum).  We delete the
-        // failing disk after building the config so the fresh read fails;
-        // in dry-run the reconstruction is still classified `recovered`
-        // (would-be), proving the candidate was not given up on.
         let dir = tempfile::tempdir().unwrap();
         let (cfg, d1) = cfg(&dir);
         fs::remove_file(&d1).unwrap();
@@ -1237,13 +948,6 @@ mod tests {
 
     #[test]
     fn freeze_timeout_defers_the_rest_of_the_batch() {
-        // H4: once the batch window exceeds the freeze timeout, the rest
-        // of the batch is deferred to the next flush instead of keeping
-        // the freeze (and the live filesystem) held.  The first candidate
-        // is always attempted (progress guarantee — a batch can never be
-        // deferred in a loop), the remainder is returned for re-queueing,
-        // and the deferred candidates are still classifiable by later
-        // flushes (so the sent-vs-classified reconciliation stays exact).
         let dir = tempfile::tempdir().unwrap();
         let (cfg, d1) = cfg(&dir);
         let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(VerdictStub {
@@ -1252,7 +956,7 @@ mod tests {
         });
         let mut stats = BatchStats::default();
         let mut freeze = FreezeController::new(None);
-        // Timeout of zero: every candidate after the first is deferred.
+
         let deferred = flush_batch(
             &[
                 cand(d1.clone(), 0, 0, false),
@@ -1282,8 +986,7 @@ mod tests {
             &vec![0x11u8; 32],
             "deferred candidates not written yet"
         );
-        // Drain the deferred candidates with subsequent flushes; each
-        // flush must classify at least one.
+
         let mut stats2 = BatchStats::default();
         let deferred2 = flush_batch(
             &deferred,
@@ -1313,8 +1016,7 @@ mod tests {
         .expect("third flush must not abort");
         assert!(deferred3.is_empty());
         assert_eq!(stats2.recovered, 2);
-        // Full drain: every candidate classified exactly once across the
-        // three flushes (reconciliation: 3 sent == 3 recovered).
+
         assert_eq!(stats.recovered + stats2.recovered, 3);
     }
 }

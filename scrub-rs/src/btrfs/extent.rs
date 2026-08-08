@@ -1,17 +1,4 @@
-//! FileExtentItem parsing — just enough to find REGULAR data extents.
-//!
-//! Layout of `struct btrfs_file_extent_item` (non-inline / REGULAR type):
-//!   +0   generation u64
-//!   +8   ram_bytes u64
-//!   +16  compression u8
-//!   +17  encryption u8
-//!   +18  other_encoding u16
-//!   +20  type u8  (0=INLINE, 1=REGULAR, 2=PREALLOC)
-//!   +21  -- if not INLINE: ExtentDataRef --
-//!        disk_bytenr  u64  (logical addr of the on-disk extent; 0 = sparse)
-//!        disk_num_bytes u64 (size of the on-disk extent)
-//!        offset       u64  (offset within the extent)
-//!        num_bytes    u64  (logical bytes in the file)
+//! Live extent- and csum-tree lookups that re-classify mismatched sectors at write time.
 
 use super::util::le_u64;
 use crate::fs::Reconfirm;
@@ -20,27 +7,30 @@ pub const TYPE_INLINE: u8 = 0;
 pub const TYPE_REGULAR: u8 = 1;
 pub const TYPE_PREALLOC: u8 = 2;
 
-/// A parsed REGULAR/PREALLOC file extent (the fields the scrub needs).
+/// On-disk EXTENT_DATA extent of one inode.
 #[derive(Debug, Clone, Copy)]
 pub struct FileExtent {
-    /// btrfs key.objectid — the inode this extent belongs to.
     pub inode: u64,
-    /// btrfs key.offset — the file offset where this extent starts.
+
     pub file_offset: u64,
+    /// TYPE_INLINE, TYPE_REGULAR, or TYPE_PREALLOC.
     pub extent_type: u8,
-    /// Logical disk address of the extent (0 = sparse/hole).
+
+    /// Logical address of the extent's data on disk.
     pub disk_bytenr: u64,
+    /// Allocated on-disk size (may exceed `num_bytes`).
     pub disk_num_bytes: u64,
-    /// Offset within the on-disk extent.
+
+    /// Byte offset into the disk extent where the file data starts.
     pub offset: u64,
-    /// Number of bytes covered in the file.
+
+    /// Number of file bytes this extent covers.
     pub num_bytes: u64,
 }
 
 impl FileExtent {
-    /// Parse a FileExtentItem payload given the key (objectid, offset).
-    ///
-    /// Returns `None` for INLINE extents (no on-disk data to scrub).
+    /// Parse a regular or prealloc extent; inline extents (data carried in
+    /// the item itself) return None.
     pub fn parse(buf: &[u8], inode: u64, file_offset: u64) -> Option<Self> {
         if buf.len() < 21 {
             return None;
@@ -67,65 +57,21 @@ impl FileExtent {
         })
     }
 
-    /// The logical address of the first byte of this extent's data on disk.
+    /// Logical address where the file data physically begins.
     pub fn disk_start(&self) -> u64 {
         self.disk_bytenr + self.offset
     }
 }
 
-/// EXTENT_ITEM flags (subset).  `EXTENT_FLAG_NODATASUM` marks an extent
-/// written without a checksum (intentional `nodatasum`/`nocow`), which can
-/// never be verified and must not be reported as corruption.
-///
-/// Values mirror the kernel's `extent-tree.h` (`btrfs_extent_item::flags`):
-///   EXTENT_FLAG_DATA      = 1 << 0   (set on every normal data extent)
-///   EXTENT_FLAG_TREE_BLOCK= 1 << 1
-///   EXTENT_FLAG_NODATASUM = 1 << 3   <-- the one we care about
+/// EXTENT_ITEM flag bits.
 pub mod extent_flag {
+    /// Extent was written without checksums.
     pub const NODATASUM: u64 = 1 << 3;
 }
 
-/// Re-confirm a data-sector csum mismatch against the **live** EXTENT_TREE
-/// and CSUM_TREE (see [`crate::btrfs::open::live_data_tree_roots`]).
-///
-/// The verdict is [`crate::fs::Reconfirm`] — the seam type shared with the
-/// recovery sink — with btrfs's meaning for each variant described in the
-/// decision logic below.
-///
-/// `logical` is the sector's logical address; `stored` is the csum our
-/// *frozen snapshot* (taken at `open()`) expected here.  `extent_root` /
-/// `csum_root` are the *current* tree roots from
-/// [`crate::btrfs::open::live_data_tree_roots`]; `hash_len` is the csum width
-/// from the filesystem strategy.
-///
-/// The decision compares the **live** csum against the **snapshot** csum
-/// (`stored`), NOT against the freshly-computed `actual` (the csum of the
-/// bytes we read).  Rationale: if the live filesystem still expects exactly
-/// `stored` at this logical address, then the data we read disagreeing with
-/// `stored` is genuine corruption.  If the live csum *differs* from `stored`,
-/// the extent was rewritten since our snapshot — our read was stale and the
-/// live data is fine, so it's benign churn.  Comparing against `actual`
-/// would be wrong: for a static (unmounted) corruption the live csum equals
-/// `stored` but differs from `actual`, and that difference is precisely the
-/// corruption signal, not staleness.
-///
-/// Logic (both trees must agree it's stale before we downgrade):
-///   1. EXTENT_TREE lookup at `logical`:
-///      - no covering EXTENT_ITEM        -> Stale (freed / orphaned)
-///      - covering item has NODATASUM    -> Stale (intentionally uncsummed)
-///      - covering item (normal)         -> continue to csum check
-///      - tree unreadable for THIS addr  -> Unverifiable (skip write for this sector only)
-///   2. CSUM_TREE lookup at `logical` (live):
-///      - no entry                       -> Stale (consistent with freed)
-///      - entry == `stored`              -> Corruption (live tree still expects `stored`; data is bad)
-///      - entry != `stored`              -> Stale (extent rewritten under us)
-///      - tree unreadable for THIS addr  -> Unverifiable
-///
-/// Note the gate is **per-sector**: an `Unreadable` here means the metadata
-/// node covering *this logical address* had no good copy.  A metadata error
-/// elsewhere in the filesystem does NOT produce `Unverifiable` for sectors
-/// whose own metadata read fine — so we never block an unrelated write just
-/// because some other part of the tree was unreadable.
+/// Re-check one mismatched sector against live metadata at write time.
+/// Returns Corruption (still bad — recover), Stale (freed or rewritten —
+/// skip), or Unverifiable (metadata unreadable — skip).
 #[allow(clippy::too_many_arguments)]
 pub fn reconfirm_mismatch(
     reader: &mut crate::btrfs::reader::FsReader,
@@ -137,23 +83,20 @@ pub fn reconfirm_mismatch(
     hash_len: usize,
     sector_size: u64,
 ) -> Reconfirm {
-    // 1. EXTENT_TREE liveness / nodatasum check.
+    // A hole or a no-checksum extent means the sector was rewritten or
+    // freed since the scan: nothing to recover.
     match extent_covers(reader, chunk_map, extent_root, logical) {
         ExtentLive::Hole => return Reconfirm::Stale,
         ExtentLive::NoDataSum => return Reconfirm::Stale,
         ExtentLive::Live => {}
-        // The EXTENT_TREE node covering THIS sector was unreadable -> we
-        // cannot confirm liveness, so skip the write for this sector only.
+
         ExtentLive::Unreadable => return Reconfirm::Unverifiable,
     }
 
-    // 2. CSUM_TREE check: does the live expected csum still equal the
-    //    snapshot's stored csum?  If yes -> real corruption; if no -> the
-    //    extent was rewritten since our snapshot (benign churn).
+    // Still owned: the live checksum decides corruption vs. churn.
     match csum_at(reader, chunk_map, csum_root, logical, hash_len, sector_size) {
         CsumLive::None => Reconfirm::Stale,
-        // The CSUM_TREE node covering THIS sector was unreadable -> skip the
-        // write for this sector only.
+
         CsumLive::Unreadable => Reconfirm::Unverifiable,
         CsumLive::Some(live) => {
             if live == stored {
@@ -165,40 +108,28 @@ pub fn reconfirm_mismatch(
     }
 }
 
-/// Whether `logical` is covered by a live data extent in `extent_root`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExtentLive {
-    /// A covering EXTENT_ITEM exists (normal, csummed data extent).
     Live,
-    /// No EXTENT_ITEM covers `logical` — the address is unallocated / freed.
+
     Hole,
-    /// A covering EXTENT_ITEM carries `EXTENT_FLAG_NODATASUM`.
+
     NoDataSum,
-    /// The extent tree could not be read; treat as "don't know".
+
     Unreadable,
 }
 
-/// Find the EXTENT_ITEM covering `logical` (if any) via a B-tree descent of
-/// `extent_root`, reusing `read_node` (DUP cross-check + fsid/owner
-/// validation) at each level.  EXTENT_ITEM keys are
-/// `(start, EXTENT_ITEM, 0)`; we locate the greatest `start <= logical` and
-/// test `start + num_bytes > logical`.
+/// Find the EXTENT_ITEM covering `logical`, or classify the gap.
 fn extent_covers(
     reader: &mut crate::btrfs::reader::FsReader,
     chunk_map: &crate::btrfs::chunk::ChunkMap,
     extent_root: u64,
     logical: u64,
 ) -> ExtentLive {
-    // Descend: at each internal node, follow the child pointer with the
-    // greatest key <= (logical, EXTENT_ITEM, u64::MAX).  EXTENT_ITEM keys
-    // are (start, EXTENT_ITEM, num_bytes), so using offset = u64::MAX makes
-    // any EXTENT_ITEM with start <= logical sort at or before the target —
-    // we then pick the greatest such key and test coverage.  (Using offset 0
-    // would wrongly exclude every real extent, whose offset is its length.)
     let target =
         crate::btrfs::key::Key::new(logical, crate::btrfs::key::key_type::EXTENT_ITEM, u64::MAX);
     let mut node_logical = extent_root;
-    // Guard against pathological loops.
+
     for _depth in 0..16 {
         let res = reader
             .read_node(
@@ -215,37 +146,24 @@ fn extent_covers(
         };
         match node {
             crate::btrfs::node::Node::Internal(internal) => {
-                // Find the child whose key is the greatest <= target.
-                // Internal `ptrs` are ascending-key-sorted, so binary
-                // search for the first one whose key is > target instead
-                // of a linear scan over every child pointer.
                 let count = internal
                     .ptrs
                     .partition_point(|ptr| key_leq(&ptr.key, &target));
                 match count {
+                    // Descend into the child whose key range can contain
+                    // the target; 0 means the target lies before the
+                    // first key — a hole.
                     0 => return ExtentLive::Hole,
                     _ => node_logical = internal.ptrs[count - 1].blockptr,
                 }
             }
             crate::btrfs::node::Node::Leaf(leaf) => {
-                // Find the greatest EXTENT_ITEM key <= target and test
-                // coverage.  Leaf slots are stored in ascending key order,
-                // so binary-search (`partition_point`) for the first slot
-                // whose key is > target — everything before that index has
-                // key <= target — instead of the previous linear scan from
-                // the start of the leaf, which was O(leaf size) per lookup.
-                // Other item types (e.g. EXTENT_DATA_REF) can share the
-                // same objectid and sort adjacent to an EXTENT_ITEM, so
-                // after landing at `count - 1` we still walk backward to
-                // the nearest EXTENT_ITEM slot — but that backward walk is
-                // bounded by how many non-EXTENT_ITEM entries share this
-                // one objectid, not by the whole leaf.  For a regular
-                // EXTENT_ITEM (type 168) the key.offset IS the extent
-                // length, so coverage is [objectid, objectid+offset).
                 let count = leaf
                     .slots
                     .partition_point(|slot| key_leq(&slot.key, &target));
-                let mut covering: Option<(usize, u64, u64)> = None; // (slot_idx, start, len)
+                // Scan backwards for the last EXTENT_ITEM at or before the
+                // target, then check whether it actually covers `logical`.
+                let mut covering: Option<(usize, u64, u64)> = None;
                 for i in (0..count).rev() {
                     let slot = &leaf.slots[i];
                     if slot.key.ty == crate::btrfs::key::key_type::EXTENT_ITEM {
@@ -273,21 +191,17 @@ fn extent_covers(
     ExtentLive::Unreadable
 }
 
-/// Whether `logical` has a csum entry in the live `csum_root`.
 #[derive(Debug, Clone)]
 enum CsumLive {
-    /// A csum entry exists; carries the live stored csum bytes.
     Some(Vec<u8>),
-    /// No csum entry at `logical` (address unallocated / freed).
+
     None,
-    /// The csum tree could not be read; treat as "don't know".
+
     Unreadable,
 }
 
-/// Look up the csum stored in the live `csum_root` for `logical`.  CSUM_TREE
-/// items are `(EXTENT_CSUM_OBJECTID, EXTENT_CSUM, run_start)` with a packed
-/// array of `hash_len`-byte csums, one per sector.  We locate the run
-/// covering `logical` and slice the matching sector's csum.
+/// Fetch the live checksum for the sector containing `logical` from the
+/// CSUM_TREE.
 fn csum_at(
     reader: &mut crate::btrfs::reader::FsReader,
     chunk_map: &crate::btrfs::chunk::ChunkMap,
@@ -319,28 +233,22 @@ fn csum_at(
         };
         match node {
             crate::btrfs::node::Node::Internal(internal) => {
-                // Binary search: `ptrs` is ascending-key-sorted.
                 let count = internal
                     .ptrs
                     .partition_point(|ptr| key_leq(&ptr.key, &target));
                 match count {
+                    // No child pointer precedes the target: the range has
+                    // no csum item.
                     0 => return CsumLive::None,
                     _ => node_logical = internal.ptrs[count - 1].blockptr,
                 }
             }
             crate::btrfs::node::Node::Leaf(leaf) => {
-                // Find the EXTENT_CSUM run whose [start, start+len) covers
-                // `sector`.  Runs are keyed by their start logical address,
-                // which lives in `key.offset` (the objectid is always
-                // EXTENT_CSUM_OBJECTID = -10).  Every slot in a CSUM_TREE
-                // leaf is uniformly `(EXTENT_CSUM_OBJECTID, EXTENT_CSUM, *)`
-                // (unlike EXTENT_TREE leaves, no other item type shares this
-                // objectid), so a plain binary search on `key.offset` lands
-                // exactly on the covering run with no type filter needed —
-                // no linear leaf scan required.
                 let count = leaf
                     .slots
                     .partition_point(|slot| key_leq(&slot.key, &target));
+                // The last EXTENT_CSUM item at or before the target sector;
+                // return its hash if the item's run covers the sector.
                 if count > 0 {
                     let i = count - 1;
                     let slot = &leaf.slots[i];
@@ -365,15 +273,13 @@ fn csum_at(
     CsumLive::Unreadable
 }
 
-/// `true` iff `a <= b` by (objectid, type, offset) lexicographic order —
-/// btrfs's key comparison order.
+/// Key comparison used for the tree descents; matches btrfs item order.
 fn key_leq(a: &crate::btrfs::key::Key, b: &crate::btrfs::key::Key) -> bool {
     (a.objectid, a.ty as u32, a.offset) <= (b.objectid, b.ty as u32, b.offset)
 }
 
-/// Whether the EXTENT_ITEM at `leaf[slot_idx]` was written `nodatasum`.
-/// Flags live at offset 16 of `btrfs_extent_item`
-/// (refs@0(8), generation@8(8), flags@16(8)).
+/// True if the extent item's flags (bytes 16..24 of its data) carry
+/// NODATASUM.
 fn extent_is_nodatasum(leaf: &crate::btrfs::node::Leaf, slot_idx: usize) -> bool {
     let data = leaf.item_data(slot_idx);
     if data.len() < 24 {
