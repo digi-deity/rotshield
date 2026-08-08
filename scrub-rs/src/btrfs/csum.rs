@@ -28,7 +28,8 @@ pub struct LazyCsumProvider {
     /// Distinct nodes that failed with a read (EIO) error.
     metadata_read_errors: u64,
 
-    /// Nodes skipped as stale (freed/repurposed) — a coverage gap, not an error.
+    /// Nodes skipped as stale (freed/repurposed by a live transaction) —
+    /// expected churn on a live filesystem, not an error.
     stale_branches: u64,
 
     /// Bytenrs already counted, per counter, to deduplicate re-read nodes.
@@ -187,8 +188,8 @@ impl LazyCsumProvider {
                 }
             },
             // Stale node (freed/repurposed by a live transaction): normal
-            // churn, but a coverage gap — counted so the run refuses
-            // exit 0, not as a metadata error.
+            // churn on a live filesystem — counted for visibility, not an
+            // error and never a metadata error.
             |logical| {
                 if reported_stale.insert(logical) {
                     *stale_branches += 1;

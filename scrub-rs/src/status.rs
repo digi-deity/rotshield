@@ -16,8 +16,8 @@ pub struct StatusCounters {
     pub sectors_no_csum: AtomicU64,
     pub sectors_read_error: AtomicU64,
 
-    /// CSUM-tree branches skipped as stale mid-scrub — a coverage gap that
-    /// blocks exit 0.
+    /// CSUM-tree branches skipped as stale mid-scrub — expected churn on a
+    /// live filesystem; informational only (does not block exit 0).
     pub stale_csum_branches: AtomicU64,
 
     /// Read runs truncated when the EIO isolation budget ran out.

@@ -24,9 +24,9 @@ Icon="rotshield.png"
  * plain language what the number counts and whether a non-zero value is
  * good or bad.  The
  * table shows only essential rows (progress, volume, mismatch, read error,
- * recovered, failed); diagnostic rows (stale, no csum, skipped) and the
- * whole Metadata group stay hidden until some disk reports a non-zero
- * value for them. Raw
+ * recovered, failed); diagnostic rows (stale, csum branches stale, no
+ * csum, skipped) and the whole Metadata group stay hidden until some disk
+ * reports a non-zero value for them. Raw
  * logs are no longer shown in the UI (they are still written to
  * /boot/config/plugins/rotshield/runs for debugging).
  */
@@ -505,7 +505,7 @@ pre { max-width: 100%; overflow-x: auto; }
   // Visibility: always-visible rows are the healthy-scrub signals where a
   // visible 0 is meaningful (Progress, Scrub volume, Sectors mismatch,
   // Sectors read error, Recovered, Failed).  Rows marked 'cond' (Sectors
-  // stale, Sectors no csum, Skipped) and the Metadata group (cond: true)
+  // stale, Sectors no csum, Skipped, CSUM-tree branches stale) and the Metadata group (cond: true)
   // are hidden for ALL disks until some disk reports a non-zero value for
   // the stat — they are edge-case diagnostics, not part of the essential
   // view, and a healthy all-zero run shows only the essential rows.
@@ -525,6 +525,7 @@ pre { max-width: 100%; overflow-x: auto; }
       rows: [
         ['Sectors mismatch', 'sectors_mismatch', "Real corruption: the block's content no longer matches the checksum recorded when it was written \u2014 something changed or damaged the data. Any number above zero means genuine problems were found; the Recovery group below shows what could be done about them."],
         ['Sectors stale', 'sectors_stale', "Blocks that initially looked wrong but turned out to be fine: the filesystem had legitimately rewritten or deleted them while the scan was running, or the file was never checksummed in the first place. This is normal activity on a busy disk, not corruption \u2014 no action needed.", 'cond'],
+        ['CSUM-tree branches stale', 'stale_csum_branches', "Parts of the filesystem's checksum map moved while the scan was running: files were written, rewritten or deleted, so some of the map's bookkeeping was freed and reused. Some of this is expected on a live filesystem \u2014 it is normal activity, not corruption. The areas covered by those parts were not verified this run, and no action is needed; rerun the scan during a quiet period if you want full coverage.", 'cond'],
         ['Sectors no csum', 'sectors_no_csum', "Data blocks the filesystem stores without a checksum, so there is nothing to compare against. Nothing is wrong with them \u2014 they simply cannot be verified. In this scan mode the count is always 0, because such blocks are passed over silently rather than counted.", 'cond'],
         ['Sectors read error', 'sectors_read_error', "The disk refused to return this block's data (an I/O error \u2014 the same kind of failure SMART tests report). This is a hardware problem, not corrupted data. The scan skips only these blocks and keeps checking the rest of the disk. Check the disk's health (SMART, cables, controller). These blocks could not be verified; if parity cannot rebuild them, they need attention."]
       ] },

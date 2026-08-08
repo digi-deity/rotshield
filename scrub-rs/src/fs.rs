@@ -73,7 +73,8 @@ pub struct ScrubStats {
     pub sectors_stale: u64,
 
     /// CSUM-tree branches skipped as stale mid-scrub; those sectors were never
-    /// verified this run (blocks exit 0).
+    /// verified this run. Expected churn on a live filesystem — informational
+    /// only, not an error.
     pub stale_csum_branches: u64,
 
     /// Read runs truncated when the EIO isolation budget was exhausted.
