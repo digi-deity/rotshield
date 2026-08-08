@@ -36,27 +36,10 @@ pub(crate) fn advise_willneed(file: &File, offset: u64, len: u64) {
     );
 }
 
-/// Hint the kernel to drop the cached pages for `offset..offset+len`.
-#[cfg(unix)]
-pub(crate) fn advise_dontneed(file: &File, offset: u64, len: u64) {
-    use std::os::fd::AsRawFd;
-    if len == 0 {
-        return;
-    }
-    let _ = nix::fcntl::posix_fadvise(
-        file.as_raw_fd(),
-        offset as i64,
-        len as i64,
-        nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
-    );
-}
-
 #[cfg(not(unix))]
 fn advise_sequential(_file: &File) {}
 #[cfg(not(unix))]
 fn advise_willneed(_file: &File, _offset: u64, _len: u64) {}
-#[cfg(not(unix))]
-fn advise_dontneed(_file: &File, _offset: u64, _len: u64) {}
 
 /// Sentinel for `expected_generation`: skip the generation check.
 pub const GEN_DONT_CHECK: u64 = u64::MAX;
@@ -178,11 +161,6 @@ impl FsReader {
         pread_at(&self.fp, self.base_offset + phys, n)
     }
 
-    /// Physical read without the devid check or read-ahead hint.
-    pub fn read_physical_raw(&mut self, phys: u64, n: usize) -> std::io::Result<Vec<u8>> {
-        pread_at(&self.fp, self.base_offset + phys, n)
-    }
-
     /// Hint the kernel to read ahead `len` bytes on every mirror copy of
     /// `logical`.
     pub fn prefetch_logical(&self, chunk_map: &ChunkMap, logical: u64, len: usize) {
@@ -195,12 +173,6 @@ impl FsReader {
 
             advise_willneed(&self.fp, off, len);
         }
-    }
-
-    /// Hint the kernel to drop the cached pages for a physical range.
-    pub fn evict_physical_range(&self, phys: u64, len: usize) {
-        let off = self.base_offset.saturating_add(phys);
-        advise_dontneed(&self.fp, off, len as u64);
     }
 
     pub fn strategy(&self) -> Option<&CsumStrategy> {

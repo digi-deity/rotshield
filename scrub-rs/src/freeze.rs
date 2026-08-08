@@ -190,13 +190,6 @@ pub(crate) fn clear_active_mount() {
     }
 }
 
-/// Build a controller from an optional mount-point string.
-pub fn controller_for(mountpoint: Option<&str>) -> FreezeController {
-    FreezeController::new(mountpoint.map(PathBuf::from))
-}
-
-pub type FreezeResult = io::Result<()>;
-
 /// FIFREEZE / FITHAW ioctl request codes (Linux). Not exposed by the
 /// libc crate, so derived from the standard _IOWR('X', n, int) expansion.
 const FIFREEZE: std::os::raw::c_ulong = 0xC004_5877;

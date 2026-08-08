@@ -110,12 +110,6 @@ pub fn gf_exp(e: i32) -> u8 {
     GFEXP[e as usize]
 }
 
-/// `g^(-e)`, i.e. the inverse of `gf_exp(e)`.
-pub fn gf_exp_inv(e: i32) -> u8 {
-    let e = e.rem_euclid(255);
-    GFINV[GFEXP[e as usize] as usize]
-}
-
 /// `x^-1 = x^254`; `gf_inv(0)` is undefined and returns 0.
 #[allow(dead_code)]
 pub fn gf_inv(x: u8) -> u8 {

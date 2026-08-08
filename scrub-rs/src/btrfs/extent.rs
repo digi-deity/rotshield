@@ -4,8 +4,6 @@ use super::util::le_u64;
 use crate::fs::Reconfirm;
 
 pub const TYPE_INLINE: u8 = 0;
-pub const TYPE_REGULAR: u8 = 1;
-pub const TYPE_PREALLOC: u8 = 2;
 
 /// On-disk EXTENT_DATA extent of one inode.
 #[derive(Debug, Clone, Copy)]
@@ -13,7 +11,7 @@ pub struct FileExtent {
     pub inode: u64,
 
     pub file_offset: u64,
-    /// TYPE_INLINE, TYPE_REGULAR, or TYPE_PREALLOC.
+    /// EXTENT_DATA type code (0 = inline, 1 = regular, 2 = prealloc).
     pub extent_type: u8,
 
     /// Logical address of the extent's data on disk.

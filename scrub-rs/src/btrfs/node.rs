@@ -88,12 +88,6 @@ pub struct Leaf {
 }
 
 impl Leaf {
-    // First byte after the item-slot array; the leaf's item data lives at or
-    // after this point.
-    pub fn data_start(&self) -> usize {
-        HEADER_SIZE + self.slots.len() * LEAF_ITEM_SIZE
-    }
-
     // slot.data_offset is relative to the end of the header, so the item
     // starts at HEADER_SIZE + data_offset.
     pub fn item_data(&self, i: usize) -> &[u8] {

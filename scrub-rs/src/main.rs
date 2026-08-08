@@ -43,31 +43,6 @@ fn main() -> ExitCode {
         return dump_array();
     }
 
-    if dev == "--resolve" {
-        let device = match args.next() {
-            Some(d) => d,
-            None => {
-                eprintln!("usage: scrub-rs --resolve <device> <logical>");
-                return ExitCode::from(EXIT_USAGE_ERROR);
-            }
-        };
-        let logical_str = match args.next() {
-            Some(l) => l,
-            None => {
-                eprintln!("usage: scrub-rs --resolve <device> <logical>");
-                return ExitCode::from(EXIT_USAGE_ERROR);
-            }
-        };
-        let logical = match u64::from_str_radix(literal_hex(&logical_str), 16) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("invalid logical {logical_str:?}: {e}");
-                return ExitCode::from(EXIT_USAGE_ERROR);
-            }
-        };
-        return resolve_cmd(&device, logical);
-    }
-
     run_scrub(dev, args)
 }
 
@@ -652,7 +627,6 @@ fn print_status_block(status: &scrub_rs::status::StatusCounters) {
 fn print_help() {
     println!("usage: scrub-rs <device-or-image> [options]");
     println!("       scrub-rs --dump-array");
-    println!("       scrub-rs --resolve <device> <logical>");
     println!();
     println!("options:");
     println!("  --offset <bytes>      byte offset of the btrfs partition in the backing file");
@@ -733,10 +707,6 @@ fn parse_offset(s: &str) -> Result<u64, String> {
     Ok(sign * bytes)
 }
 
-fn literal_hex(s: &str) -> &str {
-    s.strip_prefix("0x").unwrap_or(s)
-}
-
 fn dump_array() -> ExitCode {
     match array::config::load() {
         Ok(cfg) => {
@@ -759,51 +729,6 @@ fn dump_array() -> ExitCode {
         }
         Err(e) => {
             eprintln!("error loading array config: {e}");
-            ExitCode::from(EXIT_RUNTIME_ERROR)
-        }
-    }
-}
-
-// Diagnostic: map a btrfs logical address to a physical array location.
-fn resolve_cmd(device: &str, logical: u64) -> ExitCode {
-    let chunk_map = match btrfs::open(device, 0) {
-        Ok(ctx) => ctx.chunk_map,
-        Err(e) => {
-            eprintln!("error opening btrfs filesystem on {device}: {e}");
-            return ExitCode::from(EXIT_RUNTIME_ERROR);
-        }
-    };
-
-    let cfg = match array::config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error loading array config: {e}");
-            return ExitCode::from(EXIT_RUNTIME_ERROR);
-        }
-    };
-
-    let (devid, array_phys) = match chunk_map.lookup(logical) {
-        Some(loc) => loc,
-        None => {
-            eprintln!("error: no chunk mapping for logical 0x{logical:x}");
-            return ExitCode::from(EXIT_RUNTIME_ERROR);
-        }
-    };
-
-    match array::resolve::resolve(&cfg, devid, array_phys) {
-        Ok(loc) => {
-            println!(
-                "devid={} logical=0x{:x} array_phys=0x{:x} dev_path={} raw_phys=0x{:x}",
-                loc.devid,
-                logical,
-                loc.array_phys,
-                loc.dev_path.display(),
-                loc.raw_phys
-            );
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("error resolving logical 0x{logical:x}: {e}");
             ExitCode::from(EXIT_RUNTIME_ERROR)
         }
     }

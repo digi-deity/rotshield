@@ -21,8 +21,6 @@ pub fn has_magic_at(buf: &[u8], offset: usize) -> bool {
         && buf[offset..offset + BTRFS_MAGIC.len()] == BTRFS_MAGIC
 }
 
-pub const BTRFS_CSUM_SIZE: usize = 32;
-
 pub const BTRFS_SECTOR_SIZE: usize = 4096;
 
 /// The superblock fields needed to navigate the on-disk trees.

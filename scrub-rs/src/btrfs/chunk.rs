@@ -120,9 +120,6 @@ pub struct ChunkMap {
 struct MapEntry {
     begin: u64,
     end: u64,
-    stripe_len: u64,
-    /// True when the chunk has mirror copies (RAID1/DUP/RAID1C3/RAID1C4).
-    mirrored: bool,
 
     ty: u64,
     stripes: Vec<Stripe>,
@@ -139,12 +136,9 @@ impl ChunkMap {
     /// Add a chunk, keeping entries sorted by logical start for binary search.
     pub fn insert(&mut self, rec: &ChunkRecord) {
         let end = rec.logical + rec.chunk.length;
-        let mirrored = (rec.chunk.ty & bg_flag::MIRROR_MASK) != 0;
         self.entries.push(MapEntry {
             begin: rec.logical,
             end,
-            stripe_len: rec.chunk.stripe_len,
-            mirrored,
             ty: rec.chunk.ty,
             stripes: rec.chunk.stripes.clone(),
         });
@@ -248,25 +242,6 @@ impl ChunkMap {
             }
         }
         Ok(())
-    }
-
-    /// Print every entry (debugging aid).
-    pub fn dump(&self) {
-        for e in &self.entries {
-            let stripes: Vec<String> = e
-                .stripes
-                .iter()
-                .map(|s| format!("({}, 0x{:x})", s.devid, s.offset))
-                .collect();
-            println!(
-                "  logical 0x{:x}..0x{:x} stripe_len={} mirrored={} stripes=[{}]",
-                e.begin,
-                e.end,
-                e.stripe_len,
-                e.mirrored,
-                stripes.join(", ")
-            );
-        }
     }
 }
 

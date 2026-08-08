@@ -1,69 +1,14 @@
 //! Lazy CSUM_TREE walking: on-demand checksum ranges with bounded memory.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use super::chunk::ChunkMap;
 use super::csum_strategy::CsumStrategy;
 use super::key::{Key, key_type, objectid};
 use super::reader::FsReader;
-use super::tree::{walk_leaves, walk_leaves_range};
+use super::tree::walk_leaves_range;
 use crate::status::StatusCounters;
-
-/// Logical address → stored checksum bytes. Legacy eager map: the scrub
-/// now walks the CSUM_TREE lazily via LazyCsumProvider.
-pub type CsumMap = BTreeMap<u64, Vec<u8>>;
-
-/// Eagerly walk the entire CSUM_TREE into `map` (legacy; the scrub uses
-/// LazyCsumProvider). Returns the number of entries inserted.
-#[allow(clippy::too_many_arguments)]
-pub fn build_csum_map(
-    reader: &mut FsReader,
-    chunk_map: &ChunkMap,
-    csum_root: u64,
-    strategy: &CsumStrategy,
-    map: &mut CsumMap,
-    metadata_header_errors: &mut u64,
-    metadata_mirror_mismatches: &mut u64,
-    metadata_read_errors: &mut u64,
-) -> std::io::Result<usize> {
-    let hash_len = strategy.hash_len;
-    let sector_size = strategy.sector_size;
-    let mut count = 0usize;
-    walk_leaves(
-        reader,
-        chunk_map,
-        csum_root,
-        |_r, leaf, _logical| {
-            for i in 0..leaf.slots.len() {
-                let slot = leaf.slots[i];
-                if slot.key.ty != key_type::EXTENT_CSUM {
-                    continue;
-                }
-                let data = leaf.item_data(i);
-
-                // Packed csum array: one hash_len-byte entry per covered
-                // sector; a trailing partial entry is dropped.
-                let n = data.len() / hash_len;
-                for s in 0..n {
-                    let start = s * hash_len;
-                    let csum = data[start..start + hash_len].to_vec();
-                    let logical = slot.key.offset + (s as u64) * sector_size;
-                    map.insert(logical, csum);
-                    count += 1;
-                }
-            }
-            Ok(())
-        },
-        // Metadata-failure accounting: header failures, mirror mismatches,
-        // and read errors are counted; stale nodes (normal churn) are not.
-        |_logical| *metadata_header_errors += 1,
-        |_logical| {},
-        |_logical| *metadata_mirror_mismatches += 1,
-        |_logical| *metadata_read_errors += 1,
-    )?;
-    Ok(count)
-}
 
 /// On-demand CSUM_TREE walker: `range()` streams the checksums covering a
 /// logical span in bounded memory, and counts metadata failures it
