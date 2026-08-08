@@ -244,9 +244,11 @@
 
 
 <!--
-Install the bundle. It already contains the prebuilt binaries
-(scrub-rs, craft-corrupt) plus all plugin files, so there is NO
-binary download at install time (we build and ship it ourselves).
+Install the bundle. It already contains the prebuilt binary
+(scrub-rs) plus all plugin files, so there is NO binary download at
+install time (we build and ship it ourselves). craft-corrupt — the
+dangerous test-only corruption injector — is built by the CI test
+workflows only and is never part of the plugin bundle.
 
 The bundle filename is VERSIONED (rotshield-<version>-
 x86_64-1.txz) on purpose. unRAID's plugin manager does not re-download

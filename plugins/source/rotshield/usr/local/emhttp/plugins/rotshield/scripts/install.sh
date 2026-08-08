@@ -2,10 +2,11 @@
 # scripts/install.sh — run by the .plg install step.
 #
 # The bundle (installed just before this script runs via upgradepkg) has
-# already placed every file, including the prebuilt binaries at
-#   ${PLUGIN_DIR}/bin/scrub-rs  and  ${PLUGIN_DIR}/bin/craft-corrupt
+# already placed every file, including the prebuilt binary at
+#   ${PLUGIN_DIR}/bin/scrub-rs
 # so this script only fixes permissions, writes a default config and
-# applies the schedule. No binary download happens here.
+# applies the schedule. No binary download happens here. (craft-corrupt,
+# the test-only corruption injector, is never part of the bundle.)
 
 set -u
 PLUGIN="rotshield"
@@ -17,9 +18,9 @@ RC="/etc/rc.d/rc.${PLUGIN}"
 # used to prune stale bundles from the flash drive below.
 VERSION="${1:-}"
 
-# Make the shipped binaries and rc script executable / owned by root.
-chown root:root "${PLUGIN_DIR}/bin/scrub-rs" "${PLUGIN_DIR}/bin/craft-corrupt" 2>/dev/null
-chmod 755        "${PLUGIN_DIR}/bin/scrub-rs" "${PLUGIN_DIR}/bin/craft-corrupt" 2>/dev/null
+# Make the shipped binary and rc script executable / owned by root.
+chown root:root "${PLUGIN_DIR}/bin/scrub-rs" 2>/dev/null
+chmod 755        "${PLUGIN_DIR}/bin/scrub-rs" 2>/dev/null
 chown root:root "${RC}"
 chmod 755        "${RC}"
 

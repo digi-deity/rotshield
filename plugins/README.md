@@ -5,9 +5,11 @@
 > start at the repository root: [`../README.md`](../README.md).
 
 An unRAID plugin that ships the [`scrub-rs`](../scrub-rs) btrfs scrubber and
-`craft-corrupt` test tool, and exposes them through a **Settings page** where
-you can run a scrub on demand or on a schedule. The binaries are always
-bundled inside this plugin — there is no separate distribution.
+exposes it through a **Settings page** where you can run a scrub on demand
+or on a schedule. The binary is always bundled inside this plugin — there is
+no separate distribution. (`craft-corrupt`, the test-only corruption
+injector, is built from the same crate but only by the CI test workflows —
+it is **never** bundled with the plugin.)
 
 Unlike a typical daemon plugin, this is an **on-demand tool**: there is no
 long-running service. The Settings page (Utilities → Rotshield)
@@ -34,9 +36,8 @@ plugins/
 │       │   ├── install.sh              # .plg install step
 │       │   ├── uninstall.sh            # .plg remove step
 │       │   └── scrub.sh                # backend runner (run / status)
-│       └── bin/                        # shipped binaries (git-ignored; CI fills)
-│           ├── scrub-rs
-│           └── craft-corrupt
+│       └── bin/                        # shipped binary (git-ignored; CI fills)
+│           └── scrub-rs
 └── archive/                              # built .txz (git-ignored; produced by CI)
 ```
 
@@ -50,20 +51,26 @@ rather than downloaded at install time (the rathole-unraid reference downloads
 a prebuilt binary from upstream releases). The `.plg` install step therefore
 only runs `upgradepkg` + `scripts/install.sh`; there is no `curl` to GitHub.
 
+Only `scrub-rs` ships in the bundle. `craft-corrupt` is a dangerous test-only
+corruption injector — it is built exclusively by the CI test workflow
+(`scrub-rs-tests.yml`) for the test array, and `pkg_build.sh` explicitly
+excludes it from the archive so it can never end up on an unRAID box.
+
 ## Build locally
 
 ```sh
-# 1. Build the binaries (gnu target, matching unRAID's glibc runtime and the
-#    integration-test binaries — see build-plugin.yml)
+# 1. Build the scrub-rs binary (gnu target, matching unRAID's glibc runtime
+#    — see build-plugin.yml). craft-corrupt is deliberately NOT built or
+#    staged here: it is a dangerous test-only utility that must never ship
+#    with the plugin.
 cd scrub-rs
-cargo build --release
+cargo build --release --bin scrub-rs
 cd ..
 
-# 2. Stage them into the plugin tree
+# 2. Stage it into the plugin tree
 BIN=plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/bin
-cp scrub-rs/target/release/scrub-rs    "$BIN"/
-cp scrub-rs/target/release/craft-corrupt "$BIN"/
-chmod 755 "$BIN"/scrub-rs "$BIN"/craft-corrupt
+cp scrub-rs/target/release/scrub-rs "$BIN"/
+chmod 755 "$BIN"/scrub-rs
 
 # 3. Package the bundle
 cd plugins/source/rotshield
@@ -80,9 +87,9 @@ bash pkg_build.sh
   root + `btrfs-progs` + loop devices).
 - **Plugin packaging**: see
   [`../.github/workflows/build-plugin.yml`](../.github/workflows/build-plugin.yml).
-  It builds the gnu binaries, runs `cargo test` as a gate, packages the
-  bundle, uploads it as an artifact, and (on `v*` tags) publishes it to a
-  GitHub Release.
+  It builds the gnu `scrub-rs` binary, runs `cargo test` as a gate, packages
+  the bundle, uploads it as an artifact, and (on `v*` tags) publishes it to
+  a GitHub Release.
 
 ## Install on unRAID
 

@@ -1,8 +1,10 @@
 name: Build unRAID Plugin
 
-# Builds the scrub-rs + craft-corrupt binaries (gnu target, matching the
-# integration tests and unRAID's glibc runtime) and packages them into the
-# unRAID plugin .txz bundle. The Rust test suite lives in scrub-rs-tests.yml;
+# Builds the scrub-rs binary (gnu target, matching unRAID's glibc runtime)
+# and packages it into the unRAID plugin .txz bundle. craft-corrupt — the
+# dangerous test-only corruption injector — is deliberately NOT built or
+# shipped here: it exists only for the CI test array in scrub-rs-tests.yml.
+# The Rust test suite lives in scrub-rs-tests.yml;
 # this workflow is
 # intentionally independent so a packaging change can't be blocked by the
 # (slower) integration tests, but it runs the unit tests itself as a cheap
@@ -42,17 +44,24 @@ jobs:
       - name: Build scrub-rs (gnu)
         run: |
           cd scrub-rs
-          cargo build --release
-          ls -l target/release/scrub-rs \
-                 target/release/craft-corrupt
+          # Only scrub-rs is built for the plugin. craft-corrupt is a
+          # dangerous test-only utility and must never be built or shipped
+          # here — it is built only by scrub-rs-tests.yml for the test array.
+          cargo build --release --bin scrub-rs
+          ls -l target/release/scrub-rs
 
       - name: Stage binaries into plugin tree
         run: |
           BIN_DIR="plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/bin"
           mkdir -p "$BIN_DIR"
-          cp scrub-rs/target/release/scrub-rs    "$BIN_DIR/"
-          cp scrub-rs/target/release/craft-corrupt "$BIN_DIR/"
-          chmod 755 "$BIN_DIR/scrub-rs" "$BIN_DIR/craft-corrupt"
+          cp scrub-rs/target/release/scrub-rs "$BIN_DIR/"
+          chmod 755 "$BIN_DIR/scrub-rs"
+          # Guard: craft-corrupt must never be staged or bundled with the
+          # plugin, even if a stale copy ends up in the tree.
+          if [ -e "$BIN_DIR/craft-corrupt" ]; then
+            echo "::error::craft-corrupt found in the plugin bin dir — refusing to package"
+            exit 1
+          fi
           file "$BIN_DIR/scrub-rs"
 
       - name: Package bundle (.txz)

@@ -14,9 +14,11 @@
 # that the .plg references exactly the bundle we are about to build.
 #
 # Unlike rathole we do NOT download a binary at install time — the
-# scrub-rs / craft-corrupt binaries are copied into
+# scrub-rs binary is copied into
 #   usr/local/emhttp/plugins/rotshield/bin/
-# by CI (build-plugin.yml) before this script runs, so they are bundled.
+# by CI (build-plugin.yml) before this script runs, so it is bundled.
+# craft-corrupt (the test-only corruption injector) is NEVER bundled: the
+# find below excludes it from the archive no matter what sits in the tree.
 
 DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 PLUGIN_DIR="$(dirname "$(dirname "${DIR}")")"          # .../plugin
@@ -49,12 +51,15 @@ grep -q "&bundlefile;" "${PLG}" || {
 mkdir -p "$tmpdir" "$archive"
 
 cd "$DIR" || { echo "FATAL: cannot cd to $DIR"; exit 1; }
-# Copy every file except the build script and the .gitkeep placeholders.
+# Copy every file except the build script, the .gitkeep placeholders, and
+# craft-corrupt. craft-corrupt is a dangerous test-only corruption injector
+# that must never ship inside the plugin bundle — it is excluded explicitly
+# here as a safety net even if a stale binary is lying around in the tree.
 # The find output is intentionally unquoted so each relative path is passed
 # as a separate argument to cp (word-splitting is what we want here); the
 # tree is ours and contains no whitespace/special-char names.
 # shellcheck disable=SC2046
-cp --parents -f $(find . -type f ! \( -iname "pkg_build.sh" -o -iname ".gitkeep" \) ) "$tmpdir/"
+cp --parents -f $(find . -type f ! \( -iname "pkg_build.sh" -o -iname ".gitkeep" -o -iname "craft-corrupt" \) ) "$tmpdir/"
 cd "$tmpdir" || { echo "FATAL: cannot cd to $tmpdir"; exit 1; }
 # Normalise line endings and make scripts executable.
 find . -type f \( -iname '*.sh' -o -iname '*.page' -o -iname '*.plg' -o -iname 'rc.*' \) -exec sed -i 's/\r//g' {} +

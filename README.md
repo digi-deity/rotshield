@@ -128,7 +128,7 @@ ECC memory, good cables, and verifying transfers from other machines.
 
 | Path | What it is |
 |------|-----------|
-| `scrub-rs/` | The Rust crate: `scrub-rs` (btrfs scrub + parity recovery CLI) and `craft-corrupt` (test-only corruption injector). See [`scrub-rs/README.md`](scrub-rs/README.md). |
+| `scrub-rs/` | The Rust crate: `scrub-rs` (btrfs scrub + parity recovery CLI) and `craft-corrupt` (test-only corruption injector — built by the CI test workflows only, never shipped with the plugin). See [`scrub-rs/README.md`](scrub-rs/README.md). |
 | `plugins/` | The Rotshield unRAID plugin: CA wrapper (`plugins/rotshield.xml`), manifest (`plugins/rotshield.plg`), build tree (`plugins/source/`), and docs. See [`plugins/README.md`](plugins/README.md). |
 | `ca_profile.xml` / `plugins/rotshield.xml` | Community Applications repository profile + plugin wrapper — what Apps shows in the store. |
 | `rotshield.svg` / `LICENSE` | Repository icon referenced by the CA files; Apache-2.0 license. |
@@ -150,7 +150,7 @@ the `.plg` / `.txz` bundle, install steps, and configuration keys.
 `mk_array.sh` for a local scratch array:
 
 ```sh
-# Build the binaries
+# Build the binaries (craft-corrupt is test-only; the plugin ships scrub-rs)
 cd scrub-rs && cargo build --release
 # → target/release/scrub-rs, target/release/craft-corrupt
 
@@ -219,6 +219,8 @@ Community Apps submit flow (`/submit` in the unRAID webGUI).
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE). `scrub-rs` and
-`craft-corrupt` are built from this repository's own source — no third-party
-binaries are bundled with the plugin.
+Licensed under the [Apache License 2.0](LICENSE). `scrub-rs` is built from
+this repository's own source — no third-party binaries are bundled with the
+plugin. `craft-corrupt` (the test-only corruption injector) is likewise
+built from source, exclusively by the CI test workflows; it is never bundled
+with the plugin.

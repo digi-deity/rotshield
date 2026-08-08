@@ -45,6 +45,8 @@ Unit tests live inline in the source files (`#[cfg(test)]` modules under
 ```sh
 cargo build --release
 # binaries: target/release/scrub-rs, target/release/craft-corrupt
+# (craft-corrupt is a test-only corruption injector: it is built for the
+#  CI test workflows but is never shipped with the unRAID plugin)
 ```
 
 ## Test
