@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.07f">
-<!ENTITY bundleversion "2026.08.07f">
+<!ENTITY version       "2026.08.08">
+<!ENTITY bundleversion "2026.08.08">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -15,6 +15,17 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.08
+- The plugin bundle no longer ships `craft-corrupt`. It is a test-only
+  corruption injector (it deliberately corrupts array data) that was
+  bundled for the CI test array's benefit — it is now built only by the
+  CI test workflows and never packaged into the plugin, so it can never
+  be run on a live system by mistake. The bundle now contains just the
+  `scrub-rs` binary.
+- Removed the `scrub-rs --resolve` diagnostic subcommand (a
+  logical-address → physical-location debugging aid); the Extra options
+  help text no longer suggests it.
 
 ###2026.08.07f
 - The progress table now follows the target-disk selection live: ticking
