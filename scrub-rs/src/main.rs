@@ -68,24 +68,27 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
 
     let mut freeze_max: f64 = 60.0;
 
-    let mut status_port: u16 = 0;
+    let mut status_sock: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--status-port" => {
+            "--status-sock" => {
                 let v = match args.next() {
                     Some(s) => s,
                     None => {
-                        eprintln!("error: --status-port requires a value");
+                        eprintln!("error: --status-sock requires a value");
                         return ExitCode::from(EXIT_USAGE_ERROR);
                     }
                 };
-                match v.parse::<u16>() {
-                    Ok(p) => status_port = p,
-                    Err(_) => {
-                        eprintln!("error: --status-port must be a port number (0-65535)");
-                        return ExitCode::from(EXIT_USAGE_ERROR);
-                    }
+                // sun_path is 108 bytes on Linux; reject anything close to
+                // it up front so the bind error is never the surprise.
+                if v.is_empty() || v.len() >= 100 {
+                    eprintln!(
+                        "error: --status-sock must be a non-empty path under 100 bytes \
+                         (Unix socket path length limit)"
+                    );
+                    return ExitCode::from(EXIT_USAGE_ERROR);
                 }
+                status_sock = Some(v);
             }
             "--offset" => {
                 let v = match args.next() {
@@ -173,7 +176,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
                     "usage: scrub-rs <device-or-image> [--offset <bytes>] \
                      [--repair] [--freeze-mount <path>] [--no-freeze] \
                      [--batch-max <n>] [--batch-idle <s>] [--freeze-max <s>] \
-                     [--status-port <n>]"
+                     [--status-sock <path>]"
                 );
                 return ExitCode::from(EXIT_USAGE_ERROR);
             }
@@ -194,15 +197,13 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     let status = Arc::new(scrub_rs::status::StatusCounters::new());
 
     status.set_device(&dev);
-    if status_port != 0 {
+    if let Some(sock) = &status_sock {
         status.set_state("starting");
 
-        match scrub_rs::status::StatusServer::spawn(status_port, status.clone()) {
-            Ok(_) => println!(
-                "status         : serving live counters on 127.0.0.1:{status_port} (GET /status)"
-            ),
+        match scrub_rs::status::StatusServer::spawn(sock, status.clone()) {
+            Ok(_) => println!("status         : serving live counters on {sock} (GET /status)"),
             Err(e) => eprintln!(
-                "note: could not start status server on 127.0.0.1:{status_port} ({e}); continuing without it"
+                "note: could not start status server on {sock} ({e}); continuing without it"
             ),
         }
     }
@@ -629,7 +630,7 @@ fn print_help() {
     );
     println!("                        batch thaws and defers the remainder to the next batch");
     println!("                        (default 60.0; guards a slow/dying disk in the gather)");
-    println!("  --status-port <n>     serve live counters on 127.0.0.1:<n> (0 = off)");
+    println!("  --status-sock <path>  serve live counters on a Unix socket at <path>");
     println!("  --help, -h            show this help and the recovery-counter glossary");
     println!();
     println!("recovery summary counters (always assessed when an array is present):");
@@ -671,7 +672,7 @@ fn print_help() {
     println!("    still count as read errors, so exit 0 is already refused.");
     println!();
     println!("At the end of every run scrub-rs prints `status:` followed by the same");
-    println!("key=value payload the --status-port server serves (state, device, all");
+    println!("key=value payload the --status-sock server serves (state, device, all");
     println!("counters, progress), so the exact final numbers are always available from");
     println!("the run output — no flag needed.");
 }

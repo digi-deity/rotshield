@@ -1,7 +1,11 @@
-//! Opt-in HTTP status server: serves live scrub counters over localhost so
-//! the unRAID plugin can show progress without polling process logs.
+//! Opt-in HTTP-over-Unix-socket status server: serves live scrub counters
+//! over a root-only filesystem socket so the unRAID plugin can show progress
+//! without polling process logs or consuming a TCP port.
+use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -141,25 +145,68 @@ impl StatusCounters {
     }
 }
 
-/// Minimal HTTP server on 127.0.0.1 serving GET /status as text/plain.
+/// Minimal HTTP-over-Unix-socket server: answers GET /status with the counter
+/// snapshot and everything else with 404, to whoever can connect to the
+/// socket (pinned to mode 0600, so root only — the page's status.php runs as
+/// root via emhttp).
 pub struct StatusServer {
-    listener: TcpListener,
+    listener: UnixListener,
     counters: Arc<StatusCounters>,
 }
 
 impl StatusServer {
-    /// Bind to an ephemeral localhost port (used by tests) or a fixed one.
-    pub fn bind(port: u16, counters: Arc<StatusCounters>) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", port))?;
+    /// Bind a Unix socket at `path`, creating parent directories as needed.
+    ///
+    /// Recovery policy for an already-existing path (EADDRINUSE):
+    ///   - a regular file / directory / symlink is NOT ours to delete — the
+    ///     bind fails and the caller decides;
+    ///   - a socket file with no server behind it (crashed/killed run) is
+    ///     unlinked and rebound;
+    ///   - a socket a live server is actually answering on (probe connect
+    ///     succeeds — a second scrub-rs instance) is left alone and the
+    ///     bind fails.  The probe runs before every unlink, so a stale
+    ///     file is the only thing ever removed.
+    pub fn bind(path: impl AsRef<Path>, counters: Arc<StatusCounters>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let listener = match UnixListener::bind(path) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // Never unlink a non-socket: the path may be a file or
+                // directory some other tool left there.
+                let meta = fs::symlink_metadata(path)?;
+                if !meta.file_type().is_socket() {
+                    return Err(e);
+                }
+                // A successful probe connect means another instance is
+                // serving on this path right now — do not clobber it.
+                if UnixStream::connect(path).is_ok() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!("status socket {path:?} is in use by a live server"),
+                    ));
+                }
+                fs::remove_file(path)?;
+                UnixListener::bind(path)?
+            }
+            Err(e) => return Err(e),
+        };
+        // Root-only: the socket file is visible on the filesystem to every
+        // local user, so pin its mode to 0600.
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
         Ok(Self { listener, counters })
     }
 
     /// Start the server on a background thread named scrub-status.
     pub fn spawn(
-        port: u16,
+        path: impl AsRef<Path>,
         counters: Arc<StatusCounters>,
     ) -> std::io::Result<thread::JoinHandle<()>> {
-        let server = Self::bind(port, counters)?;
+        let server = Self::bind(path, counters)?;
         thread::Builder::new()
             .name("scrub-status".into())
             .spawn(move || server.serve())
@@ -195,6 +242,19 @@ impl StatusServer {
 mod tests {
     use super::*;
 
+
+    /// Unique per-test socket path under the temp dir (parallel-safe).
+    fn test_sock_path() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "scrub-status-{}-{nanos}.sock",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn serves_status_payload_and_404s() {
         let counters = Arc::new(StatusCounters::new());
@@ -210,11 +270,11 @@ mod tests {
         counters.progress_total.store(1073741824, Ordering::Relaxed);
         counters.progress_done.store(268435456, Ordering::Relaxed);
 
-        let server = StatusServer::bind(0, counters.clone()).unwrap();
-        let port = server.listener.local_addr().unwrap().port();
+        let path = test_sock_path();
+        let server = StatusServer::bind(&path, counters.clone()).unwrap();
         let handle = thread::spawn(move || server.serve());
 
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut stream = UnixStream::connect(&path).expect("connect");
         stream
             .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("write");
@@ -247,7 +307,7 @@ mod tests {
             assert!(resp.contains(expected), "missing {expected:?} in: {resp:?}");
         }
 
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut stream = UnixStream::connect(&path).expect("connect");
         stream
             .write_all(b"GET /nope HTTP/1.1\r\n\r\n")
             .expect("write");
@@ -256,5 +316,71 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 404"), "got: {resp:?}");
 
         drop(handle);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rebinds_over_stale_socket() {
+        // A crashed run leaves its socket file behind; bind() must unlink it
+        // and rebind instead of failing with EADDRINUSE.
+        let counters = Arc::new(StatusCounters::new());
+        let path = test_sock_path();
+        {
+            // Dropping the listener leaves the socket FILE in place with no
+            // server behind it — exactly the stale state a crash produces.
+            let server = StatusServer::bind(&path, counters.clone()).unwrap();
+            drop(server);
+        }
+        assert!(path.exists(), "socket file should linger after drop");
+        let server = StatusServer::bind(&path, counters.clone()).unwrap();
+        drop(server);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refuses_to_unlink_a_non_socket_file() {
+        // A regular file squatting on the socket path is not ours to
+        // delete: bind must fail and the file must survive untouched.
+        let counters = Arc::new(StatusCounters::new());
+        let path = test_sock_path();
+        fs::write(&path, b"someone else's data").unwrap();
+
+        let err = match StatusServer::bind(&path, counters.clone()) {
+            Ok(_) => panic!("bind must fail over a non-socket file"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(fs::read(&path).unwrap(), b"someone else's data");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn refuses_to_clobber_a_live_socket() {
+        // A second instance binding the same path must fail without
+        // unlinking the first instance's live socket.
+        let counters = Arc::new(StatusCounters::new());
+        let path = test_sock_path();
+
+        let server_a = StatusServer::bind(&path, counters.clone()).unwrap();
+        let handle_a = thread::spawn(move || server_a.serve());
+
+        let err = match StatusServer::bind(&path, counters.clone()) {
+            Ok(_) => panic!("second bind must fail while the first is live"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+
+        // The original server still answers and the file is still there.
+        let mut stream = UnixStream::connect(&path).expect("connect");
+        stream
+            .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write");
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).expect("read");
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp:?}");
+        assert!(path.exists(), "live socket must not be unlinked");
+
+        drop(handle_a);
+        let _ = fs::remove_file(&path);
     }
 }

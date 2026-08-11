@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.08a">
-<!ENTITY bundleversion "2026.08.08a">
+<!ENTITY version       "2026.08.11">
+<!ENTITY bundleversion "2026.08.11">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -15,6 +15,21 @@
 
 <CHANGES>
 ##&name;
+
+###2026.08.11
+- The live status endpoint no longer consumes a TCP port: scrub-rs now
+  serves the live counters over a root-only Unix socket
+  (`/var/run/rotshield/status.sock`, mode 0600) instead of a localhost HTTP
+  port. The Status port field is gone from the Settings page — nothing to
+  configure, nothing to collide on. Advanced users can still move the
+  socket with `--status-sock <path>` via Extra options; scrub.sh resolves
+  the same override for its own status polling, so the live panel keeps
+  working.
+- Socket recovery sanity checks: a path occupied by a regular file or
+  directory is left untouched (bind fails loudly), and a socket a live
+  server is answering on is never unlinked (probe before reclaim) — only a
+  genuinely stale socket file from a crashed/killed run is unlinked and
+  rebound.
 
 ###2026.08.08
 - The Settings page only exposes options users actually need: removed the

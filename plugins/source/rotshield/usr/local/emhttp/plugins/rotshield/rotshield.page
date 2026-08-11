@@ -93,7 +93,7 @@ if (!is_file($config_file)) {
     file_put_contents($config_file,
         "DEVICES=''\n" .
         "DEVICE=''\n" .
-        "SCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nSTATUS_PORT=9101\nEXTRA_OPTIONS=\n");
+        "SCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nEXTRA_OPTIONS=\n");
 }
 $config = parse_ini_file($config_file);
 
@@ -131,12 +131,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $recover  = isset($_POST['recover'])  ? 1 : 0;
     $write    = isset($_POST['write'])    ? 1 : 0;
     $extra    = escapeshellarg(trim($_POST['extra_options'] ?? ''));
-    // Live status port: 0 disables the localhost status endpoint, 1-65535
-    // enables it on 127.0.0.1. Validated to a plain integer so it can never
-    // inject anything into the config / command line.
-    $status_port = trim($_POST['status_port'] ?? '9101');
-    $status_port = (ctype_digit($status_port) && (int)$status_port <= 65535)
-        ? (int)$status_port : 9101;
+    // Live status needs no settings: it is always on, served over a
+    // root-only Unix socket (no port to configure or collide on).
     // Single-quote every string value so the file is valid BOTH as PHP INI
     // (parse_ini_file strips the quotes) AND as a bash `source`d file. An
     // unquoted space-separated value — DEVICES with multiple disks, or a
@@ -149,7 +145,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         "CRON='$cron'\n" .
         "RECOVER=$recover\n" .
         "WRITE=$write\n" .
-        "STATUS_PORT=$status_port\n" .
         "EXTRA_OPTIONS=$extra\n");
     exec("/etc/rc.d/rc.$plugin restart 2>&1");
     if (isset($_POST['run'])) {
@@ -352,9 +347,6 @@ pre { max-width: 100%; overflow-x: auto; }
 </td></tr>
     <tr><td>Repair disk</td>
         <td><label><input type="checkbox" name="write" value="1" <?=($config['WRITE'] ?? 0) ? 'checked' : ''?>> write reconstructed blocks back (--repair; default is dry-run assessment only)</label>
-</td></tr>
-    <tr><td>Status port <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Localhost HTTP port for the live status endpoint (0 disables; default 9101).</span></span></td>
-        <td><input type="text" name="status_port" size="10" value="<?=htmlspecialchars($config['STATUS_PORT'] ?? '9101')?>" placeholder="9101">
 </td></tr>
     <tr><td>Extra options <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Advanced: extra arguments appended to the scrub-rs command line.</span></span></td>
         <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>">

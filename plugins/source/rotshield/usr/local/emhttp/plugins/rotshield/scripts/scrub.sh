@@ -63,10 +63,13 @@ errored=0
 # opts in to writing reconstructed blocks back. Dry-run is the safe default,
 # so we pass --repair ONLY when WRITE is explicitly enabled.
 #
-# The live status server is ON by default (port STATUS_PORT, default 9101) so
-# the Settings page can poll the running scrub's error counters via
-# `scrub.sh status`. STATUS_PORT=0 disables it. scrub-rs itself skips a busy
-# port (logged, never fatal), so two runs can never collide on it.
+# The live status server is ON by default: scrub-rs serves the live error
+# counters over a root-only Unix socket (default
+# /var/run/rotshield/status.sock, mode 0600) so the Settings page can poll
+# the running scrub's error counters via `scrub.sh status`. No TCP port is
+# consumed and there is no config knob; a stale socket file left by a
+# crashed run is unlinked and rebound by scrub-rs, and the path can be
+# overridden with `--status-sock` via EXTRA_OPTIONS.
 #
 # Freeze and batch tuning are intentionally NOT config keys: their safe
 # defaults are baked into scrub-rs (freeze on for live repairs, batch max
@@ -75,9 +78,10 @@ errored=0
 build_args() {
   local args=""
   [ "${WRITE:-0}" = "1" ] && args="${args} --repair"
-  # 0 = disabled; anything else (incl. empty -> default) enables the server.
-  local port="${STATUS_PORT:-9101}"
-  [ "${port}" != "0" ] && args="${args} --status-port ${port}"
+  # Live status: always on via a root-only Unix socket — no port consumed,
+  # nothing to collide on. Path is the default unless EXTRA_OPTIONS
+  # overrides it (see status_sock()).
+  args="${args} --status-sock $(status_sock)"
   [ -n "${EXTRA_OPTIONS:-}" ] && args="${args} ${EXTRA_OPTIONS}"
   echo "${args}"
 }
@@ -823,14 +827,34 @@ kill_tree() {
   kill -"${sig}" "${pid}" 2>/dev/null
 }
 
-# Print the live status payload from the running scrub's status server
-# (key=value lines; empty if the server isn't up or curl is missing).  Backs
-# the Settings page's live-status panel.
+# Effective live-status socket path.  Always on: the default
+# /var/run/rotshield/status.sock (created by scrub-rs itself), unless
+# EXTRA_OPTIONS overrides it with `--status-sock <path>` — last one wins,
+# matching scrub-rs's own arg parsing.  build_args() and status() both
+# resolve through here, so the page always curls the socket the server
+# actually bound (an override that only half-applied would silently kill
+# the live panel).
+status_sock() {
+  local sock="/var/run/rotshield/status.sock"
+  # shellcheck disable=SC2086
+  set -- ${EXTRA_OPTIONS:-}
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--status-sock" ] && [ $# -gt 1 ]; then
+      sock="$2"
+      shift 2
+    else
+      shift
+    fi
+  done
+  echo "${sock}"
+}
+
+# Print the live status payload from the running scrub's Unix-socket status
+# server (key=value lines; empty if the server isn't up or curl is missing).
+# Backs the Settings page's live-status panel.
 status() {
-  local port="${STATUS_PORT:-9101}"
-  [ "${port}" = "0" ] && return 0
   command -v curl >/dev/null 2>&1 || return 0
-  curl -s --max-time 2 "http://127.0.0.1:${port}/status" 2>/dev/null
+  curl -s --max-time 2 --unix-socket "$(status_sock)" "http://localhost/status" 2>/dev/null
 }
 
 case "${1:-running}" in

@@ -136,7 +136,6 @@ The partition offset (`--offset`) is **auto-applied per device** from
 superblock lives at that offset on the raw device (not at 0, as it would on the
 array partition `/dev/nmdNp1`). There is nothing for the user to set — and no
 fallback, because without a valid offset recovery is impossible anyway.
-| `STATUS_PORT` | localhost HTTP port for the live status endpoint (`0` disables; default `9101`) | `--status-port` |
 | `EXTRA_OPTIONS` | appended verbatim (advanced) | — |
 | `SCHEDULE` | `disabled` / `weekly` / `monthly` / `custom` | (cron) |
 | `CRON` | 5-field cron time spec (`min hour day month weekday`), used only when `SCHEDULE=custom` (e.g. `0 4 1 * *` = 04:00 on the 1st). `daily` is intentionally not offered — a scrub can take days and would overlap its own previous run. | (cron) |
@@ -145,21 +144,25 @@ The freeze and batch settings are not config keys: their safe defaults
 (freeze on for live repairs, batch max 64, batch idle 5 s) are baked into
 scrub-rs and cannot be hand-set in `config.cfg`. The only way to override
 them is to pass the flags (`--no-freeze`, `--batch-max`, `--batch-idle`)
-via `EXTRA_OPTIONS`.
+via `EXTRA_OPTIONS`. The same applies to the live-status socket path:
+`--status-sock <path>` in `EXTRA_OPTIONS` moves it (scrub.sh resolves the
+override for its own polling, so the page keeps working).
 
 ### Live status + per-disk progress table
 
 While a scrub runs, scrub-rs serves the live error counters over a
-localhost-only HTTP endpoint so the Settings page shows real-time numbers
-instead of just "running / idle". It is on by default (port `9101`)
-and binds to `127.0.0.1` only — never the network. `scrub.sh status` prints
-the payload, and the Settings page polls it every 5 s. The page renders the
+root-only Unix socket (`/var/run/rotshield/status.sock`, mode 0600) so the
+Settings page shows real-time numbers instead of just "running / idle". No
+TCP port is consumed: there is nothing to configure and nothing to collide
+on. The socket is recreated per run, a stale file left by a crashed run is
+unlinked and rebound automatically, and `scrub.sh status` prints the
+payload (the Settings page polls it every 5 s). The page renders the
 counters as a **progress table** (rows = statistics grouped by hierarchy,
 columns = disks): the disk currently being scrubbed gets live values, and
 each finished disk keeps its exact final counters.
 
 ```
-$ curl -s http://127.0.0.1:9101/status
+$ curl -s --unix-socket /var/run/rotshield/status.sock http://localhost/status
 state=running
 device=/dev/nmd1p1
 sectors_checked=123456

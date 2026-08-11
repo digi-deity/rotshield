@@ -10,8 +10,9 @@
  *     shows the real end-of-run numbers even though the live status server
  *     died with the process.  The log is streamed live by scrub.sh, so
  *     completed devices appear while later devices are still scrubbing.
- *   - a LIVE block (only while the running scrub's localhost status server
- *     answers): `scrub.sh status` curls 127.0.0.1:<port> for the in-flight
+ *   - a LIVE block (only while the running scrub's status server answers):
+ *     `scrub.sh status` curls the run's root-only Unix socket
+ *     (/var/run/rotshield/status.sock, via --unix-socket) for the in-flight
  *     counters of the device being scrubbed right now.
  *   - a META block, always last: running=0|1, run_log=<file>,
  *     run_outcome=<finished: label>, active_device=<device>.
@@ -87,7 +88,8 @@ if ($run_log !== "" && is_file($run_log)) {
             // scrub-rs prints its own "scrubbing (recovery assessment +
             // dry-run):" banner into the same log, and matching that would
             // hand the page a bogus active device ("(recovery") whenever the
-            // live status server is unavailable (STATUS_PORT=0).
+            // live status server is unavailable (socket missing, e.g. the
+            // server failed to start).
             if (preg_match('/scrubbing\s+(\/\S+)/', $line, $m)) {
                 $active = $m[1];
             }

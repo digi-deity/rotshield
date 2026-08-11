@@ -89,7 +89,7 @@ live simulation) is defined at the repo root in
 ## Run output contract
 
 Every run ends by printing a `status:` marker followed by the same
-`key=value` payload the `--status-port` live server serves (`state`,
+`key=value` payload the `--status-sock` live server serves (`state`,
 `device`, all counters, `recovery`, `progress_*`). It is emitted
 unconditionally — no flag needed — so scripts (e.g. the unRAID plugin's
 `status.php`) can read a device's exact final counters from the run log
