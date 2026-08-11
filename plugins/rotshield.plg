@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.08.11">
-<!ENTITY bundleversion "2026.08.11">
+<!ENTITY version       "2026.08.11a">
+<!ENTITY bundleversion "2026.08.11a">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">

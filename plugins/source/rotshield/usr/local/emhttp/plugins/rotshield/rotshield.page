@@ -355,7 +355,7 @@ pre { max-width: 100%; overflow-x: auto; }
           </div>
 </td></tr>
     <tr><td>Repair disk <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Ticking this writes the reconstructed blocks back to the disk (--repair). Leave it off (the default) to run dry: every block is still read and checked, and the correct data is rebuilt from parity, but nothing is written to the disk.</span></span></td>
-        <td><label><input type="checkbox" name="write" value="1" <?=($config['WRITE'] ?? 0) ? 'checked' : ''?>> write reconstructed blocks back (--repair; default is dry-run assessment only)</label>
+        <td><label><input type="checkbox" name="write" value="1" <?=($config['WRITE'] ?? 0) ? 'checked' : ''?>></label>
 </td></tr>
     <tr><td>Extra options <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Advanced: extra arguments appended to the scrub-rs command line.</span></span></td>
         <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>">
