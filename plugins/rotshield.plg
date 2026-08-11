@@ -22,7 +22,7 @@
   (`/var/run/rotshield/status.sock`, mode 0600) instead of a localhost HTTP
   port. The Status port field is gone from the Settings page — nothing to
   configure, nothing to collide on. Advanced users can still move the
-  socket with `--status-sock <path>` via Extra options; scrub.sh resolves
+  socket with `--status-sock &lt;path&gt;` via Extra options; scrub.sh resolves
   the same override for its own status polling, so the live panel keeps
   working.
 - Socket recovery sanity checks: a path occupied by a regular file or
@@ -30,16 +30,21 @@
   server is answering on is never unlinked (probe before reclaim) — only a
   genuinely stale socket file from a crashed/killed run is unlinked and
   rebound.
-
-###2026.08.08
 - The Settings page only exposes options users actually need: removed the
   Disable freeze checkbox and the Batch max / Batch idle fields. The
   freeze/batch keys are gone from config.cfg entirely — their safe
   defaults (freeze on, batch max 64, batch idle 5 s) are baked into
-  scrub-rs and overridable only via Extra options. The Status port field
-  stays (port conflicts are possible on real systems). Tooltips were cut
-  down to bare one-liners on genuinely non-obvious rows; obvious rows,
-  group headers and the table footnote are gone.
+  scrub-rs and overridable only via Extra options. Tooltips were cut down
+  to a short plain-language explanation on the genuinely non-obvious
+  rows; obvious rows, group headers and the table footnote are gone.
+- Help text got a human pass: the Repair disk tooltip is back (the
+  dry-run vs. write-back distinction deserves an explanation before
+  someone toggles it), the remaining table tooltips now spell out what a
+  non-zero value means and whether action is needed (the I/O error rows
+  recommend checking SMART and replacing a failing disk so the array can
+  rebuild it from parity), and all user-visible strings are em-dash-free.
+
+###2026.08.08
 - The plugin bundle no longer ships `craft-corrupt`. It is a test-only
   corruption injector (it deliberately corrupts array data) that was
   bundled for the CI test array's benefit — it is now built only by the

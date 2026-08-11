@@ -345,7 +345,7 @@ pre { max-width: 100%; overflow-x: auto; }
             <?php endforeach; ?>
           </div>
 </td></tr>
-    <tr><td>Repair disk</td>
+    <tr><td>Repair disk <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Ticking this writes the reconstructed blocks back to the disk (--repair). Leave it off (the default) to run dry: every block is still read and checked, and the correct data is rebuilt from parity, but nothing is written to the disk.</span></span></td>
         <td><label><input type="checkbox" name="write" value="1" <?=($config['WRITE'] ?? 0) ? 'checked' : ''?>> write reconstructed blocks back (--repair; default is dry-run assessment only)</label>
 </td></tr>
     <tr><td>Extra options <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Advanced: extra arguments appended to the scrub-rs command line.</span></span></td>
@@ -456,9 +456,10 @@ pre { max-width: 100%; overflow-x: auto; }
 
   // Row hierarchy: group rows order the statistics so related counters
   // sit together.  Only genuinely non-obvious diagnostic rows carry a
-  // question-mark help popup (same pattern as the settings form), with a
-  // bare one-line explanation; obvious rows (progress, volume, recovery
-  // outcome) and group headers are plain.
+  // question-mark help popup (same pattern as the settings form) with a
+  // short plain-language explanation of what the number means and whether
+  // action is needed; obvious rows (progress, volume, recovery outcome)
+  // and group headers are plain.
   //
   // Visibility: always-visible rows are the healthy-scrub signals where a
   // visible 0 is meaningful (Progress, Scrub volume, Sectors mismatch,
@@ -480,23 +481,23 @@ pre { max-width: 100%; overflow-x: auto; }
     { name: 'Issues found',
       rows: [
         ['Sectors mismatch', 'sectors_mismatch'],
-        ['Sectors stale', 'sectors_stale', "Initially mismatched, then rewritten or deleted by the live filesystem. Not corruption.", 'cond'],
-        ['CSUM-tree branches stale', 'stale_csum_branches', "Checksum-map bookkeeping moved while the scan ran on a live filesystem. Not corruption.", 'cond'],
-        ['Sectors no csum', 'sectors_no_csum', "Blocks stored without a checksum, so they cannot be verified.", 'cond'],
-        ['Sectors read error', 'sectors_read_error', "The disk returned an I/O error. Hardware problem."]
+        ['Sectors stale', 'sectors_stale', "These blocks looked wrong at first, but turned out fine: the filesystem legitimately rewrote or deleted them while the scan was running. This is normal activity on a busy disk, not corruption. No action needed.", 'cond'],
+        ['CSUM-tree branches stale', 'stale_csum_branches', "Parts of the filesystem's checksum bookkeeping were freed and reused while the scan ran, because files were written, rewritten or deleted. Expected on a live filesystem, not corruption. Those areas were simply not re-verified this run; rerun during a quiet period for full coverage.", 'cond'],
+        ['Sectors no csum', 'sectors_no_csum', "These blocks are stored without a checksum, so there is nothing to compare against. Nothing is wrong with them, they just cannot be verified. Harmless and expected; no action needed.", 'cond'],
+        ['Sectors read error', 'sectors_read_error', "The disk could not read this data back (an I/O error). This is a hardware problem, not corrupted data: the drive is struggling or failing. Check its SMART health, and if it is failing, replace the disk and let the array rebuild (resilver) it from parity. The scan skips these blocks and keeps checking the rest of the disk."]
       ] },
     { name: 'Metadata',
       cond: true,
       rows: [
-        ['Metadata header errors', 'metadata_header_errors', "Metadata map damaged beyond its duplicate copy. Not rebuildable from parity; needs offline btrfs check --repair."],
-        ['Metadata mirror mismatches', 'metadata_mirror_mismatches', "The two metadata copies disagree, but a good copy exists. No action needed."],
-        ['Metadata read errors', 'metadata_read_errors', "Disk I/O error while reading metadata. Hardware problem."]
+        ['Metadata header errors', 'metadata_header_errors', "The filesystem's metadata map (the bookkeeping that records which files exist and where their data is stored) is damaged: the disk returns the bytes, but no copy passes the integrity check. This is corruption of the map itself (e.g. bit rot), not a hardware read problem, and it cannot be rebuilt from parity. The scan skips the affected areas but continues with the rest of the disk. Action: unmount the disk and repair the filesystem offline with btrfs check --repair."],
+        ['Metadata mirror mismatches', 'metadata_mirror_mismatches', "btrfs keeps two copies of the metadata map. They disagree, but at least one copy is intact, so btrfs reads the good one and refreshes the bad one itself. Harmless, no action needed. A normal btrfs scrub reports this the same way."],
+        ['Metadata read errors', 'metadata_read_errors', "The disk refused to return the metadata map bytes at all (an I/O error, the kind a failing drive produces). Hardware problem, not corruption. The scan skips those areas but keeps scrubbing the rest. Check the drive's SMART health, and if it is failing, replace the disk and let the array rebuild it from parity."]
       ] },
     { name: 'Recovery',
       rows: [
         ['Recovered', 'recovered'],
         ['Failed', 'failed'],
-        ['Skipped', 'skipped', "Left unrepaired because corruption could not be safely confirmed.", 'cond']
+        ['Skipped', 'skipped', "Blocks deliberately left unrepaired: at repair time, the bookkeeping covering exactly those blocks could not be read, so Rotshield could not confirm they are still corrupt, and it never writes a guess. A small number is the safe, cautious outcome. If it grows, the disk is likely having read trouble (see the read-error rows).", 'cond']
       ] }
   ];
 
