@@ -219,6 +219,11 @@ pre { max-width: 100%; overflow-x: auto; }
 }
 .help-block:hover .help-content,
 .help-block:focus-within .help-content { display: block; }
+/* The table's help popups all open UPWARD (help-up): #progress-wrap's
+   horizontal scroll also clips vertically, and a downward popup on the
+   lower rows would run past the table's bottom edge and be cut off at
+   the container (the tooltips are several lines tall). */
+.help-block .help-content.help-up { top: auto; bottom: 1.6em; }
 /* Per-disk progress table (Status section): rows = statistics grouped by
    hierarchy, columns = disks.  Group rows order the stats so related
    counters sit together (scrub volume, issues found, metadata, recovery);
@@ -248,7 +253,11 @@ pre { max-width: 100%; overflow-x: auto; }
 #progress-table th { font-weight: bold; }
 #progress-table th:first-child, #progress-table td:first-child { width: 220px; }
 #progress-table th:not(:first-child), #progress-table td:not(:first-child) { width: 170px; }
-#progress-table td:first-child { color: #6c757d; }
+/* The label column must not clip the help popups, which are wider than
+   the 220px column.  table-layout: fixed still keeps the label text
+   itself at 220px; only the absolutely-positioned popup is allowed to
+   overflow (a clipped popup renders behind the rows below it). */
+#progress-table td:first-child { color: #6c757d; overflow: visible; }
 .devname {
   display: inline-block;
   max-width: 96px;
@@ -459,7 +468,11 @@ pre { max-width: 100%; overflow-x: auto; }
   // question-mark help popup (same pattern as the settings form) with a
   // short plain-language explanation of what the number means and whether
   // action is needed; obvious rows (progress, volume, recovery outcome)
-  // and group headers are plain.
+  // and group headers are plain.  Every popup-bearing group sits in the
+  // lower half of the table and sets `up: true` so its popups open
+  // upward: downward popups there would be cut off at the container's
+  // bottom edge (worst case: the Issues found popups, which hang over
+  // the Recovery group when the Metadata group is hidden).
   //
   // Visibility: always-visible rows are the healthy-scrub signals where a
   // visible 0 is meaningful (Progress, Scrub volume, Sectors mismatch,
@@ -479,6 +492,7 @@ pre { max-width: 100%; overflow-x: auto; }
         ['Bytes checked', 'bytes_checked']
       ] },
     { name: 'Issues found',
+      up: true,
       rows: [
         ['Sectors mismatch', 'sectors_mismatch'],
         ['Sectors stale', 'sectors_stale', "These blocks looked wrong at first, but turned out fine: the filesystem legitimately rewrote or deleted them while the scan was running. This is normal activity on a busy disk, not corruption. No action needed.", 'cond'],
@@ -488,12 +502,14 @@ pre { max-width: 100%; overflow-x: auto; }
       ] },
     { name: 'Metadata',
       cond: true,
+      up: true,
       rows: [
         ['Metadata header errors', 'metadata_header_errors', "The filesystem's metadata map (the bookkeeping that records which files exist and where their data is stored) is damaged: the disk returns the bytes, but no copy passes the integrity check. This is corruption of the map itself (e.g. bit rot), not a hardware read problem, and it cannot be rebuilt from parity. The scan skips the affected areas but continues with the rest of the disk. Action: unmount the disk and repair the filesystem offline with btrfs check --repair."],
         ['Metadata mirror mismatches', 'metadata_mirror_mismatches', "btrfs keeps two copies of the metadata map. They disagree, but at least one copy is intact, so btrfs reads the good one and refreshes the bad one itself. Harmless, no action needed. A normal btrfs scrub reports this the same way."],
         ['Metadata read errors', 'metadata_read_errors', "The disk refused to return the metadata map bytes at all (an I/O error, the kind a failing drive produces). Hardware problem, not corruption. The scan skips those areas but keeps scrubbing the rest. Check the drive's SMART health, and if it is failing, replace the disk and let the array rebuild it from parity."]
       ] },
     { name: 'Recovery',
+      up: true,
       rows: [
         ['Recovered', 'recovered'],
         ['Failed', 'failed'],
@@ -554,11 +570,15 @@ pre { max-width: 100%; overflow-x: auto; }
   }
 
   // Help popup wrapper - the same question-mark pattern the settings form
-  // uses: label + icon, hover/focus shows a bare one-line tip.
-  function helpWrap(label, tip) {
+  // uses: label + icon, hover/focus shows the plain-language tip.  `up`
+  // opens the popup above the icon (help-up): every table popup lives in
+  // the lower groups, where a downward popup would be cut off at the
+  // scrollable container's bottom edge.
+  function helpWrap(label, tip, up) {
     return '<span class="help-block" tabindex="0">' + label +
            '<i class="fa fa-question-circle"></i>' +
-           '<span class="help-content">' + tip + '</span></span>';
+           '<span class="help-content' + (up ? ' help-up' : '') + '">' + tip +
+           '</span></span>';
   }
 
   // Row/group visibility: `anyDisk(key)` is true when at least one disk
@@ -631,7 +651,7 @@ pre { max-width: 100%; overflow-x: auto; }
         // a non-zero value (stale / no-csum / skipped are diagnostics,
         // not healthy-scrub signals).
         if (grp.rows[r][3] === 'cond' && !anyDisk(key)) continue;
-        html += '<tr><td class="stat">' + (tip ? helpWrap(esc(label), tip) : esc(label)) + '</td>';
+        html += '<tr><td class="stat">' + (tip ? helpWrap(esc(label), tip, grp.up) : esc(label)) + '</td>';
         for (var i = 0; i < devs.length; i++) {
           var d = disks[devs[i]];
           var cell = cellFor(d, key);
