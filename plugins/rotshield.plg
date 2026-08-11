@@ -17,6 +17,14 @@
 ##&name;
 
 ###2026.08.08
+- The Settings page only exposes options users actually need: removed the
+  Disable freeze checkbox and the Batch max / Batch idle fields. The
+  freeze/batch keys are gone from config.cfg entirely — their safe
+  defaults (freeze on, batch max 64, batch idle 5 s) are baked into
+  scrub-rs and overridable only via Extra options. The Status port field
+  stays (port conflicts are possible on real systems). Tooltips were cut
+  down to bare one-liners on genuinely non-obvious rows; obvious rows,
+  group headers and the table footnote are gone.
 - The plugin bundle no longer ships `craft-corrupt`. It is a test-only
   corruption injector (it deliberately corrupts array data) that was
   bundled for the CI test array's benefit — it is now built only by the

@@ -19,10 +19,7 @@ Icon="rotshield.png"
  * parses the run log for every device independent of the selection, and
  * the page keeps that data for all disks, so re-checking a disk brings its
  * column back with the last run's results (or live progress) — nothing is
- * lost when a column is hidden. Every group and statistic row carries a
- * question-mark help popup (same style as the settings form) explaining in
- * plain language what the number counts and whether a non-zero value is
- * good or bad.  The
+ * lost when a column is hidden. The
  * table shows only essential rows (progress, volume, mismatch, read error,
  * recovered, failed); diagnostic rows (stale, csum branches stale, no
  * csum, skipped) and the whole Metadata group stay hidden until some disk
@@ -96,7 +93,7 @@ if (!is_file($config_file)) {
     file_put_contents($config_file,
         "DEVICES=''\n" .
         "DEVICE=''\n" .
-        "SCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nNO_FREEZE=0\nBATCH_MAX=\nBATCH_IDLE=\nSTATUS_PORT=9101\nEXTRA_OPTIONS=\n");
+        "SCHEDULE='disabled'\nCRON=''\nRECOVER=1\nWRITE=0\nSTATUS_PORT=9101\nEXTRA_OPTIONS=\n");
 }
 $config = parse_ini_file($config_file);
 
@@ -109,7 +106,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // hand-edited config.cfg order is honored by the run as-is.
     // An EMPTY selection is saved as-is and never silently replaced with
     // the first disk: with no disks targeted, scrubbing is skipped until
-    // the user picks at least one (see the Target disk(s) help).
+    // the user picks at least one.
     $sel = $_POST['devices'] ?? [];
     $sel = is_array($sel) ? $sel : [$sel];
     $sel = array_values(array_filter(array_map('trim', $sel), fn($d) => $d !== '' && in_array($d, $devices, true)));
@@ -128,14 +125,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!cron_expr_valid($cron)) {
             $cron = '';
             $schedule = 'disabled';
-            $message = "Invalid custom cron expression — schedule left disabled.";
+            $message = "Invalid custom cron expression. Schedule left disabled.";
         }
     }
     $recover  = isset($_POST['recover'])  ? 1 : 0;
     $write    = isset($_POST['write'])    ? 1 : 0;
-    $no_freeze= isset($_POST['no_freeze'])? 1 : 0;
-    $batch_max= escapeshellarg(trim($_POST['batch_max']   ?? ''));
-    $batch_idle=escapeshellarg(trim($_POST['batch_idle']  ?? ''));
     $extra    = escapeshellarg(trim($_POST['extra_options'] ?? ''));
     // Live status port: 0 disables the localhost status endpoint, 1-65535
     // enables it on 127.0.0.1. Validated to a plain integer so it can never
@@ -155,9 +149,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         "CRON='$cron'\n" .
         "RECOVER=$recover\n" .
         "WRITE=$write\n" .
-        "NO_FREEZE=$no_freeze\n" .
-        "BATCH_MAX=$batch_max\n" .
-        "BATCH_IDLE=$batch_idle\n" .
         "STATUS_PORT=$status_port\n" .
         "EXTRA_OPTIONS=$extra\n");
     exec("/etc/rc.d/rc.$plugin restart 2>&1");
@@ -165,7 +156,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($devices_csv === '') {
             // Honest no-op: the empty selection was saved as-is above and
             // must never silently scrub something else.
-            $message = "No disks targeted — nothing to scrub. Select at least one disk, then run again.";
+            $message = "No disks targeted, so nothing to scrub. Select at least one disk, then run again.";
         } else {
             exec("nohup $plugin_dir/scripts/scrub.sh run >/dev/null 2>&1 &");
             $message = "Scrub started in the background.";
@@ -230,10 +221,6 @@ pre { max-width: 100%; overflow-x: auto; }
   color: #333;
   text-align: left;
   white-space: normal;
-  /* Inside the uppercase group-header rows the popup must not inherit the
-     row's all-caps / letter-spaced styling. */
-  text-transform: none;
-  letter-spacing: normal;
 }
 .help-block:hover .help-content,
 .help-block:focus-within .help-content { display: block; }
@@ -243,14 +230,8 @@ pre { max-width: 100%; overflow-x: auto; }
    stat labels are indented under their group.  Colored chips mark each
    disk's state, the active column gets a subtle tint, and the progress row
    shows a bar.  Semi-transparent colors keep both light and dark webGui
-   themes readable.  Every group and stat row carries a question-mark help
-   popup (same pattern as the settings form). */
+   themes readable. */
 #progress-wrap { margin-top: 8px; overflow-x: auto; max-width: 100%; }
-/* Rows near the bottom of the table (Metadata, Recovery) open their help
-   popups UPWARD: #progress-wrap's horizontal scroll also clips vertically,
-   so a downward popup on the last rows would be cut off at the container
-   edge. */
-.help-block .help-content.help-up { top: auto; bottom: 1.6em; }
 #progress-table {
   border-collapse: collapse;
   margin-top: 6px;
@@ -272,10 +253,7 @@ pre { max-width: 100%; overflow-x: auto; }
 #progress-table th { font-weight: bold; }
 #progress-table th:first-child, #progress-table td:first-child { width: 220px; }
 #progress-table th:not(:first-child), #progress-table td:not(:first-child) { width: 170px; }
-/* The label column must not clip the help popups, which are wider than the
-   220px column.  table-layout: fixed still keeps the label text itself at
-   220px; only the absolutely-positioned popup is allowed to overflow. */
-#progress-table td:first-child { color: #6c757d; overflow: visible; }
+#progress-table td:first-child { color: #6c757d; }
 .devname {
   display: inline-block;
   max-width: 96px;
@@ -332,7 +310,7 @@ pre { max-width: 100%; overflow-x: auto; }
 
 <form method="post" id="settings-form">
   <table class="settings">
-    <tr><td>Schedule <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">How often an automatic scrub runs. <b>Disabled</b> = manual only; <b>Weekly</b> = Sundays 03:00; <b>Monthly</b> = 1st of month 03:00; <b>Custom</b> = your own 5-field cron. Daily is deliberately omitted because a full scrub can take days and would overlap its own previous run. The schedule is written to /etc/cron.d by the plugin's rc script; "Run Scrub Now" always works regardless of this setting.</span></span></td>
+    <tr><td>Schedule</td>
         <td><select name="schedule">
             <option value="disabled" <?=($config['SCHEDULE'] ?? 'disabled') === 'disabled' ? 'selected' : ''?>>Disabled</option>
             <option value="weekly"   <?=($config['SCHEDULE'] ?? '') === 'weekly'   ? 'selected' : ''?>>Weekly (Sun 03:00)</option>
@@ -340,7 +318,7 @@ pre { max-width: 100%; overflow-x: auto; }
             <option value="custom"   <?=($config['SCHEDULE'] ?? '') === 'custom'   ? 'selected' : ''?>>Custom cron</option>
           </select>
 </td></tr>
-    <tr id="cron-row" style="<?=($config['SCHEDULE'] ?? 'disabled') === 'custom' ? '' : 'display:none'?>"><td>Custom cron <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">5-field cron time spec (minute hour day-of-month month day-of-week), used only when Schedule = Custom cron — e.g. <code>0 4 1 * *</code> runs at 04:00 on the 1st of each month. The value is strictly validated (only digits and *, ?, /, ,, - allowed) before saving, so an invalid entry is rejected and the schedule left disabled rather than injected. Leave blank to disable the custom schedule.</span></span></td>
+    <tr id="cron-row" style="<?=($config['SCHEDULE'] ?? 'disabled') === 'custom' ? '' : 'display:none'?>"><td>Custom cron <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">5-field cron time spec (minute hour day-of-month month day-of-week).</span></span></td>
         <td><input type="text" name="cron" size="22" value="<?=htmlspecialchars($config['CRON'] ?? '')?>" placeholder="0 4 1 * *">
 </td></tr>
   <script>
@@ -348,7 +326,7 @@ pre { max-width: 100%; overflow-x: auto; }
       document.getElementById('cron-row').style.display = (this.value === 'custom') ? '' : 'none';
   });
   </script>
-    <tr><td>Target disk(s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Raw array data-disk partitions to scrub, auto-discovered from /proc/nmdstat (parity disks are excluded). Multiple disks are scrubbed sequentially, in the order listed; the whole run is written to a single per-run log (…/runs/run-&lt;ts&gt;.log) with each disk's section and final status block, and the progress table below shows per-disk results. The partition offset is applied automatically per device, so you just pick the array data disk (e.g. /dev/sdX). An empty selection is saved as-is: the table shows no columns and scrubbing is skipped until at least one disk is selected. Ticking or unticking a disk shows or hides its table column immediately (a live preview — the selection persists when you hit Save, like any other field). Columns never depend on whether a disk has data: results for every disk are read from the run log regardless of the selection, so a newly ticked disk shows the last run's results if any exist, and unticking never discards anything. A Scrub order row under the header numbers the disks in the order they are scrubbed. Corruption is rare on a healthy array, so one disk is usually enough; add more only to cover several disks in a single scheduled job. Disks without a btrfs filesystem (e.g. XFS) are greyed out and can't be selected — Rotshield only supports btrfs data disks.</span></span></td>
+    <tr><td>Target disk(s)</td>
         <td><div class="devices-list">
             <?php
             // Current target selection (recomputed after a save refreshed
@@ -366,29 +344,20 @@ pre { max-width: 100%; overflow-x: auto; }
             foreach ($devices as $d):
                 $is_btrfs = !$probe_ok || ($fstype[$d] ?? '') === 'btrfs';
             ?>
-            <label style="display:block" class="<?=$is_btrfs ? '' : 'dev-unsupported'?>"<?=$is_btrfs ? '' : ' title="Not a btrfs filesystem — Rotshield only supports btrfs data disks"'?>>
+            <label style="display:block" class="<?=$is_btrfs ? '' : 'dev-unsupported'?>"<?=$is_btrfs ? '' : ' title="Not a btrfs filesystem. Rotshield only supports btrfs data disks"'?>>
               <input type="checkbox" name="devices[]" value="<?=htmlspecialchars($d)?>" <?=in_array($d, $selected, true) && $is_btrfs ? 'checked' : ''?><?=$is_btrfs ? '' : ' disabled'?>><?=htmlspecialchars($d)?><?= $is_btrfs ? '' : ' <span class="muted">(not btrfs)</span>' ?>
             </label>
             <?php endforeach; ?>
           </div>
 </td></tr>
-    <tr><td>Repair disk <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Writes reconstructed blocks back to the disk (scrub-rs --repair). By default the tool runs in SAFE dry-run mode: it still reads every checksum, flags mismatches, and rebuilds the correct data from parity to tell you whether the corruption is recoverable — but it never touches the disk. Tick this only when you actually want the recovered blocks written back. The batch and freeze settings below only take effect in this repair mode; in the default dry-run they do nothing.</span></span></td>
+    <tr><td>Repair disk</td>
         <td><label><input type="checkbox" name="write" value="1" <?=($config['WRITE'] ?? 0) ? 'checked' : ''?>> write reconstructed blocks back (--repair; default is dry-run assessment only)</label>
 </td></tr>
-    <tr><td>Disable freeze <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Controls the filesystem freeze that makes repair writes safe. When Repair disk is enabled and the target is a live mounted filesystem, scrub-rs freezes the mount (FIFREEZE) around each recovery batch so the live FS cannot alter a block between re-confirmation and write-back, then thaws it. This is ON by default and only engages during repair on a mounted FS; unmounted images are never frozen. Only tick Disable freeze if the disk is not mounted/active — leaving it disabled during a live repair is unsafe. No effect in dry-run mode.</span></span></td>
-        <td><label><input type="checkbox" name="no_freeze" value="1" <?=($config['NO_FREEZE'] ?? 0) ? 'checked' : ''?>> --no-freeze (unsafe with write on a live FS)</label>
-</td></tr>
-    <tr><td>Batch max <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Max corruption candidates gathered into one recovery batch before it is written (scrub-rs --batch-max, default 64). Batching means one freeze/thaw cycle per burst instead of one per sector, and re-confirmation is deferred to write time so only still-corrupt blocks get written. Because corruption is rare on a healthy array, this rarely matters — it only becomes relevant under serious corruption during a repair run. Leave at the default unless you have a specific throughput reason to change it.</span></span></td>
-        <td><input type="text" name="batch_max" size="10" value="<?=htmlspecialchars($config['BATCH_MAX'] ?? '')?>" placeholder="64">
-</td></tr>
-    <tr><td>Batch idle (s) <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Idle seconds to wait before flushing a partially-filled recovery batch (scrub-rs --batch-idle, default 5.0). Guarantees a single isolated corruption still flushes promptly instead of waiting for the batch to fill. Like Batch max, this applies only during repair mode and is inconsequential for the usual rare, isolated corruption. Leave at the default in almost all cases.</span></span></td>
-        <td><input type="text" name="batch_idle" size="10" value="<?=htmlspecialchars($config['BATCH_IDLE'] ?? '')?>" placeholder="5.0">
-</td></tr>
-    <tr><td>Extra options <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Advanced: extra arguments appended verbatim to the scrub-rs command line (e.g. --dump-array for debugging). Anything you type is passed through unmodified, so invalid flags will make the scrub fail with a usage error. Most users should leave this empty.</span></span></td>
-        <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>">
-</td></tr>
-    <tr><td>Status port <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Localhost HTTP port that serves the running scrub's live error counters (scrub-rs --status-port), fed into the progress table below. Binds only to 127.0.0.1, so it is never reachable from the network. Set 0 to disable (the table then only shows the final per-disk counters from the run log). The scrub-rs process skips a busy port without failing, so two runs can never collide on it.</span></span></td>
+    <tr><td>Status port <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Localhost HTTP port for the live status endpoint (0 disables; default 9101).</span></span></td>
         <td><input type="text" name="status_port" size="10" value="<?=htmlspecialchars($config['STATUS_PORT'] ?? '9101')?>" placeholder="9101">
+</td></tr>
+    <tr><td>Extra options <span class="help-block" tabindex="0"><i class="fa fa-question-circle"></i><span class="help-content">Advanced: extra arguments appended to the scrub-rs command line.</span></span></td>
+        <td><input type="text" name="extra_options" size="40" value="<?=htmlspecialchars($config['EXTRA_OPTIONS'] ?? '')?>">
 </td></tr>
   </table>
   <p>
@@ -413,7 +382,6 @@ pre { max-width: 100%; overflow-x: auto; }
 ?>
 <div id="progress-wrap">
   <table id="progress-table"></table>
-  <p style="margin-top:8px;color:#6c757d;font-size:12px">Live counters refresh every 5&nbsp;s for the disk being scrubbed; finished disks keep their exact final counters from the run log. Columns follow the target-disk checkboxes above — hidden disks keep their stored results and reappear when re-checked. <span id="progress-updated"></span></p>
 </div>
 <script>
 // Progress table: rows = statistics grouped by hierarchy, columns = the
@@ -483,7 +451,7 @@ pre { max-width: 100%; overflow-x: auto; }
   function int(v) { return Number(v).toLocaleString('en-US'); }
   function bytes(v) {
     var n = Number(v);
-    if (!isFinite(n) || n < 0) return '\u2014';
+    if (!isFinite(n) || n < 0) return '-';
     if (n < 1024) return n + ' B';
     var units = ['KiB', 'MiB', 'GiB', 'TiB'];
     for (var i = 0; i < units.length; i++) {
@@ -494,57 +462,49 @@ pre { max-width: 100%; overflow-x: auto; }
     }
   }
 
-  // Row hierarchy: group rows order the statistics so related counters sit
-  // together.  Every group row and every statistic row carries a
-  // question-mark help popup (same pattern as the settings form) with a
-  // plain-language explanation of what the number counts and whether a
-  // non-zero value is good or bad.  Groups near the bottom of the table
-  // set `up: true` so their popups open upward and cannot be clipped by
-  // the scrollable table container.
+  // Row hierarchy: group rows order the statistics so related counters
+  // sit together.  Only genuinely non-obvious diagnostic rows carry a
+  // question-mark help popup (same pattern as the settings form), with a
+  // bare one-line explanation; obvious rows (progress, volume, recovery
+  // outcome) and group headers are plain.
   //
   // Visibility: always-visible rows are the healthy-scrub signals where a
   // visible 0 is meaningful (Progress, Scrub volume, Sectors mismatch,
   // Sectors read error, Recovered, Failed).  Rows marked 'cond' (Sectors
-  // stale, Sectors no csum, Skipped, CSUM-tree branches stale) and the Metadata group (cond: true)
-  // are hidden for ALL disks until some disk reports a non-zero value for
-  // the stat — they are edge-case diagnostics, not part of the essential
-  // view, and a healthy all-zero run shows only the essential rows.
+  // stale, Sectors no csum, Skipped, CSUM-tree branches stale) and the
+  // Metadata group (cond: true) are hidden for ALL disks until some disk
+  // reports a non-zero value for the stat — they are edge-case
+  // diagnostics, not part of the essential view, and a healthy all-zero
+  // run shows only the essential rows.
   var GROUPS = [
     { name: 'Progress',
-      tip: "How far along the scan of this disk is: 0% at the start, 100% when every data area has been checked. The bar updates in steps as whole regions of the disk finish, so it may pause for a while and then jump forward.",
-      rows: [ ['Progress', 'progress', "The share of this disk's data that has been checked so far, shown as a bar and a percentage. The value moves in steps as whole regions finish, so it can sit still for a while and then jump. 100% = the scan of this disk is complete."] ] },
+      rows: [ ['Progress', 'progress'] ] },
     { name: 'Scrub volume',
-      tip: "How much work the scan has done on this disk so far: how many data blocks were read and checked, how many came back exactly right, and the total amount of data covered. On a healthy disk, almost every checked block comes back OK.",
       rows: [
-        ['Sectors checked', 'sectors_checked', "The number of data blocks the scan has read and verified on this disk so far (each block is a few kilobytes; the exact size depends on the filesystem settings). It grows while the disk is being scrubbed and stops at the total when the scan finishes. A growing number simply means the scan is working."],
-        ['Sectors OK', 'sectors_ok', "Blocks that were read back exactly as they should be: their checksum matched the one recorded when the data was written. On a healthy disk this is almost the same as Sectors checked. This is the result you want to see."],
-        ['Bytes checked', 'bytes_checked', "The total amount of data read and verified so far, in bytes \u2014 the same progress as Sectors checked, just shown as a data volume instead of a block count. A large number is normal on a large disk."]
+        ['Sectors checked', 'sectors_checked'],
+        ['Sectors OK', 'sectors_ok'],
+        ['Bytes checked', 'bytes_checked']
       ] },
     { name: 'Issues found',
-      tip: "Anything the scan found that was not simply 'block is fine': real corruption, blocks that only looked suspicious but are actually fine, blocks with no checksum to compare against, and blocks the disk could not read back at all (a hardware problem).",
       rows: [
-        ['Sectors mismatch', 'sectors_mismatch', "Real corruption: the block's content no longer matches the checksum recorded when it was written \u2014 something changed or damaged the data. Any number above zero means genuine problems were found; the Recovery group below shows what could be done about them."],
-        ['Sectors stale', 'sectors_stale', "Blocks that initially looked wrong but turned out to be fine: the filesystem had legitimately rewritten or deleted them while the scan was running, or the file was never checksummed in the first place. This is normal activity on a busy disk, not corruption \u2014 no action needed.", 'cond'],
-        ['CSUM-tree branches stale', 'stale_csum_branches', "Parts of the filesystem's checksum map moved while the scan was running: files were written, rewritten or deleted, so some of the map's bookkeeping was freed and reused. Some of this is expected on a live filesystem \u2014 it is normal activity, not corruption. The areas covered by those parts were not verified this run, and no action is needed; rerun the scan during a quiet period if you want full coverage.", 'cond'],
-        ['Sectors no csum', 'sectors_no_csum', "Data blocks the filesystem stores without a checksum, so there is nothing to compare against. Nothing is wrong with them \u2014 they simply cannot be verified. In this scan mode the count is always 0, because such blocks are passed over silently rather than counted.", 'cond'],
-        ['Sectors read error', 'sectors_read_error', "The disk refused to return this block's data (an I/O error \u2014 the same kind of failure SMART tests report). This is a hardware problem, not corrupted data. The scan skips only these blocks and keeps checking the rest of the disk. Check the disk's health (SMART, cables, controller). These blocks could not be verified; if parity cannot rebuild them, they need attention."]
+        ['Sectors mismatch', 'sectors_mismatch'],
+        ['Sectors stale', 'sectors_stale', "Initially mismatched, then rewritten or deleted by the live filesystem. Not corruption.", 'cond'],
+        ['CSUM-tree branches stale', 'stale_csum_branches', "Checksum-map bookkeeping moved while the scan ran on a live filesystem. Not corruption.", 'cond'],
+        ['Sectors no csum', 'sectors_no_csum', "Blocks stored without a checksum, so they cannot be verified.", 'cond'],
+        ['Sectors read error', 'sectors_read_error', "The disk returned an I/O error. Hardware problem."]
       ] },
     { name: 'Metadata',
       cond: true,
-      up: true,
-      tip: "The filesystem's bookkeeping \u2014 the map that records which files exist and where their data is stored \u2014 is kept twice for safety. The three rows describe different kinds of trouble: the two copies disagree but a good one still exists (mirror mismatch), every copy is damaged so no good one is left (header error), or the disk would not return the bytes at all (read error \u2014 hardware).",
       rows: [
-        ['Metadata header errors', 'metadata_header_errors', "The filesystem's bookkeeping \u2014 the map of which files exist and where their data is stored \u2014 is damaged: the disk returns the bytes, but no copy passes the integrity check (or the only valid copy is stale, from an older moment in time). This is corruption of the stored map itself, e.g. silent bit rot \u2014 not a hardware read problem \u2014 and unlike data blocks it is never rebuilt from parity, so the scan cannot fix it. The affected part of the map cannot be trusted: the scan skips it (those data areas may never be checked) but continues with the rest of the disk, and because part of the map could not be trusted, the whole run is reported as failed. Action: unmount the disk and repair the filesystem offline (btrfs check --repair)."],
-        ['Metadata mirror mismatches', 'metadata_mirror_mismatches', "The two safety copies of the bookkeeping disagree \u2014 but at least one copy is intact, so the filesystem reads the good copy and can refresh the bad one itself. The scan continues normally and no data is lost; no action is needed \u2014 the count is reported for visibility, the same way a normal btrfs scrub reports it. It usually means a copy was damaged at some point (or is from an older moment in time) and btrfs already caught it."],
-        ['Metadata read errors', 'metadata_read_errors', "The disk refused to return the bookkeeping bytes at all (an I/O error \u2014 the kind a failing drive produces). This is a hardware problem, not corruption: the scan skips that part of the map, so some data areas may never have been checked, but it keeps scrubbing the rest of the disk. Action: check the disk's hardware health (SMART, cables, controller) \u2014 a filesystem repair will not help here."]
+        ['Metadata header errors', 'metadata_header_errors', "Metadata map damaged beyond its duplicate copy. Not rebuildable from parity; needs offline btrfs check --repair."],
+        ['Metadata mirror mismatches', 'metadata_mirror_mismatches', "The two metadata copies disagree, but a good copy exists. No action needed."],
+        ['Metadata read errors', 'metadata_read_errors', "Disk I/O error while reading metadata. Hardware problem."]
       ] },
     { name: 'Recovery',
-      up: true,
-      tip: "What was done about the genuine corruption found above, using the array's parity: blocks successfully rebuilt, blocks that could not be rebuilt, and blocks deliberately left alone because the scan could not safely confirm them. Recovered + Failed = Sectors mismatch. n/a means no array information was available, so rebuilding was not possible.",
       rows: [
-        ['Recovered', 'recovered', "Blocks that were confirmed corrupt and then successfully rebuilt from the array's parity \u2014 the original data was reconstructed. With Repair disk turned off (the default), this shows what would be written back; with it on, the rebuilt blocks are actually written to the disk. Green = the corruption was fixable."],
-        ['Failed', 'failed', "Blocks that were confirmed corrupt but could not be rebuilt: the disk's own bytes could not be read at repair time, the parity data could not be read, the reconstruction failed the checksum test, or writing the blocks back to the disk failed. These blocks could not be fixed. This needs attention: check the array and the other disks, and consider restoring from backup."],
-        ['Skipped', 'skipped', "Blocks the scan deliberately left alone: at repair time, the bookkeeping covering exactly that block could not be read, so the scan could not confirm whether it is still corrupt \u2014 and it never writes a guess. Only that one block is skipped; the rest of the run continues normally. A small number is a cautious, safe outcome; if it grows, it usually points to the disk having read trouble (see the read-error rows).", 'cond']
+        ['Recovered', 'recovered'],
+        ['Failed', 'failed'],
+        ['Skipped', 'skipped', "Left unrepaired because corruption could not be safely confirmed.", 'cond']
       ] }
   ];
 
@@ -566,7 +526,7 @@ pre { max-width: 100%; overflow-x: auto; }
   // --- table rendering --------------------------------------------------
   function cellProgress(d) {
     var pct = Number(d.data.progress_pct);
-    if (!isFinite(pct)) return '\u2014';
+    if (!isFinite(pct)) return '-';
     var color = d.st === 'done' ? '#28a745'
               : d.st === 'error' ? '#dc3545'
               : d.st === 'cancelled' ? '#6c757d' : '#f0ad4e';
@@ -575,14 +535,14 @@ pre { max-width: 100%; overflow-x: auto; }
       ' <span class="ppct">' + pct.toFixed(2) + '%</span>';
   }
 
-  // One stat cell for a disk; null means "no data yet" (rendered as —).
+  // One stat cell for a disk; null means "no data yet" (rendered as -).
   function cellFor(d, key) {
     if (key === 'progress') return cellProgress(d);
     if (key === 'recovered' || key === 'failed' || key === 'skipped') {
       // Plain scrub (no array): the counters are meaningless, show n/a
       // instead of zeros that would read like "nothing was recovered".
       if (d.data.recovery === '0') {
-        return '<span class="muted" title="No array information available \u2014 this disk cannot be rebuilt from parity, so recovery counts are not shown">n/a</span>';
+        return '<span class="muted" title="No array information available, so this disk cannot be rebuilt from parity and recovery counts are not shown">n/a</span>';
       }
     }
     if (d.data[key] === undefined) return null;
@@ -601,14 +561,11 @@ pre { max-width: 100%; overflow-x: auto; }
   }
 
   // Help popup wrapper - the same question-mark pattern the settings form
-  // uses: label + icon, hover/focus shows the plain-language tip.  `up`
-  // opens the popup above the icon for rows near the bottom of the table,
-  // so it stays inside the scrollable #progress-wrap.
-  function helpWrap(label, tip, up) {
+  // uses: label + icon, hover/focus shows a bare one-line tip.
+  function helpWrap(label, tip) {
     return '<span class="help-block" tabindex="0">' + label +
            '<i class="fa fa-question-circle"></i>' +
-           '<span class="help-content' + (up ? ' help-up' : '') + '">' + tip +
-           '</span></span>';
+           '<span class="help-content">' + tip + '</span></span>';
   }
 
   // Row/group visibility: `anyDisk(key)` is true when at least one disk
@@ -666,9 +623,7 @@ pre { max-width: 100%; overflow-x: auto; }
       // order scrub.sh runs them in; a hand-edited config.cfg order is
       // honored by the run but cannot be shown here because the page's
       // columns derive from the checkbox list).
-      html += '<tr><td class="stat">' +
-              helpWrap('Scrub order', "The order this run scrubs the targeted disks in: disk 1 is scrubbed first, then disk 2, and so on \u2014 one disk at a time, sequentially. The order is the one the settings form lists the disks in: the saved DEVICES list stores the disks in that same order and scrub.sh runs it verbatim.", false) +
-              '</td>';
+      html += '<tr><td class="stat">Scrub order</td>';
       for (var oi = 0; oi < devs.length; oi++) html += '<td>' + (oi + 1) + '</td>';
       html += '</tr>';
     for (var g = 0; g < GROUPS.length; g++) {
@@ -676,22 +631,21 @@ pre { max-width: 100%; overflow-x: auto; }
       // Conditional group (Metadata): hide the header AND its rows for
       // every disk until some disk actually reports an issue.
       if (grp.cond && !groupVisible(grp)) continue;
-      html += '<tr class="grp"><td colspan="' + span + '">' +
-              helpWrap(esc(grp.name), grp.tip, grp.up) + '</td></tr>';
+      html += '<tr class="grp"><td colspan="' + span + '">' + esc(grp.name) + '</td></tr>';
       for (var r = 0; r < grp.rows.length; r++) {
         var label = grp.rows[r][0], key = grp.rows[r][1], tip = grp.rows[r][2];
         // Conditional row: hide it for ALL disks until some disk reports
         // a non-zero value (stale / no-csum / skipped are diagnostics,
         // not healthy-scrub signals).
         if (grp.rows[r][3] === 'cond' && !anyDisk(key)) continue;
-        html += '<tr><td class="stat">' + helpWrap(esc(label), tip, grp.up) + '</td>';
+        html += '<tr><td class="stat">' + (tip ? helpWrap(esc(label), tip) : esc(label)) + '</td>';
         for (var i = 0; i < devs.length; i++) {
           var d = disks[devs[i]];
           var cell = cellFor(d, key);
           var colcls = d.st === 'active' ? ' class="col-active"'
                      : d.st === 'done' ? ' class="col-done"'
                      : d.st === 'cancelled' ? ' class="col-cancelled"' : '';
-          html += '<td' + colcls + '>' + (cell === null ? '\u2014' : cell) + '</td>';
+          html += '<td' + colcls + '>' + (cell === null ? '-' : cell) + '</td>';
         }
         html += '</tr>';
       }
@@ -747,7 +701,7 @@ pre { max-width: 100%; overflow-x: auto; }
       disks[p.live.device].st = 'active';
       disks[p.live.device].data = p.live;
     }
-    // Status server down mid-run (e.g. STATUS_PORT=0): the log's most
+    // Status server down mid-run: the log's most
     // recent "scrubbing <dev>" line still tells us which disk is active.
     if (running && !p.live && meta.active_device && disks[meta.active_device]) {
       if (disks[meta.active_device].st === 'pending') disks[meta.active_device].st = 'active';
@@ -763,8 +717,6 @@ pre { max-width: 100%; overflow-x: auto; }
       if (snap) snap.value = p.liveRaw;
     }
     renderTable();
-    document.getElementById('progress-updated').textContent =
-      'Last updated ' + new Date().toLocaleTimeString();
   }
 
   function updateLine(meta) {
@@ -776,10 +728,10 @@ pre { max-width: 100%; overflow-x: auto; }
         if (disks[keys[i]].st === 'active') { active = keys[i]; break; }
       }
       el.innerHTML = '<span style="color:#c00">Running</span>' +
-        (active ? ' \u2014 active disk: <code>' + esc(active) + '</code>' : '');
+        (active ? ' (active disk: <code>' + esc(active) + '</code>)' : '');
     } else {
       var s = 'Idle';
-      if (meta.run_outcome) s += ' \u2014 last run: ' + meta.run_outcome;
+      if (meta.run_outcome) s += ' (last run: ' + meta.run_outcome + ')';
       el.textContent = s;
     }
   }
