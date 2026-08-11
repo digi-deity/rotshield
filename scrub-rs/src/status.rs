@@ -242,17 +242,13 @@ impl StatusServer {
 mod tests {
     use super::*;
 
-
     /// Unique per-test socket path under the temp dir (parallel-safe).
     fn test_sock_path() -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "scrub-status-{}-{nanos}.sock",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("scrub-status-{}-{nanos}.sock", std::process::id()))
     }
 
     #[test]
