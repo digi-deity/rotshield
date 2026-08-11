@@ -118,7 +118,6 @@ into `scrub-rs` arguments (see `scrub-rs/src/main.rs` for the full flag list):
 | `DEVICES` | space-separated list of **raw array data-disk rdevs** to scrub **sequentially** (e.g. `/dev/sdX`, `/dev/nvmeXnY`, `/dev/loopX` — whatever `/proc/nmdstat` reports in `rdevName.N` for the data slots; parity slots 0 and 29 are excluded). Scrub order = the listed order (config is the single source of truth); the Settings page stores them alphabetically. **No target is preselected on a fresh install** (empty list = the table stays empty and scrubbing is skipped until you pick a disk) | `<device>` (one per run) |
 | `DEVICE` | first entry of `DEVICES` (kept for backwards compatibility) | `<device>` |
 | `WRITE` | `1` writes reconstructed blocks back (`--repair`); `0` (default) dry-run assessment only | `--repair` |
-| `NO_FREEZE` | `1` disables freeze (unsafe with repair) | `--no-freeze` |
 
 Recovery assessment is **always on** (free + read-only): every csum mismatch is
 reconstructed from parity so the operator learns whether the corruption is
@@ -137,18 +136,22 @@ The partition offset (`--offset`) is **auto-applied per device** from
 superblock lives at that offset on the raw device (not at 0, as it would on the
 array partition `/dev/nmdNp1`). There is nothing for the user to set — and no
 fallback, because without a valid offset recovery is impossible anyway.
-| `BATCH_MAX` | max candidates per recovery batch | `--batch-max` |
-| `BATCH_IDLE` | idle-seconds flush threshold | `--batch-idle` |
 | `STATUS_PORT` | localhost HTTP port for the live status endpoint (`0` disables; default `9101`) | `--status-port` |
 | `EXTRA_OPTIONS` | appended verbatim (advanced) | — |
 | `SCHEDULE` | `disabled` / `weekly` / `monthly` / `custom` | (cron) |
 | `CRON` | 5-field cron time spec (`min hour day month weekday`), used only when `SCHEDULE=custom` (e.g. `0 4 1 * *` = 04:00 on the 1st). `daily` is intentionally not offered — a scrub can take days and would overlap its own previous run. | (cron) |
 
+The freeze and batch settings are not config keys: their safe defaults
+(freeze on for live repairs, batch max 64, batch idle 5 s) are baked into
+scrub-rs and cannot be hand-set in `config.cfg`. The only way to override
+them is to pass the flags (`--no-freeze`, `--batch-max`, `--batch-idle`)
+via `EXTRA_OPTIONS`.
+
 ### Live status + per-disk progress table
 
 While a scrub runs, scrub-rs serves the live error counters over a
 localhost-only HTTP endpoint so the Settings page shows real-time numbers
-instead of just "running / idle". This is on by default (`STATUS_PORT=9101`)
+instead of just "running / idle". It is on by default (port `9101`)
 and binds to `127.0.0.1` only — never the network. `scrub.sh status` prints
 the payload, and the Settings page polls it every 5 s. The page renders the
 counters as a **progress table** (rows = statistics grouped by hierarchy,
@@ -188,8 +191,7 @@ filesystem), which is plenty on real disks (1 TiB → ~1000 steps → 0.1%
 resolution) and only visibly chunky on tiny test images.
 
 `key=value` lines, shell-parseable (e.g. `curl -s …/status | awk -F= '$1=="recovered"{print $2}'`).
-Set `STATUS_PORT=0` to disable. A busy port is logged and skipped by scrub-rs,
-never fatal.
+A busy port is logged and skipped by scrub-rs, never fatal.
 
 **Final counters survive the process**: every scrub-rs run ends by printing a
 `status:` marker followed by the same `key=value` payload to stdout, so the
@@ -200,8 +202,8 @@ falling back to the Settings page's last-received payload if the fetch fails),
 so an aborted disk keeps its numbers instead of dropping back to empty.
 `status.php` merges those final blocks with the live
 endpoint, which is how the table keeps finished disks populated even though
-the status server dies with each device's process — and it works even with
-`STATUS_PORT=0`. The payload's `recovery=1|0` tells the table whether the
+the status server dies with each device's process — and it works even when the
+status server is unavailable. The payload's `recovery=1|0` tells the table whether the
 recovered/failed/skipped counters are meaningful (1 = array present, parity
 recovery ran; 0 = plain scrub, the table shows n/a).
 

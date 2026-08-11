@@ -67,12 +67,14 @@ errored=0
 # the Settings page can poll the running scrub's error counters via
 # `scrub.sh status`. STATUS_PORT=0 disables it. scrub-rs itself skips a busy
 # port (logged, never fatal), so two runs can never collide on it.
+#
+# Freeze and batch tuning are intentionally NOT config keys: their safe
+# defaults are baked into scrub-rs (freeze on for live repairs, batch max
+# 64, batch idle 5.0 s) and can only be overridden by passing the flags
+# manually via EXTRA_OPTIONS.
 build_args() {
   local args=""
   [ "${WRITE:-0}" = "1" ] && args="${args} --repair"
-  [ "${NO_FREEZE:-0}" = "1" ] && args="${args} --no-freeze"
-  [ -n "${BATCH_MAX:-}" ]   && args="${args} --batch-max ${BATCH_MAX}"
-  [ -n "${BATCH_IDLE:-}" ]  && args="${args} --batch-idle ${BATCH_IDLE}"
   # 0 = disabled; anything else (incl. empty -> default) enables the server.
   local port="${STATUS_PORT:-9101}"
   [ "${port}" != "0" ] && args="${args} --status-port ${port}"
@@ -359,15 +361,16 @@ scrub_one_device() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: WARNING no rdevOffset found in nmdstat; scrub-rs will likely reject this device"
   fi
   # Auto-supply --freeze-mount when the disk (or a mounted partition of
-  # it) is actually MOUNTED; an unmounted disk gets no freeze flag.
-  # NO_FREEZE disables it entirely.
+  # it) is actually MOUNTED; an unmounted disk gets no freeze flag.  An
+  # explicit --no-freeze in EXTRA_OPTIONS disables it entirely (the only
+  # way to opt out — freeze is on by default).
   #
   # C1 integration check: a REPAIR run must never write recovered blocks
   # into a live, unfrozen filesystem.  If the disk is mounted but no freeze
   # mount could be resolved, refuse this device loudly rather than proceed
   # — the freeze is the only thing standing between the recovery write and
   # a concurrent live in-place rewrite (NODATACOW/PREALLOC).
-  if [ "${NO_FREEZE:-0}" != "1" ]; then
+  if [[ " ${EXTRA_OPTIONS:-} " != *" --no-freeze "* ]]; then
     fm="$(freeze_mount_for "${device}")"
     if [ -n "${fm}" ]; then
       dev_opts="${dev_opts} --freeze-mount ${fm}"
@@ -376,7 +379,7 @@ scrub_one_device() {
       # Mounted but unresolvable: `freeze_mount_for` returned nothing even
       # though the device (or its partition) is mounted.  Never silently
       # downgrade to unfrozen writes — refuse.
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: REFUSED: --repair requested but the disk is MOUNTED and no freeze mount could be resolved (mounted-partition lookup failed). Unmount the disk to repair it offline, or set NO_FREEZE=1 to explicitly allow unfrozen writes."
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: REFUSED: --repair requested but the disk is MOUNTED and no freeze mount could be resolved (mounted-partition lookup failed). Unmount the disk to repair it offline, or pass --no-freeze via Extra options to explicitly allow unfrozen writes."
       errored=1
       notify_scrub \
         "${PLUGIN}_scrub_refused" \
