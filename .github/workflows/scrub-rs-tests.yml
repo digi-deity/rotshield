@@ -20,13 +20,17 @@ on:
   workflow_dispatch:
 
 jobs:
-  integration-test:
+  # ===========================================================================
+  # Build job: compile scrub-rs + craft-corrupt ONCE and share them with both
+  # test jobs as an artifact. The two test jobs then run IN PARALLEL against
+  # the identical binary — no duplicated compiles, and no toolchain drift
+  # between the suites (there is no rust-toolchain.toml, so per-job `stable`
+  # installs could otherwise diverge if a new Rust release lands mid-run).
+  # ===========================================================================
+  build-scrub-rs:
     runs-on: ubuntu-latest
-    name: scrub-rs Integration Tests
-    timeout-minutes: 20
-    # The btrfs matrix + live-simulation job is more fundamental (no array
-    # needed) and must pass first; the array tests build on top of it.
-    needs: [btrfs-matrix-tests]
+    name: Build scrub-rs binaries
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +40,42 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install NonRAID + build dependencies
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            scrub-rs/target
+          key: ${{ runner.os }}-scrub-rs-build-${{ hashFiles('scrub-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-scrub-rs-build-
+
+      - name: Build scrub-rs (release)
+        run: |
+          cd scrub-rs
+          cargo build --release
+
+      - name: Upload scrub-rs binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrub-rs-binaries
+          path: |
+            scrub-rs/target/release/scrub-rs
+            scrub-rs/target/release/craft-corrupt
+          if-no-files-found: error
+
+  integration-test:
+    runs-on: ubuntu-latest
+    name: scrub-rs Integration Tests
+    timeout-minutes: 20
+    # Both test jobs depend only on the shared build and run in parallel.
+    needs: [build-scrub-rs]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NonRAID dependencies
         run: |
           # Add the NonRAID PPA
           sudo add-apt-repository ppa:qvr/nonraid
@@ -50,16 +89,19 @@ jobs:
           # Verify the DKMS module installation
           sudo dkms status
 
-      - name: Build scrub-rs
+      - name: Download scrub-rs binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: scrub-rs-binaries
+          path: scrub-rs-binaries
+
+      - name: Set up scrub-rs binaries
         run: |
-          cd scrub-rs
-          cargo build --release
-          ./target/release/scrub-rs --dump-array || true
+          chmod +x "$GITHUB_WORKSPACE"/scrub-rs-binaries/*
           # Add both scrub-rs and craft-corrupt to PATH so tests can call them directly
-          echo "$PWD/target/release" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/scrub-rs-binaries" >> "$GITHUB_PATH"
           # Also export the full path so sudo invocations can use the absolute path
-          echo "SCRUB_RS_DIR=$PWD/target/release" >> "$GITHUB_ENV"
-          cd ..
+          echo "SCRUB_RS_DIR=$GITHUB_WORKSPACE/scrub-rs-binaries" >> "$GITHUB_ENV"
 
       - name: Create asymmetric test disk images
         run: |
@@ -390,15 +432,12 @@ jobs:
     runs-on: ubuntu-latest
     name: scrub-rs btrfs matrix + live simulation
     timeout-minutes: 30
-    needs: []   # standalone — does not depend on the array job
+    # Runs in parallel with the array integration job, both against the
+    # binary shared by build-scrub-rs.
+    needs: [build-scrub-rs]
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install btrfs runtime dependencies
         run: |
@@ -424,12 +463,17 @@ jobs:
           echo "=== btrfs-map-logical --version ==="; btrfs-map-logical --version 2>&1 || true
           echo "=== btrfs check --help (relevant flags) ==="; btrfs check --help 2>&1 | grep -iE 'data-csum|readonly|corrupt|mode' || true
 
-      - name: Build scrub-rs
+      - name: Download scrub-rs binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: scrub-rs-binaries
+          path: scrub-rs-binaries
+
+      - name: Set up scrub-rs binaries
         run: |
-          cd scrub-rs
-          cargo build --release
-          echo "$PWD/target/release" >> "$GITHUB_PATH"
-          echo "SCRUB_RS_DIR=$PWD/target/release" >> "$GITHUB_ENV"
+          chmod +x "$GITHUB_WORKSPACE"/scrub-rs-binaries/*
+          echo "$GITHUB_WORKSPACE/scrub-rs-binaries" >> "$GITHUB_PATH"
+          echo "SCRUB_RS_DIR=$GITHUB_WORKSPACE/scrub-rs-binaries" >> "$GITHUB_ENV"
 
       - name: btrfs matrix — generate images + run scrub-rs
         continue-on-error: true
