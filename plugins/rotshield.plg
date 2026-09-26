@@ -9,6 +9,7 @@
 <!ENTITY pluginURL     "https://raw.githubusercontent.com/digi-deity/rotshield/main/plugins/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
 <!ENTITY bundleURL     "https://github.com/digi-deity/rotshield/releases/download/v&version;/&bundlefile;">
+<!ENTITY sha256 "79fc630a200a0907c62b347c9091149421bc8c68e0be871abb945ba1600977c9">
 ]>
 
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;">
@@ -309,6 +310,7 @@ would only re-extract an already-installed package on every boot.
 -->
 <FILE Name="/boot/config/plugins/rotshield/install/&bundlefile;" Run="upgradepkg --install-new">
 <URL>&bundleURL;</URL>
+<SHA256>&sha256;</SHA256>
 </FILE>
 
 <!-- Run install logic (binaries are already in place from the bundle).
